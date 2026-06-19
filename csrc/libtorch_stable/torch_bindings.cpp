@@ -624,6 +624,18 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int tp_rank, int blocksparse_local_blocks,"
       "    int blocksparse_vert_stride, int blocksparse_block_size,"
       "    int blocksparse_head_sliding_step) -> ()");
+
+  // Gemma4-optimized paged attention
+  ops.def(
+      "gemma_paged_attention("
+      "    Tensor! out, Tensor! exp_sums, Tensor! max_logits,"
+      "    Tensor! tmp_out, Tensor query, Tensor key_cache,"
+      "    Tensor value_cache, int num_kv_heads, float scale,"
+      "    Tensor block_tables, Tensor seq_lens, int block_size,"
+      "    int max_seq_len,"
+      "    str kv_cache_dtype, Tensor k_scale, Tensor v_scale,"
+      "    int actual_head_size, bool k_eq_v,"
+      "    int sliding_window) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
@@ -747,6 +759,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 
   ops.impl("paged_attention_v1", TORCH_BOX(&paged_attention_v1));
   ops.impl("paged_attention_v2", TORCH_BOX(&paged_attention_v2));
+  ops.impl("gemma_paged_attention", TORCH_BOX(&gemma_paged_attention));
 }
 
 // TODO: Remove this once ROCm upgrade to torch 2.11.

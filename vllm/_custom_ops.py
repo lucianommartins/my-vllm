@@ -205,6 +205,50 @@ def paged_attention_v2(
     )
 
 
+def gemma_paged_attention(
+    out: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    actual_head_size: int,
+    k_eq_v: bool,
+    sliding_window: int,
+) -> None:
+    torch.ops._C.gemma_paged_attention(
+        out,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        actual_head_size,
+        k_eq_v,
+        sliding_window,
+    )
+
+
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sum: torch.Tensor,
