@@ -35,6 +35,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 PARTITION_SIZE = 512
+# Upper bound on split-KV partitions the decode kernel may use. The partition
+# buffers are sized to allow ~256 tokens/split so cross-CTA split-KV can engage
+# at low batch (the launcher clamps the actual num_splits to this and to the
+# available KV blocks).
+SPLIT_PARTITION_CAP = 128
+TOKENS_PER_SPLIT = 256
 
 
 @dataclass
@@ -230,7 +236,13 @@ class GemmaAttentionImpl(AttentionImpl):
         self, num_seqs: int, max_seq_len: int,
         dtype: torch.dtype, device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        max_num_partitions = (max_seq_len + PARTITION_SIZE - 1) // PARTITION_SIZE
+        max_num_partitions = max(
+            1,
+            min(
+                SPLIT_PARTITION_CAP,
+                (max_seq_len + TOKENS_PER_SPLIT - 1) // TOKENS_PER_SPLIT,
+            ),
+        )
         if (
             self._exp_sums is None
             or self._exp_sums.shape[0] < num_seqs

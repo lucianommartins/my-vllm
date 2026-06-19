@@ -487,6 +487,13 @@ void gemma_paged_attention(
     torch::stable::Tensor& v_scale, int64_t actual_head_size, bool k_eq_v,
     int64_t sliding_window);
 
+void gemma_prefill_attention(
+    torch::stable::Tensor& out, torch::stable::Tensor& query,
+    torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
+    int64_t num_kv_heads, double scale, torch::stable::Tensor& block_tables,
+    torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
+    int64_t max_q_len, int64_t block_size, bool k_eq_v, int64_t sliding_window);
+
 // Cache ops (shared CUDA/ROCm)
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,

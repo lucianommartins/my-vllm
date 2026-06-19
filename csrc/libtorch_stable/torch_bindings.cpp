@@ -636,6 +636,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    str kv_cache_dtype, Tensor k_scale, Tensor v_scale,"
       "    int actual_head_size, bool k_eq_v,"
       "    int sliding_window) -> ()");
+
+  // Gemma4-optimized tensor-core prefill attention (hd=512)
+  ops.def(
+      "gemma_prefill_attention("
+      "    Tensor! out, Tensor query, Tensor key_cache, Tensor value_cache,"
+      "    int num_kv_heads, float scale, Tensor block_tables, Tensor seq_lens,"
+      "    Tensor cu_seqlens_q, int max_q_len, int block_size, bool k_eq_v,"
+      "    int sliding_window) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
@@ -760,6 +768,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("paged_attention_v1", TORCH_BOX(&paged_attention_v1));
   ops.impl("paged_attention_v2", TORCH_BOX(&paged_attention_v2));
   ops.impl("gemma_paged_attention", TORCH_BOX(&gemma_paged_attention));
+  ops.impl("gemma_prefill_attention", TORCH_BOX(&gemma_prefill_attention));
 }
 
 // TODO: Remove this once ROCm upgrade to torch 2.11.
