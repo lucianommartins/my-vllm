@@ -395,37 +395,39 @@ __global__ void gemma_prefill_kernel_v2(
     }
     __syncthreads();
 
-    // mask + online softmax (one row per active thread); writes sP, sA, sM, sL.
-    for (int r = tid; r < BLOCK_M; r += nthreads) {
+    // mask + online softmax, parallelized: one WARP per row (32 lanes = the
+    // BLOCK_N columns), warp-reduced max/sum. All warps active (vs the previous
+    // 1-thread-per-row serial phase that bottlenecked between barriers).
+    static_assert(BLOCK_N == 32, "warp-softmax assumes BLOCK_N == warpSize");
+    for (int r = warp; r < BLOCK_M; r += NUM_WARPS) {
       const int qr = row0 + r;
       const int q_abs = context + qr;
-      float rmax = -FLT_MAX;
-#pragma unroll 1
-      for (int c = 0; c < BLOCK_N; c++) {
-        const int k_abs = kv0 + c;
-        bool valid = (qr < q_len) && (c < n_tok) && (k_abs <= q_abs);
-        if (USE_SLIDING_WINDOW && sliding_window > 0)
-          valid = valid && (k_abs > q_abs - sliding_window);
-        float sv = valid ? sS[r * LDN + c] : -FLT_MAX;
-        sS[r * LDN + c] = sv;
-        rmax = fmaxf(rmax, sv);
-      }
+      const int c = lane;
+      const int k_abs = kv0 + c;
+      bool valid = (qr < q_len) && (c < n_tok) && (k_abs <= q_abs);
+      if (USE_SLIDING_WINDOW && sliding_window > 0)
+        valid = valid && (k_abs > q_abs - sliding_window);
+      float sv = valid ? sS[r * LDN + c] : -FLT_MAX;
+      float rmax = sv;
+#pragma unroll
+      for (int o = 16; o >= 1; o >>= 1)
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, o));
       const float m_old = sM[r];
       const float m_new = fmaxf(m_old, rmax);
       const float alpha =
           (m_old <= -FLT_MAX) ? 0.f : exp2f((m_old - m_new) * scale_log2);
-      float rsum = 0.f;
-#pragma unroll 1
-      for (int c = 0; c < BLOCK_N; c++) {
-        float p = (m_new <= -FLT_MAX)
-                      ? 0.f
-                      : exp2f((sS[r * LDN + c] - m_new) * scale_log2);
-        sP[r * LDN + c] = static_cast<cache_t>(p);
-        rsum += p;
+      const float p =
+          (m_new <= -FLT_MAX) ? 0.f : exp2f((sv - m_new) * scale_log2);
+      sP[r * LDN + c] = static_cast<cache_t>(p);
+      float rsum = p;
+#pragma unroll
+      for (int o = 16; o >= 1; o >>= 1)
+        rsum += __shfl_xor_sync(0xffffffffu, rsum, o);
+      if (lane == 0) {
+        sM[r] = m_new;
+        sL[r] = sL[r] * alpha + rsum;
+        sA[r] = alpha;
       }
-      sM[r] = m_new;
-      sL[r] = sL[r] * alpha + rsum;
-      sA[r] = alpha;
     }
     __syncthreads();
 
