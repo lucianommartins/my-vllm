@@ -13,7 +13,7 @@
 static constexpr int PF_BM = 32;
 static constexpr int PF_BN = 32;
 static constexpr int PF_NW = 4;
-static constexpr int PF_NW_V2 = 8;
+static constexpr int PF_NW_V2 = 16;
 
 #define LAUNCH_PREFILL(HEAD, GROUP, KEQV, USW)                                 \
   do {                                                                         \
@@ -57,6 +57,8 @@ static constexpr int PF_NW_V2 = 8;
     if (smem > 48 * 1024)                                                      \
       cudaFuncSetAttribute(                                                    \
           kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);           \
+    cudaFuncSetAttribute(                                                      \
+        kern, cudaFuncAttributePreferredSharedMemoryCarveout, 100);           \
     dim3 grid(PF_CDIV(max_q_len, PF_BM), num_q_heads, num_seqs);             \
     kern<<<grid, PF_NW_V2 * 32, smem, stream>>>(                              \
         out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,            \
