@@ -8,10 +8,20 @@
 
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 // NUM_WARPS per CTA — controls parallelism within each head.
 // 4 warps = 128 threads is a good balance for A100 occupancy.
 static constexpr int NUM_WARPS = 4;
+
+// Phase 1 bandwidth-saturating tensor-core decode (gemma_decode_stream_kernel):
+// per-head warps/CTA + MIN_CTA (__launch_bounds__) to be tuned by the roofline
+// sweep. BLOCK_N=32 (wmma N tile, % 32 for the warp-softmax).
+static constexpr int DS_BN = 32;
+static constexpr int DS_NW_512 = 16;
+static constexpr int DS_NW_256 = 16;
+static constexpr int DS_MINCTA_512 = 1;
+static constexpr int DS_MINCTA_256 = 1;
 
 #define LAUNCH_GEMMA(HEAD_SIZE, ACTUAL_HEAD_SIZE, K_EQ_V, USE_SW)              \
   vllm::gemma::gemma_flash_decode_kernel<                                      \
@@ -101,6 +111,63 @@ static constexpr int NUM_WARPS = 4;
     default: LAUNCH_GEMMA(HEAD_SIZE, ACTUAL_HEAD_SIZE, K_EQ_V, USE_SW);        \
       break;                                                                   \
   }
+
+// Phase 1 stream-decode launch. SPLITB selects grid + epilogue (false: final
+// out; true: partials + combine). smem = sQ[16,LDH] + 2 pipeline stages of
+// K(+V if !keqv) + sP[16,LDN] + sS[16,LDN] + sM/sL/sA.
+#define LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, GROUP, KEQV, USW, SPLITB)        \
+  do {                                                                         \
+    const dim3 sgrid = (SPLITB) ? dim3(num_kv_heads, num_seqs, num_splits)     \
+                                : dim3(num_kv_heads, num_seqs);                 \
+    constexpr int SLDH = (HEAD) + 8;                                           \
+    constexpr int SLDN = DS_BN + 8;                                            \
+    constexpr int SKTILE = DS_BN * SLDH;                                       \
+    constexpr int SSTAGE = SKTILE + ((KEQV) ? 0 : SKTILE);                     \
+    size_t ssmem = (size_t)(16 * SLDH + 2 * SSTAGE + 16 * SLDN)                \
+                       * sizeof(CACHE_T)                                       \
+                   + (size_t)(16 * SLDN + 3 * 16) * sizeof(float);            \
+    auto sk = vllm::gemma::gemma_decode_stream_kernel<                         \
+        T, CACHE_T, HEAD, DS_BN, NW, GROUP, KEQV, USW, SPLITB, MINCTA>;       \
+    if (ssmem > 48 * 1024)                                                     \
+      cudaFuncSetAttribute(                                                    \
+          sk, cudaFuncAttributeMaxDynamicSharedMemorySize, ssmem);            \
+    cudaFuncSetAttribute(                                                      \
+        sk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);            \
+    T* sout = (SPLITB) ? tmp_out_ptr : out_ptr;                               \
+    sk<<<sgrid, (NW) * WARP_SIZE, ssmem, stream>>>(                           \
+        sout, exp_sums_ptr, max_logits_ptr, query_ptr, key_cache_ptr,        \
+        value_cache_ptr, num_kv_heads, scale, block_tables_ptr,              \
+        seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,          \
+        kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,     \
+        num_splits, max_parts);                                              \
+    if (SPLITB) {                                                            \
+      const dim3 cg(num_kv_heads * (GROUP), num_seqs);                       \
+      vllm::gemma::gemma_split_reduce_kernel<T, HEAD>                        \
+          <<<cg, WARP_SIZE, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr, \
+                                         max_logits_ptr, num_splits,         \
+                                         max_parts);                         \
+    }                                                                        \
+  } while (0)
+
+#define LAUNCH_GEMMA_STREAM_GROUP(HEAD, NW, MINCTA, KEQV, USW, SPLITB)         \
+  switch (gqa_group) {                                                         \
+    case 1:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 1, KEQV, USW, SPLITB); break;\
+    case 2:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 2, KEQV, USW, SPLITB); break;\
+    case 4:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 4, KEQV, USW, SPLITB); break;\
+    case 8:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 8, KEQV, USW, SPLITB); break;\
+    case 16: LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 16, KEQV, USW, SPLITB);     \
+      break;                                                                   \
+    default: STD_TORCH_CHECK(false, "stream decode bad group ", gqa_group);    \
+  }
+
+#define LAUNCH_GEMMA_STREAM_HEAD(HEAD, NW, MINCTA, KEQV, USW)                  \
+  do {                                                                         \
+    if (num_splits > 1) {                                                      \
+      LAUNCH_GEMMA_STREAM_GROUP(HEAD, NW, MINCTA, KEQV, USW, true);            \
+    } else {                                                                   \
+      LAUNCH_GEMMA_STREAM_GROUP(HEAD, NW, MINCTA, KEQV, USW, false);           \
+    }                                                                          \
+  } while (0)
 
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE>
@@ -197,16 +264,41 @@ void gemma_paged_attention_launcher(
     if (num_splits < 1) num_splits = 1;
   }
 
+  // Phase 1 dev toggle: GEMMA_DECODE_STREAM=1 routes the bandwidth-saturating
+  // tensor-core decode (bf16 + non-quant KV only); else the scalar GQA path.
+  // Temporary A/B knob; becomes the default once it beats scalar on the roofline.
+  constexpr bool DS_DTYPE_OK =
+      std::is_same<T, __nv_bfloat16>::value &&
+      (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto);
+  static int ds_mode = []() {
+    const char* e = getenv("GEMMA_DECODE_STREAM");
+    return e ? atoi(e) : 0;
+  }();
+  bool use_stream = false;
+  if constexpr (DS_DTYPE_OK) use_stream = (ds_mode == 1);
+
   // GQA-reuse dispatch (always on): A2 split-KV when the batch underfills the
   // SMs, else the A1 single-CTA GQA kernel. For cases where actual_head_size ==
   // head_size (the combine reads HEAD_SIZE dims).
-#define GEMMA_DISPATCH(HS, AHS, KEQV, USW)                  \
-  do {                                                      \
-    if (num_splits > 1) {                                   \
-      LAUNCH_GEMMA_GQA_SPLIT_GROUP(HS, AHS, KEQV, USW);     \
-    } else {                                                \
-      LAUNCH_GEMMA_GQA_GROUP(HS, AHS, KEQV, USW);           \
-    }                                                       \
+#define GEMMA_DISPATCH(HS, AHS, KEQV, USW)                          \
+  do {                                                              \
+    bool did_stream = false;                                       \
+    if constexpr (DS_DTYPE_OK) {                                   \
+      if (use_stream) {                                            \
+        LAUNCH_GEMMA_STREAM_HEAD(                                  \
+            HS, (HS == 512 ? DS_NW_512 : DS_NW_256),               \
+            (HS == 512 ? DS_MINCTA_512 : DS_MINCTA_256),          \
+            KEQV, USW);                                            \
+        did_stream = true;                                         \
+      }                                                            \
+    }                                                              \
+    if (!did_stream) {                                             \
+      if (num_splits > 1) {                                        \
+        LAUNCH_GEMMA_GQA_SPLIT_GROUP(HS, AHS, KEQV, USW);          \
+      } else {                                                     \
+        LAUNCH_GEMMA_GQA_GROUP(HS, AHS, KEQV, USW);                \
+      }                                                            \
+    }                                                              \
   } while (0)
 
   if (head_size == 512 && actual_head_size == 256 && !k_eq_v && use_sw) {

@@ -25,12 +25,14 @@ typedef __hip_bfloat16 __nv_bfloat16;
 
 #include <float.h>
 #include <cuda_pipeline_primitives.h>
+#include <mma.h>
 
 #define GEMMA_CDIV(a, b) (((a) + (b) - 1) / (b))
 
 namespace vllm {
 namespace gemma {
 
+using namespace nvcuda;
 static constexpr float LOG2E = 1.4426950408889634f;
 
 inline __device__ float warp_reduce_sum(float val) {
@@ -666,6 +668,315 @@ __global__ void gemma_gqa_split_decode_kernel(
 #pragma unroll
   for (int e = 0; e < ELEMS_PER_THREAD; e++)
     from_float(to[e], acc[e] * inv_L);
+}
+
+// ---------------------------------------------------------------------------
+// Bandwidth-saturating tensor-core decode (Phase 1).
+//
+// Decode is HBM-bandwidth-bound; the scalar kernel was compute-bound (per-token
+// warp-shuffle reduction => SM busy doing math, not issuing loads) so HBM sat at
+// ~14-21%. This kernel combines: (1) LIGHT compute -- GQA-pack the group's query
+// heads into a 16-row mma tile and use wmma for QK/PV (no per-token shuffle);
+// (2) OVERLAP -- a double-buffered cp.async pipeline so tile t+1 streams while
+// tile t computes; (3) the split-KV heuristic supplies enough waves. Goal: drive
+// %HBM-roofline toward Triton's ~82% while reading HALF the bytes (k_eq_v), i.e.
+// ~2x Triton at high batch. Same online-softmax math as the prefill v2 kernel,
+// BLOCK_M=16 (the G group-heads at the last position; no causal triangle).
+//
+// SPLIT=false: grid (num_kv_heads, num_seqs) -> final out.
+// SPLIT=true:  grid (num_kv_heads, num_seqs, num_splits) -> partials + combine.
+// bf16 only (no fp8 dequant here); fp8 stays on the scalar path.
+// ---------------------------------------------------------------------------
+template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_N,
+          int NUM_WARPS, int GQA_GROUP, bool K_EQ_V, bool USE_SLIDING_WINDOW,
+          bool SPLIT, int MIN_CTA = 1>
+__global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
+gemma_decode_stream_kernel(
+    scalar_t* __restrict__ out_or_tmp,   // SPLIT ? tmp_out partials : final out
+    float* __restrict__ exp_sums,        // [num_seqs,num_q_heads,max_parts] (SPLIT)
+    float* __restrict__ max_logits,      // (SPLIT)
+    const scalar_t* __restrict__ q,
+    const cache_t* __restrict__ k_cache,
+    const cache_t* __restrict__ v_cache,
+    const int num_kv_heads, const float scale,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int max_num_blocks_per_seq, const int page_size, const int q_stride,
+    const int64_t kv_stride_block, const int64_t kv_stride_slot,
+    const int64_t kv_stride_head, const int sliding_window,
+    const int num_splits, const int max_parts) {
+  constexpr int BLOCK_M = 16;
+  constexpr int MT = BLOCK_M / 16;          // == 1
+  constexpr int NT = BLOCK_N / 16;          // QK N tiles
+  constexpr int DT = HEAD_SIZE / 16;        // head tiles
+  constexpr int HNT_W = DT / NUM_WARPS;     // head tiles per warp
+  constexpr int VEC = 16 / sizeof(cache_t);
+  static_assert(DT % NUM_WARPS == 0, "head tiles must split across warps");
+  static_assert(MT * NT <= NUM_WARPS, "QK tiles must fit in warps");
+  static_assert(BLOCK_N % 32 == 0, "warp-softmax assumes BLOCK_N % 32 == 0");
+
+  const int kv_head = blockIdx.x;
+  const int seq_idx = blockIdx.y;
+  const int split_idx = SPLIT ? blockIdx.z : 0;
+  const int nsplits = SPLIT ? num_splits : 1;
+  const int num_q_heads = gridDim.x * GQA_GROUP;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+  const int nthreads = NUM_WARPS * 32;
+  const int seq_len = seq_lens[seq_idx];
+
+#define DSTREAM_PART(qh) \
+  (((int64_t)(seq_idx) * num_q_heads + (qh)) * max_parts + split_idx)
+
+  int kv_begin = 0;
+  if (USE_SLIDING_WINDOW && sliding_window > 0) {
+    const int lo = seq_len - sliding_window;
+    kv_begin = (lo > 0) ? (lo / BLOCK_N) * BLOCK_N : 0;
+  }
+  const int n_tiles = GEMMA_CDIV(seq_len - kv_begin, BLOCK_N);
+  const int tiles_per_split = GEMMA_CDIV(n_tiles, nsplits);
+  const int tile_lo = split_idx * tiles_per_split;
+  int tile_hi = tile_lo + tiles_per_split;
+  if (tile_hi > n_tiles) tile_hi = n_tiles;
+  const int hvps = HEAD_SIZE / VEC;
+
+  if (SPLIT && tile_lo >= tile_hi) {
+    for (int g = warp; g < GQA_GROUP; g += NUM_WARPS)
+      if (lane == 0) {
+        const int qh = kv_head * GQA_GROUP + g;
+        max_logits[DSTREAM_PART(qh)] = -FLT_MAX;
+        exp_sums[DSTREAM_PART(qh)] = 0.f;
+      }
+    for (int iv = tid; iv < GQA_GROUP * hvps; iv += nthreads) {
+      const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
+      const int qh = kv_head * GQA_GROUP + r;
+      *reinterpret_cast<uint4*>(out_or_tmp + DSTREAM_PART(qh) * HEAD_SIZE + dv) =
+          uint4{0, 0, 0, 0};
+    }
+    return;
+  }
+
+  constexpr int SPAD = 8;
+  constexpr int LDH = HEAD_SIZE + SPAD;
+  constexpr int LDN = BLOCK_N + SPAD;
+  constexpr int KTILE = BLOCK_N * LDH;          // elems per staged K tile
+  constexpr int VBUF = K_EQ_V ? 0 : KTILE;      // V staged separately if !k_eq_v
+  constexpr int STAGE = KTILE + VBUF;           // elems per pipeline stage
+
+  extern __shared__ char ds_smem[];
+  cache_t* sQ = reinterpret_cast<cache_t*>(ds_smem);   // [16, LDH]
+  cache_t* sKV = sQ + BLOCK_M * LDH;                    // 2 stages of K(+V)
+  cache_t* sP = sKV + 2 * STAGE;                        // [16, LDN]
+  float* sS = reinterpret_cast<float*>(sP + BLOCK_M * LDN);  // [16, LDN]
+  float* sM = sS + BLOCK_M * LDN;
+  float* sL = sM + BLOCK_M;
+  float* sA = sL + BLOCK_M;
+#define DS_KBUF(s) (sKV + (s) * STAGE)
+#define DS_VBUF(s) (K_EQ_V ? DS_KBUF(s) : (DS_KBUF(s) + KTILE))
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> Ofrag[MT][HNT_W];
+#pragma unroll
+  for (int m = 0; m < MT; m++)
+#pragma unroll
+    for (int j = 0; j < HNT_W; j++) wmma::fill_fragment(Ofrag[m][j], 0.0f);
+
+  for (int r = tid; r < BLOCK_M; r += nthreads) { sM[r] = -FLT_MAX; sL[r] = 0.f; }
+  // Zero KV stages once so partial-tile tails (n >= n_tok) never feed NaN to QK.
+  for (int i = tid; i < 2 * STAGE; i += nthreads) sKV[i] = static_cast<cache_t>(0);
+
+  // Stage Q: G group heads at the last position into rows 0..G-1, pad rest 0.
+  for (int iv = tid; iv < BLOCK_M * hvps; iv += nthreads) {
+    const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
+    if (r < GQA_GROUP) {
+      const int qh = kv_head * GQA_GROUP + r;
+      const scalar_t* gq = q + (int64_t)seq_idx * q_stride + qh * HEAD_SIZE + dv;
+      *reinterpret_cast<uint4*>(sQ + r * LDH + dv) =
+          *reinterpret_cast<const uint4*>(gq);
+    } else {
+      *reinterpret_cast<uint4*>(sQ + r * LDH + dv) = uint4{0, 0, 0, 0};
+    }
+  }
+
+  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+  const float scale_log2 = scale * LOG2E;
+  const int q_abs = seq_len - 1;
+  const int ntiles_local = tile_hi - tile_lo;
+
+  // Async-stage tile (tile_lo + ti) into pipeline stage buffer `s` (per-token
+  // paged gather; 16B cp.async). One pending group committed per call.
+#define DS_STAGE(ti, s)                                                        \
+  do {                                                                         \
+    const int _kv0 = kv_begin + (ti) * BLOCK_N;                                \
+    const int _ntok = min(BLOCK_N, seq_len - _kv0);                            \
+    for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {                  \
+      const int n = iv / hvps, dv = (iv - n * hvps) * VEC;                     \
+      if (n < _ntok) {                                                         \
+        const int tok = _kv0 + n;                                             \
+        const int64_t phys = block_table[tok / page_size];                    \
+        const int slot = tok % page_size;                                     \
+        const int64_t off = phys * kv_stride_block + slot * kv_stride_slot     \
+                            + kv_head * kv_stride_head + dv;                   \
+        __pipeline_memcpy_async(DS_KBUF(s) + n * LDH + dv, k_cache + off, 16); \
+        if (!K_EQ_V)                                                           \
+          __pipeline_memcpy_async(DS_VBUF(s) + n * LDH + dv, v_cache + off,    \
+                                  16);                                         \
+      }                                                                        \
+    }                                                                          \
+    __pipeline_commit();                                                       \
+  } while (0)
+
+  __syncthreads();              // Q + zeroed KV visible before async loads land
+  DS_STAGE(tile_lo, 0);         // prefetch first tile
+
+  for (int t = 0; t < ntiles_local; t++) {
+    const int cur = t & 1;
+    if (t + 1 < ntiles_local) {
+      DS_STAGE(tile_lo + t + 1, (t + 1) & 1);
+      __pipeline_wait_prior(1);  // keep next tile's load in flight
+    } else {
+      __pipeline_wait_prior(0);
+    }
+    __syncthreads();
+
+    const int kv0 = kv_begin + (tile_lo + t) * BLOCK_N;
+    const int n_tok = min(BLOCK_N, seq_len - kv0);
+    cache_t* kbuf = DS_KBUF(cur);
+    cache_t* vbuf = DS_VBUF(cur);
+
+    // QK: S[16, BLOCK_N] = sQ @ kbuf^T (col-major K), full-head contraction.
+    if (warp < MT * NT) {
+      const int mt = warp / NT, nt = warp % NT;
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> s;
+      wmma::fill_fragment(s, 0.0f);
+#pragma unroll
+      for (int kt = 0; kt < DT; kt++) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, cache_t, wmma::row_major> fa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, cache_t, wmma::col_major> fb;
+        wmma::load_matrix_sync(fa, sQ + mt * 16 * LDH + kt * 16, LDH);
+        wmma::load_matrix_sync(fb, kbuf + nt * 16 * LDH + kt * 16, LDH);
+        wmma::mma_sync(s, fa, fb, s);
+      }
+      wmma::store_matrix_sync(sS + mt * 16 * LDN + nt * 16, s, LDN,
+                              wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    // online softmax (parallel, one warp per row). Mask: token-valid + sliding
+    // lower bound only (decode query is the last position -> no causal).
+    constexpr int CPL = BLOCK_N / 32;
+    for (int r = warp; r < BLOCK_M; r += NUM_WARPS) {
+      float sv[CPL];
+      float rmax = -FLT_MAX;
+#pragma unroll
+      for (int cc = 0; cc < CPL; ++cc) {
+        const int c = lane + cc * 32;
+        const int k_abs = kv0 + c;
+        bool valid = (c < n_tok);
+        if (USE_SLIDING_WINDOW && sliding_window > 0)
+          valid = valid && (k_abs > q_abs - sliding_window);
+        sv[cc] = valid ? sS[r * LDN + c] : -FLT_MAX;
+        rmax = fmaxf(rmax, sv[cc]);
+      }
+#pragma unroll
+      for (int o = 16; o >= 1; o >>= 1)
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, o));
+      const float m_old = sM[r];
+      const float m_new = fmaxf(m_old, rmax);
+      const float alpha =
+          (m_old <= -FLT_MAX) ? 0.f : exp2f((m_old - m_new) * scale_log2);
+      float rsum = 0.f;
+#pragma unroll
+      for (int cc = 0; cc < CPL; ++cc) {
+        const int c = lane + cc * 32;
+        const float p =
+            (m_new <= -FLT_MAX) ? 0.f : exp2f((sv[cc] - m_new) * scale_log2);
+        sP[r * LDN + c] = static_cast<cache_t>(p);
+        rsum += p;
+      }
+#pragma unroll
+      for (int o = 16; o >= 1; o >>= 1)
+        rsum += __shfl_xor_sync(0xffffffffu, rsum, o);
+      if (lane == 0) {
+        sM[r] = m_new;
+        sL[r] = sL[r] * alpha + rsum;
+        sA[r] = alpha;
+      }
+    }
+    __syncthreads();
+
+    // PV: rescale O frags by per-row alpha (SM80 acc layout), then P@V.
+    const int gid = lane / 4;
+#pragma unroll
+    for (int m = 0; m < MT; m++) {
+      const float a_lo = sA[m * 16 + gid];
+      const float a_hi = sA[m * 16 + gid + 8];
+#pragma unroll
+      for (int j = 0; j < HNT_W; j++) {
+        Ofrag[m][j].x[0] *= a_lo; Ofrag[m][j].x[1] *= a_lo;
+        Ofrag[m][j].x[2] *= a_hi; Ofrag[m][j].x[3] *= a_hi;
+        Ofrag[m][j].x[4] *= a_lo; Ofrag[m][j].x[5] *= a_lo;
+        Ofrag[m][j].x[6] *= a_hi; Ofrag[m][j].x[7] *= a_hi;
+        const int ht = warp * HNT_W + j;
+#pragma unroll
+        for (int kt = 0; kt < NT; kt++) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, cache_t, wmma::row_major> fp;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, cache_t, wmma::row_major> fv;
+          wmma::load_matrix_sync(fp, sP + m * 16 * LDN + kt * 16, LDN);
+          wmma::load_matrix_sync(fv, vbuf + kt * 16 * LDH + ht * 16, LDH);
+          wmma::mma_sync(Ofrag[m][j], fp, fv, Ofrag[m][j]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // epilogue: store O frags to reused smem (sQ as f32, stride LDH), /L.
+  float* sOt = reinterpret_cast<float*>(sQ);  // [16, LDH] f32 (fits sQ region)
+#pragma unroll
+  for (int m = 0; m < MT; m++)
+#pragma unroll
+    for (int j = 0; j < HNT_W; j++) {
+      const int ht = warp * HNT_W + j;
+      wmma::store_matrix_sync(sOt + m * 16 * LDH + ht * 16, Ofrag[m][j], LDH,
+                              wmma::mem_row_major);
+    }
+  __syncthreads();
+
+  if constexpr (SPLIT) {
+    for (int g = warp; g < GQA_GROUP; g += NUM_WARPS)
+      if (lane == 0) {
+        const int qh = kv_head * GQA_GROUP + g;
+        max_logits[DSTREAM_PART(qh)] = sM[g] * scale_log2;  // base-2 units
+        exp_sums[DSTREAM_PART(qh)] = sL[g];
+      }
+    for (int iv = tid; iv < GQA_GROUP * hvps; iv += nthreads) {
+      const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
+      const int qh = kv_head * GQA_GROUP + r;
+      const float inv = (sL[r] > 0.f) ? (1.f / sL[r]) : 0.f;
+      scalar_t tmp[VEC];
+#pragma unroll
+      for (int e = 0; e < VEC; e++)
+        from_float(tmp[e], sOt[r * LDH + dv + e] * inv);
+      *reinterpret_cast<uint4*>(out_or_tmp + DSTREAM_PART(qh) * HEAD_SIZE + dv) =
+          *reinterpret_cast<uint4*>(tmp);
+    }
+  } else {
+    for (int iv = tid; iv < GQA_GROUP * hvps; iv += nthreads) {
+      const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
+      const int qh = kv_head * GQA_GROUP + r;
+      const float inv = (sL[r] > 0.f) ? (1.f / sL[r]) : 0.f;
+      scalar_t tmp[VEC];
+#pragma unroll
+      for (int e = 0; e < VEC; e++)
+        from_float(tmp[e], sOt[r * LDH + dv + e] * inv);
+      scalar_t* go = out_or_tmp + (int64_t)seq_idx * num_q_heads * HEAD_SIZE
+                       + qh * HEAD_SIZE + dv;
+      *reinterpret_cast<uint4*>(go) = *reinterpret_cast<uint4*>(tmp);
+    }
+  }
+#undef DS_STAGE
+#undef DS_KBUF
+#undef DS_VBUF
+#undef DSTREAM_PART
 }
 
 // ---------------------------------------------------------------------------
