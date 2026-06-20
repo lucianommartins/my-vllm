@@ -162,9 +162,15 @@ void gemma_paged_attention_launcher(
   const int gqa_group =
       (num_kv_heads > 0) ? (num_q_heads / num_kv_heads) : 0;
 
-  // num_splits heuristic: split only when the batch underfills the SMs.
-  // Target ~2 CTAs/SM after accounting for the (num_seqs * num_kv_heads) CTAs
-  // the GQA grid already produces. Clamped to KV blocks and the partition cap.
+  // num_splits heuristic: split the KV dimension until the grid fills the device
+  // with enough waves to saturate HBM. Decode is bandwidth-bound; the prior
+  // `2*SMs` target left the grid at <1 wave for medium batch (ncu: "grid too
+  // small, 0.8 waves"), so HBM sat idle. Target ~DECODE_WAVES waves at the
+  // measured decode occupancy (~3 CTA/SM); a split-count sweep (hd512, A100)
+  // matched ceil(DECODE_WAVES*CTA_PER_SM*SMs / total_ctas) across b=8..256.
+  // Clamped to the KV blocks and the partition-buffer cap.
+  static constexpr int DECODE_CTA_PER_SM = 3;  // reg/smem-bound occupancy
+  static constexpr int DECODE_WAVES = 6;       // waves to saturate HBM (swept)
   static int num_sms = []() {
     int dev = 0;
     cudaGetDevice(&dev);
@@ -180,8 +186,9 @@ void gemma_paged_attention_launcher(
     const int eff_seq = (sliding_window > 0 && sliding_window < max_seq_len)
                             ? sliding_window : max_seq_len;
     const int max_seq_blocks = (eff_seq + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int desired_ctas = DECODE_WAVES * DECODE_CTA_PER_SM * num_sms;
     int target = (total_ctas > 0)
-                     ? (2 * num_sms + total_ctas - 1) / total_ctas
+                     ? (desired_ctas + total_ctas - 1) / total_ctas
                      : 1;
     num_splits = target < 1 ? 1 : target;
     if (num_splits > max_seq_blocks) num_splits = max_seq_blocks;
