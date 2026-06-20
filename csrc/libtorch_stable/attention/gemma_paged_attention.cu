@@ -159,11 +159,6 @@ void gemma_paged_attention_launcher(
 
   bool use_sw = (sliding_window > 0);
 
-  // Prototype A/B toggle: GEMMA_USE_GQA enables the GQA-group-reuse kernel for
-  // the k_eq_v full-attention case (the high-value hd=512 path).
-  // GEMMA_GQA_NOSPLIT forces the single-CTA (no split-KV) variant for A/B.
-  const bool use_gqa = (std::getenv("GEMMA_USE_GQA") != nullptr);
-  const bool no_split = (std::getenv("GEMMA_GQA_NOSPLIT") != nullptr);
   const int gqa_group =
       (num_kv_heads > 0) ? (num_q_heads / num_kv_heads) : 0;
 
@@ -194,18 +189,16 @@ void gemma_paged_attention_launcher(
     if (max_seq_blocks <= 4) num_splits = 1;
     if (num_splits < 1) num_splits = 1;
   }
-  if (no_split) num_splits = 1;
 
-  // GQA-reuse dispatch (A1 single-CTA, or A2 split-KV when num_splits>1) for the
-  // cases where actual_head_size == head_size (the combine reads HEAD_SIZE dims).
+  // GQA-reuse dispatch (always on): A2 split-KV when the batch underfills the
+  // SMs, else the A1 single-CTA GQA kernel. For cases where actual_head_size ==
+  // head_size (the combine reads HEAD_SIZE dims).
 #define GEMMA_DISPATCH(HS, AHS, KEQV, USW)                  \
   do {                                                      \
-    if (use_gqa && num_splits > 1) {                        \
+    if (num_splits > 1) {                                   \
       LAUNCH_GEMMA_GQA_SPLIT_GROUP(HS, AHS, KEQV, USW);     \
-    } else if (use_gqa) {                                   \
-      LAUNCH_GEMMA_GQA_GROUP(HS, AHS, KEQV, USW);           \
     } else {                                                \
-      LAUNCH_GEMMA(HS, AHS, KEQV, USW);                     \
+      LAUNCH_GEMMA_GQA_GROUP(HS, AHS, KEQV, USW);           \
     }                                                       \
   } while (0)
 

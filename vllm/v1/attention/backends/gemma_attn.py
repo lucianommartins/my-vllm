@@ -313,6 +313,32 @@ class GemmaAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: GemmaAttentionMetadata,
     ) -> torch.Tensor:
+        # Gemma4-optimized tensor-core prefill for all bf16 / non-quantized-KV
+        # layers (hd=512 full and hd=256 sliding-window). fp8/fp16 fall back to
+        # Triton below.
+        if (
+            self.head_size in (256, 512)
+            and self.actual_head_size == self.head_size
+            and query.dtype == torch.bfloat16
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+        ):
+            torch.ops._C.gemma_prefill_attention(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                self.num_kv_heads,
+                self.scale,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                attn_metadata.query_start_loc,
+                attn_metadata.max_query_len,
+                key_cache.shape[1],
+                self.k_eq_v,
+                self.sliding_window,
+            )
+            return output
+
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,
         )

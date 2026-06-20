@@ -13,7 +13,8 @@
 static constexpr int PF_BM = 32;
 static constexpr int PF_BN = 32;
 static constexpr int PF_NW = 4;
-static constexpr int PF_NW_V2 = 16;
+static constexpr int PF_NW_V2 = 16;       // warps/CTA for hd=512
+static constexpr int PF_NW_V2_256 = 8;    // warps/CTA for hd=256 (sweep knob)
 
 #define LAUNCH_PREFILL(HEAD, GROUP, KEQV, USW)                                 \
   do {                                                                         \
@@ -45,11 +46,11 @@ static constexpr int PF_NW_V2 = 16;
       STD_TORCH_CHECK(false, "Unsupported prefill GQA group: ", gqa_group);    \
   }
 
-// v2: register-resident O, head-split warps.
-#define LAUNCH_PREFILL_V2(HEAD, GROUP, KEQV, USW)                              \
+// v2: register-resident O, head-split warps. NW = warps/CTA (per head size).
+#define LAUNCH_PREFILL_V2(HEAD, NW, GROUP, KEQV, USW)                          \
   do {                                                                         \
     auto kern = vllm::gemma_prefill::gemma_prefill_kernel_v2<                  \
-        T, CACHE_T, HEAD, PF_BM, PF_BN, PF_NW_V2, GROUP, KEQV, USW>;          \
+        T, CACHE_T, HEAD, PF_BM, PF_BN, NW, GROUP, KEQV, USW>;                \
     size_t smem =                                                             \
         (size_t)(PF_BM * (HEAD + 8) + PF_BN * (HEAD + 8)                       \
                  + PF_BM * (PF_BN + 8)) * sizeof(CACHE_T)                       \
@@ -60,20 +61,20 @@ static constexpr int PF_NW_V2 = 16;
     cudaFuncSetAttribute(                                                      \
         kern, cudaFuncAttributePreferredSharedMemoryCarveout, 100);           \
     dim3 grid(PF_CDIV(max_q_len, PF_BM), num_q_heads, num_seqs);             \
-    kern<<<grid, PF_NW_V2 * 32, smem, stream>>>(                              \
+    kern<<<grid, (NW) * 32, smem, stream>>>(                                  \
         out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,            \
         block_tables_ptr, seq_lens_ptr, cu_seqlens_q_ptr,                      \
         max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
         kv_stride_slot, kv_stride_head, sliding_window);                       \
   } while (0)
 
-#define LAUNCH_PREFILL_V2_GROUP(HEAD, KEQV, USW)                               \
+#define LAUNCH_PREFILL_V2_GROUP(HEAD, NW, KEQV, USW)                           \
   switch (gqa_group) {                                                         \
-    case 1: LAUNCH_PREFILL_V2(HEAD, 1, KEQV, USW); break;                      \
-    case 2: LAUNCH_PREFILL_V2(HEAD, 2, KEQV, USW); break;                      \
-    case 4: LAUNCH_PREFILL_V2(HEAD, 4, KEQV, USW); break;                      \
-    case 8: LAUNCH_PREFILL_V2(HEAD, 8, KEQV, USW); break;                      \
-    case 16: LAUNCH_PREFILL_V2(HEAD, 16, KEQV, USW); break;                    \
+    case 1: LAUNCH_PREFILL_V2(HEAD, NW, 1, KEQV, USW); break;                  \
+    case 2: LAUNCH_PREFILL_V2(HEAD, NW, 2, KEQV, USW); break;                  \
+    case 4: LAUNCH_PREFILL_V2(HEAD, NW, 4, KEQV, USW); break;                  \
+    case 8: LAUNCH_PREFILL_V2(HEAD, NW, 8, KEQV, USW); break;                  \
+    case 16: LAUNCH_PREFILL_V2(HEAD, NW, 16, KEQV, USW); break;                \
     default:                                                                   \
       STD_TORCH_CHECK(false, "Unsupported prefill GQA group: ", gqa_group);    \
   }
@@ -108,29 +109,29 @@ void gemma_prefill_launcher(
       query.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
 
-  STD_TORCH_CHECK(head_size == 512,
-                  "Gemma prefill kernel currently supports head_size=512 only,"
-                  " got ", head_size);
-  const bool v2 = (std::getenv("GEMMA_PREFILL_V2") != nullptr);
-  if (v2) {
-    if (k_eq_v && use_sw) {
-      LAUNCH_PREFILL_V2_GROUP(512, true, true);
-    } else if (k_eq_v && !use_sw) {
-      LAUNCH_PREFILL_V2_GROUP(512, true, false);
-    } else if (!k_eq_v && use_sw) {
-      LAUNCH_PREFILL_V2_GROUP(512, false, true);
-    } else {
-      LAUNCH_PREFILL_V2_GROUP(512, false, false);
-    }
-  } else if (k_eq_v && use_sw) {
-    LAUNCH_PREFILL_GROUP(512, true, true);
-  } else if (k_eq_v && !use_sw) {
-    LAUNCH_PREFILL_GROUP(512, true, false);
-  } else if (!k_eq_v && use_sw) {
-    LAUNCH_PREFILL_GROUP(512, false, true);
+  STD_TORCH_CHECK(head_size == 512 || head_size == 256,
+                  "Gemma prefill kernel supports head_size 256 or 512, got ",
+                  head_size);
+
+#define PF_DISPATCH(HEAD, NW)                                  \
+  do {                                                         \
+    if (k_eq_v && use_sw) {                                    \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, true, true);           \
+    } else if (k_eq_v && !use_sw) {                            \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, true, false);          \
+    } else if (!k_eq_v && use_sw) {                            \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, false, true);          \
+    } else {                                                   \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, false, false);         \
+    }                                                          \
+  } while (0)
+
+  if (head_size == 512) {
+    PF_DISPATCH(512, PF_NW_V2);
   } else {
-    LAUNCH_PREFILL_GROUP(512, false, false);
+    PF_DISPATCH(256, PF_NW_V2_256);
   }
+#undef PF_DISPATCH
 }
 
 void gemma_prefill_attention(
