@@ -15,6 +15,13 @@ static constexpr int PF_BN = 32;
 static constexpr int PF_NW = 4;
 static constexpr int PF_NW_V2 = 16;       // warps/CTA for hd=512
 static constexpr int PF_NW_V2_256 = 8;    // warps/CTA for hd=256 (sweep knob)
+// __launch_bounds__ min-CTA/SM target -> drives the register allocator to the
+// occupancy the smem budget allows. Tuned per head size (profiled on A100):
+//   hd512: 1->2 CTA/SM (REG 128->64, no spill) = 50% occ, ~1.33x->~1.67x.
+//   hd256: 2->3 CTA/SM (REG ~120->79, no spill) = 37.5% occ, 0.9-1.15x->1.17-1.34x.
+// Pushing further (hd512=3 / hd256=4) is smem-capped and only cuts ILP -> worse.
+static constexpr int PF_MINCTA_512 = 2;
+static constexpr int PF_MINCTA_256 = 3;
 
 #define LAUNCH_PREFILL(HEAD, GROUP, KEQV, USW)                                 \
   do {                                                                         \
@@ -47,10 +54,11 @@ static constexpr int PF_NW_V2_256 = 8;    // warps/CTA for hd=256 (sweep knob)
   }
 
 // v2: register-resident O, head-split warps. NW = warps/CTA (per head size).
-#define LAUNCH_PREFILL_V2(HEAD, NW, GROUP, KEQV, USW)                          \
+// MINCTA = __launch_bounds__ min CTA/SM target (drives register allocation).
+#define LAUNCH_PREFILL_V2(HEAD, NW, MINCTA, GROUP, KEQV, USW)                  \
   do {                                                                         \
     auto kern = vllm::gemma_prefill::gemma_prefill_kernel_v2<                  \
-        T, CACHE_T, HEAD, PF_BM, PF_BN, NW, GROUP, KEQV, USW>;                \
+        T, CACHE_T, HEAD, PF_BM, PF_BN, NW, GROUP, KEQV, USW, MINCTA>;        \
     size_t smem =                                                             \
         (size_t)(PF_BM * (HEAD + 8) + PF_BN * (HEAD + 8)                       \
                  + PF_BM * (PF_BN + 8)) * sizeof(CACHE_T)                       \
@@ -68,13 +76,13 @@ static constexpr int PF_NW_V2_256 = 8;    // warps/CTA for hd=256 (sweep knob)
         kv_stride_slot, kv_stride_head, sliding_window);                       \
   } while (0)
 
-#define LAUNCH_PREFILL_V2_GROUP(HEAD, NW, KEQV, USW)                           \
+#define LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, KEQV, USW)                   \
   switch (gqa_group) {                                                         \
-    case 1: LAUNCH_PREFILL_V2(HEAD, NW, 1, KEQV, USW); break;                  \
-    case 2: LAUNCH_PREFILL_V2(HEAD, NW, 2, KEQV, USW); break;                  \
-    case 4: LAUNCH_PREFILL_V2(HEAD, NW, 4, KEQV, USW); break;                  \
-    case 8: LAUNCH_PREFILL_V2(HEAD, NW, 8, KEQV, USW); break;                  \
-    case 16: LAUNCH_PREFILL_V2(HEAD, NW, 16, KEQV, USW); break;                \
+    case 1: LAUNCH_PREFILL_V2(HEAD, NW, MINCTA, 1, KEQV, USW); break;          \
+    case 2: LAUNCH_PREFILL_V2(HEAD, NW, MINCTA, 2, KEQV, USW); break;          \
+    case 4: LAUNCH_PREFILL_V2(HEAD, NW, MINCTA, 4, KEQV, USW); break;          \
+    case 8: LAUNCH_PREFILL_V2(HEAD, NW, MINCTA, 8, KEQV, USW); break;          \
+    case 16: LAUNCH_PREFILL_V2(HEAD, NW, MINCTA, 16, KEQV, USW); break;        \
     default:                                                                   \
       STD_TORCH_CHECK(false, "Unsupported prefill GQA group: ", gqa_group);    \
   }
@@ -113,23 +121,23 @@ void gemma_prefill_launcher(
                   "Gemma prefill kernel supports head_size 256 or 512, got ",
                   head_size);
 
-#define PF_DISPATCH(HEAD, NW)                                  \
+#define PF_DISPATCH(HEAD, NW, MINCTA)                          \
   do {                                                         \
     if (k_eq_v && use_sw) {                                    \
-      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, true, true);           \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, true, true);   \
     } else if (k_eq_v && !use_sw) {                            \
-      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, true, false);          \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, true, false);  \
     } else if (!k_eq_v && use_sw) {                            \
-      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, false, true);          \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, false, true);  \
     } else {                                                   \
-      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, false, false);         \
+      LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, false, false); \
     }                                                          \
   } while (0)
 
   if (head_size == 512) {
-    PF_DISPATCH(512, PF_NW_V2);
+    PF_DISPATCH(512, PF_NW_V2, PF_MINCTA_512);
   } else {
-    PF_DISPATCH(256, PF_NW_V2_256);
+    PF_DISPATCH(256, PF_NW_V2_256, PF_MINCTA_256);
   }
 #undef PF_DISPATCH
 }

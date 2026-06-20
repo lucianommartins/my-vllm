@@ -268,8 +268,9 @@ __global__ void gemma_prefill_kernel(
 // ===========================================================================
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_M,
           int BLOCK_N, int NUM_WARPS, int GQA_GROUP, bool K_EQ_V,
-          bool USE_SLIDING_WINDOW>
-__global__ void gemma_prefill_kernel_v2(
+          bool USE_SLIDING_WINDOW, int MIN_CTA = 1>
+__global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
+    gemma_prefill_kernel_v2(
     scalar_t* __restrict__ out, const scalar_t* __restrict__ q,
     const cache_t* __restrict__ k_cache, const cache_t* __restrict__ v_cache,
     const float scale, const int* __restrict__ block_tables,
@@ -398,17 +399,26 @@ __global__ void gemma_prefill_kernel_v2(
     // mask + online softmax, parallelized: one WARP per row (32 lanes = the
     // BLOCK_N columns), warp-reduced max/sum. All warps active (vs the previous
     // 1-thread-per-row serial phase that bottlenecked between barriers).
-    static_assert(BLOCK_N == 32, "warp-softmax assumes BLOCK_N == warpSize");
+    // Generalized to BLOCK_N == k*32: each lane owns CPL = BLOCK_N/32 columns
+    // (strided by 32), reduced within-lane then across the warp. CPL==1 recovers
+    // the original one-col-per-lane path.
+    static_assert(BLOCK_N % 32 == 0, "warp-softmax assumes BLOCK_N % 32 == 0");
+    constexpr int CPL = BLOCK_N / 32;
     for (int r = warp; r < BLOCK_M; r += NUM_WARPS) {
       const int qr = row0 + r;
       const int q_abs = context + qr;
-      const int c = lane;
-      const int k_abs = kv0 + c;
-      bool valid = (qr < q_len) && (c < n_tok) && (k_abs <= q_abs);
-      if (USE_SLIDING_WINDOW && sliding_window > 0)
-        valid = valid && (k_abs > q_abs - sliding_window);
-      float sv = valid ? sS[r * LDN + c] : -FLT_MAX;
-      float rmax = sv;
+      float sv[CPL];
+      float rmax = -FLT_MAX;
+#pragma unroll
+      for (int cc = 0; cc < CPL; ++cc) {
+        const int c = lane + cc * 32;
+        const int k_abs = kv0 + c;
+        bool valid = (qr < q_len) && (c < n_tok) && (k_abs <= q_abs);
+        if (USE_SLIDING_WINDOW && sliding_window > 0)
+          valid = valid && (k_abs > q_abs - sliding_window);
+        sv[cc] = valid ? sS[r * LDN + c] : -FLT_MAX;
+        rmax = fmaxf(rmax, sv[cc]);
+      }
 #pragma unroll
       for (int o = 16; o >= 1; o >>= 1)
         rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, o));
@@ -416,10 +426,15 @@ __global__ void gemma_prefill_kernel_v2(
       const float m_new = fmaxf(m_old, rmax);
       const float alpha =
           (m_old <= -FLT_MAX) ? 0.f : exp2f((m_old - m_new) * scale_log2);
-      const float p =
-          (m_new <= -FLT_MAX) ? 0.f : exp2f((sv - m_new) * scale_log2);
-      sP[r * LDN + c] = static_cast<cache_t>(p);
-      float rsum = p;
+      float rsum = 0.f;
+#pragma unroll
+      for (int cc = 0; cc < CPL; ++cc) {
+        const int c = lane + cc * 32;
+        const float p =
+            (m_new <= -FLT_MAX) ? 0.f : exp2f((sv[cc] - m_new) * scale_log2);
+        sP[r * LDN + c] = static_cast<cache_t>(p);
+        rsum += p;
+      }
 #pragma unroll
       for (int o = 16; o >= 1; o >>= 1)
         rsum += __shfl_xor_sync(0xffffffffu, rsum, o);
