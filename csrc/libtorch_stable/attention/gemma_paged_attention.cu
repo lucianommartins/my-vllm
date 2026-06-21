@@ -523,3 +523,180 @@ void gemma_paged_attention(
   DISPATCH_BY_KV_CACHE_DTYPE(query.scalar_type(), kv_cache_dtype,
                              CALL_GEMMA_LAUNCHER_BLOCK_SIZE)
 }
+
+// ---- Lossy top-k block selection (P2). Produces selected_tiles for the decode
+// op. EXACT scoring (reads K) — the quality reference; bounds scoring is next.
+template <typename T, typename CACHE_T, int BLOCK_SIZE,
+          vllm::Fp8KVCacheDataType KV_DTYPE>
+void gemma_topk_select_launcher(
+    torch::stable::Tensor& selected_tiles,
+    torch::stable::Tensor& query,
+    torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& block_bounds,   // empty -> exact (read K) scoring
+    float scale,
+    torch::stable::Tensor& block_tables,
+    torch::stable::Tensor& seq_lens,
+    int num_kv_heads,
+    int sink_tiles,
+    int win_tiles) {
+  const int num_seqs = query.size(0);
+  const int num_q_heads = query.size(1);
+  const int head_size = query.size(2);
+  const int max_num_blocks_per_seq = block_tables.size(1);
+  const int q_stride = query.stride(0);
+  const int num_sel = selected_tiles.size(2);
+  const int gqa_group = (num_kv_heads > 0) ? (num_q_heads / num_kv_heads) : 0;
+
+  const int64_t kv_stride_block = key_cache.stride(0);
+  const int64_t kv_stride_slot = key_cache.stride(1);
+  const int64_t kv_stride_head = key_cache.stride(2);
+
+  int* sel_ptr = selected_tiles.mutable_data_ptr<int>();
+  T* q_ptr = reinterpret_cast<T*>(query.data_ptr());
+  CACHE_T* k_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
+  int* bt_ptr = block_tables.mutable_data_ptr<int>();
+  int* sl_ptr = seq_lens.mutable_data_ptr<int>();
+  const bool use_bounds = (block_bounds.numel() > 0);
+  const float* bb_ptr = use_bounds
+      ? reinterpret_cast<const float*>(block_bounds.data_ptr()) : nullptr;
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      query.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  const dim3 grid(num_kv_heads, num_seqs);
+  constexpr int NW = 8;
+  const size_t smem = (size_t)max_num_blocks_per_seq * sizeof(float);
+
+#define LAUNCH_TOPK(HS, GRP)                                                  \
+  do {                                                                        \
+    if (use_bounds) {                                                         \
+      auto tk = vllm::gemma::gemma_topk_select_bounds_kernel<T, HS,           \
+                                                    BLOCK_SIZE, GRP, NW>;     \
+      if (smem > 48 * 1024)                                                   \
+        cudaFuncSetAttribute(                                                 \
+            tk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);          \
+      tk<<<grid, NW * WARP_SIZE, smem, stream>>>(                            \
+          sel_ptr, q_ptr, bb_ptr, scale, bt_ptr, sl_ptr,                     \
+          max_num_blocks_per_seq, q_stride, num_kv_heads, num_sel,            \
+          sink_tiles, win_tiles);                                            \
+    } else {                                                                  \
+      auto tk = vllm::gemma::gemma_topk_select_kernel<T, CACHE_T, HS,         \
+                                                    BLOCK_SIZE, GRP, NW>;     \
+      if (smem > 48 * 1024)                                                   \
+        cudaFuncSetAttribute(                                                 \
+            tk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);          \
+      tk<<<grid, NW * WARP_SIZE, smem, stream>>>(                            \
+          sel_ptr, q_ptr, k_ptr, scale, bt_ptr, sl_ptr,                      \
+          max_num_blocks_per_seq, q_stride, kv_stride_block, kv_stride_slot,  \
+          kv_stride_head, num_sel, sink_tiles, win_tiles);                   \
+    }                                                                         \
+  } while (0)
+
+  STD_TORCH_CHECK(head_size == 512,
+      "gemma_topk_select supports head_size=512 (full layers) only, got ",
+      head_size);
+  switch (gqa_group) {
+    case 1:  LAUNCH_TOPK(512, 1); break;
+    case 2:  LAUNCH_TOPK(512, 2); break;
+    case 4:  LAUNCH_TOPK(512, 4); break;
+    case 8:  LAUNCH_TOPK(512, 8); break;
+    default:
+      STD_TORCH_CHECK(false, "gemma_topk_select unsupported gqa_group=",
+                      gqa_group);
+  }
+#undef LAUNCH_TOPK
+}
+
+#define CALL_GEMMA_TOPK(T, CACHE_T, BLOCK_SIZE, KV_DTYPE)                     \
+  gemma_topk_select_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE>(               \
+      selected_tiles, query, key_cache, block_bounds, scale, block_tables,    \
+      seq_lens, num_kv_heads, sink_tiles, win_tiles);
+
+#define CALL_GEMMA_TOPK_BLOCK_SIZE(T, CACHE_T, KV_DTYPE)                      \
+  switch (block_size) {                                                       \
+    case 16: CALL_GEMMA_TOPK(T, CACHE_T, 16, KV_DTYPE); break;                \
+    case 32: CALL_GEMMA_TOPK(T, CACHE_T, 32, KV_DTYPE); break;                \
+    case 64: CALL_GEMMA_TOPK(T, CACHE_T, 64, KV_DTYPE); break;                \
+    default:                                                                  \
+      STD_TORCH_CHECK(false, "Unsupported block size: ", block_size);         \
+      break;                                                                  \
+  }
+
+void gemma_topk_select(
+    torch::stable::Tensor& selected_tiles,
+    torch::stable::Tensor& query,
+    torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& block_bounds,
+    double scale,
+    torch::stable::Tensor& block_tables,
+    torch::stable::Tensor& seq_lens,
+    int64_t num_kv_heads,
+    int64_t block_size,
+    const std::string& kv_cache_dtype,
+    int64_t sink_tiles,
+    int64_t win_tiles) {
+  DISPATCH_BY_KV_CACHE_DTYPE(query.scalar_type(), kv_cache_dtype,
+                             CALL_GEMMA_TOPK_BLOCK_SIZE)
+}
+
+// ---- Maintain per-block min/max key bounds (recompute touched blocks). ----
+template <typename T, typename CACHE_T, int BLOCK_SIZE,
+          vllm::Fp8KVCacheDataType KV_DTYPE>
+void gemma_update_kv_bounds_launcher(
+    torch::stable::Tensor& block_bounds,
+    torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& uniq_blocks,
+    torch::stable::Tensor& ntoks,
+    int num_kv_heads) {
+  const int M = uniq_blocks.size(0);
+  if (M <= 0) return;
+  const int head_size = key_cache.size(3);
+  const int64_t kv_stride_block = key_cache.stride(0);
+  const int64_t kv_stride_slot = key_cache.stride(1);
+  const int64_t kv_stride_head = key_cache.stride(2);
+
+  float* bb_ptr = reinterpret_cast<float*>(block_bounds.data_ptr());
+  CACHE_T* k_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
+  int* ub_ptr = uniq_blocks.mutable_data_ptr<int>();
+  int* nt_ptr = ntoks.mutable_data_ptr<int>();
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      key_cache.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  const int threads = 256;
+
+  STD_TORCH_CHECK(head_size == 512,
+      "gemma_update_kv_bounds supports head_size=512 only, got ", head_size);
+  vllm::gemma::gemma_update_kv_bounds_kernel<CACHE_T, 512>
+      <<<M, threads, 0, stream>>>(bb_ptr, k_ptr, ub_ptr, nt_ptr, num_kv_heads,
+                                  kv_stride_block, kv_stride_slot,
+                                  kv_stride_head);
+}
+
+#define CALL_GEMMA_UPDATE_BOUNDS(T, CACHE_T, BLOCK_SIZE, KV_DTYPE)            \
+  gemma_update_kv_bounds_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE>(          \
+      block_bounds, key_cache, uniq_blocks, ntoks, num_kv_heads);
+
+#define CALL_GEMMA_UPDATE_BOUNDS_BLOCK_SIZE(T, CACHE_T, KV_DTYPE)            \
+  switch (block_size) {                                                       \
+    case 16: CALL_GEMMA_UPDATE_BOUNDS(T, CACHE_T, 16, KV_DTYPE); break;       \
+    case 32: CALL_GEMMA_UPDATE_BOUNDS(T, CACHE_T, 32, KV_DTYPE); break;       \
+    case 64: CALL_GEMMA_UPDATE_BOUNDS(T, CACHE_T, 64, KV_DTYPE); break;       \
+    default:                                                                  \
+      STD_TORCH_CHECK(false, "Unsupported block size: ", block_size);         \
+      break;                                                                  \
+  }
+
+void gemma_update_kv_bounds(
+    torch::stable::Tensor& block_bounds,
+    torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& uniq_blocks,
+    torch::stable::Tensor& ntoks,
+    int64_t num_kv_heads,
+    int64_t block_size,
+    const std::string& kv_cache_dtype) {
+  // query scalar_type stand-in: use key_cache dtype for dispatch.
+  DISPATCH_BY_KV_CACHE_DTYPE(key_cache.scalar_type(), kv_cache_dtype,
+                             CALL_GEMMA_UPDATE_BOUNDS_BLOCK_SIZE)
+}

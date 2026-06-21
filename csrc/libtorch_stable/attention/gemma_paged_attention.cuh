@@ -75,6 +75,246 @@ inline __device__ float warp_reduce_sum(float val) {
   return val;
 }
 
+// Warp-wide argmax (value, index); ties -> lower index. Used by top-k select.
+inline __device__ void warp_argmax(float& val, int& idx) {
+#pragma unroll
+  for (int o = WARP_SIZE / 2; o >= 1; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, val, o);
+    const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+    if (ov > val || (ov == val && oi < idx)) { val = ov; idx = oi; }
+  }
+}
+
+// Lossy top-k block SELECTION (P2, Quest-style) — EXACT scoring variant.
+// One CTA per (kv_head, seq); grid (num_kv_heads, num_seqs). Computes, per KV
+// block, score = max over {tokens in block} x {GROUP query heads} of q.k, then
+// writes the top-`num_sel` block indices (sink + recent window forced in) to
+// selected_tiles[seq, kv_head, :]. The decode kernel then walks that list.
+// This reads K (the QK part) -> a quality reference; the maintained-bounds
+// scoring (no full-K read = the speed win) is the follow-up, same output API.
+template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE,
+          int GROUP, int NUM_WARPS>
+__global__ void gemma_topk_select_kernel(
+    int* __restrict__ selected_tiles,           // [num_seqs,num_kv_heads,num_sel]
+    const scalar_t* __restrict__ q,             // [num_seqs,num_q_heads,HEAD_SIZE]
+    const cache_t* __restrict__ k_cache,
+    const float scale,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int64_t kv_stride_block,
+    const int64_t kv_stride_slot,
+    const int64_t kv_stride_head,
+    const int num_sel, const int sink_tiles, const int win_tiles) {
+  const int kv_head = blockIdx.x;
+  const int seq_idx = blockIdx.y;
+  const int num_kv_heads = gridDim.x;
+  const int seq_len = seq_lens[seq_idx];
+  const int n_blocks = GEMMA_CDIV(seq_len, BLOCK_SIZE);
+  const int warp_idx = threadIdx.x / WARP_SIZE;
+  const int lane = threadIdx.x % WARP_SIZE;
+  constexpr int EPT = HEAD_SIZE / WARP_SIZE;
+  static_assert(HEAD_SIZE % WARP_SIZE == 0);
+  const int dim_start = lane * EPT;
+
+  extern __shared__ float s_scores[];           // [n_blocks]
+
+  // Load this lane's EPT dims of all GROUP query heads of this kv_head.
+  float q_regs[GROUP][EPT];
+#pragma unroll
+  for (int g = 0; g < GROUP; g++) {
+    const scalar_t* qp = q + (int64_t)seq_idx * q_stride
+                           + (int64_t)(kv_head * GROUP + g) * HEAD_SIZE
+                           + dim_start;
+#pragma unroll
+    for (int e = 0; e < EPT; e++) q_regs[g][e] = static_cast<float>(qp[e]);
+  }
+
+  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+
+  // Phase 1: per-block score (warp-strided over blocks).
+  for (int blk = warp_idx; blk < n_blocks; blk += NUM_WARPS) {
+    const int64_t phys = block_table[blk];
+    const int ntok = min(BLOCK_SIZE, seq_len - blk * BLOCK_SIZE);
+    float bmax = -FLT_MAX;
+    for (int slot = 0; slot < ntok; slot++) {
+      const cache_t* kp = k_cache + phys * kv_stride_block
+                                   + slot * kv_stride_slot
+                                   + (int64_t)kv_head * kv_stride_head
+                                   + dim_start;
+      float kv[EPT];
+#pragma unroll
+      for (int e = 0; e < EPT; e++) kv[e] = static_cast<float>(kp[e]);
+#pragma unroll
+      for (int g = 0; g < GROUP; g++) {
+        float qk = 0.f;
+#pragma unroll
+        for (int e = 0; e < EPT; e++) qk += q_regs[g][e] * kv[e];
+        qk = warp_reduce_sum(qk);
+        bmax = fmaxf(bmax, qk);
+      }
+    }
+    if (lane == 0) s_scores[blk] = bmax * scale;
+  }
+  __syncthreads();
+
+  // Force sinks [0,sink_tiles) and recent window [n_blocks-win_tiles,n_blocks).
+  for (int t = threadIdx.x; t < n_blocks; t += blockDim.x)
+    if (t < sink_tiles || t >= n_blocks - win_tiles) s_scores[t] = FLT_MAX;
+  __syncthreads();
+
+  // Phase 2: pick top-`num_sel` (warp 0). Caller gates num_sel <= n_blocks; the
+  // pad branch only fires for degenerate short seqs (then ~full attention).
+  if (warp_idx == 0) {
+    int* outp = selected_tiles
+              + ((int64_t)seq_idx * num_kv_heads + kv_head) * num_sel;
+    const int cnt = (num_sel < n_blocks) ? num_sel : n_blocks;
+    for (int i = 0; i < cnt; i++) {
+      float bv = -FLT_MAX;
+      int bi = n_blocks;  // sentinel (> any valid index for tie-break)
+      for (int t = lane; t < n_blocks; t += WARP_SIZE) {
+        const float v = s_scores[t];
+        if (v > bv || (v == bv && t < bi)) { bv = v; bi = t; }
+      }
+      warp_argmax(bv, bi);
+      if (lane == 0) { outp[i] = bi; s_scores[bi] = -FLT_MAX; }
+      __syncwarp();
+    }
+    if (lane == 0)
+      for (int i = cnt; i < num_sel; i++) outp[i] = (cnt > 0) ? outp[cnt - 1] : 0;
+  }
+}
+
+// Maintain per-block channel min/max key bounds (for the bounds-scoring top-k =
+// the SPEED path: scoring reads these small bounds, NOT the full K). Recomputes
+// only the TOUCHED blocks (passed as uniq_blocks/ntoks) from the cache after a
+// KV write -> correct, race-free, and recycling-safe (freed/reused blocks are
+// recomputed from offset 0 on their first new write). Layout
+// block_bounds[num_blocks, 2(min,max), num_kv_heads, HEAD_SIZE].
+template <typename cache_t, int HEAD_SIZE>
+__global__ void gemma_update_kv_bounds_kernel(
+    float* __restrict__ block_bounds,
+    const cache_t* __restrict__ k_cache,
+    const int* __restrict__ uniq_blocks,   // [M] physical block ids touched
+    const int* __restrict__ ntoks,         // [M] valid tokens in each block
+    const int num_kv_heads,
+    const int64_t kv_stride_block,
+    const int64_t kv_stride_slot,
+    const int64_t kv_stride_head) {
+  const int m = blockIdx.x;
+  const int phys = uniq_blocks[m];
+  const int ntok = ntoks[m];
+  const int plane = num_kv_heads * HEAD_SIZE;   // min/max plane stride
+  const int total = plane;                      // channels = nkv * HEAD_SIZE
+  const int64_t bb_block = (int64_t)2 * plane;
+  for (int c = threadIdx.x; c < total; c += blockDim.x) {
+    const int kvh = c / HEAD_SIZE;
+    const int d = c % HEAD_SIZE;
+    const cache_t* base = k_cache + (int64_t)phys * kv_stride_block
+                                   + (int64_t)kvh * kv_stride_head + d;
+    float vmin = FLT_MAX, vmax = -FLT_MAX;
+    for (int s = 0; s < ntok; s++) {
+      const float v = static_cast<float>(base[(int64_t)s * kv_stride_slot]);
+      vmin = fminf(vmin, v);
+      vmax = fmaxf(vmax, v);
+    }
+    float* bb = block_bounds + (int64_t)phys * bb_block + c;
+    bb[0] = vmin;          // min plane
+    bb[plane] = vmax;      // max plane
+  }
+}
+
+// Bounds-scoring top-k SELECTION (the SPEED path). Same output as
+// gemma_topk_select_kernel but the per-block score is the Quest upper bound
+// sum_d (q_d>0 ? q_d*max_d : q_d*min_d) read from the maintained bounds (no
+// full-K read). Validated to select identically to exact scoring (synthetic).
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int GROUP,
+          int NUM_WARPS>
+__global__ void gemma_topk_select_bounds_kernel(
+    int* __restrict__ selected_tiles,
+    const scalar_t* __restrict__ q,
+    const float* __restrict__ block_bounds,    // [num_blocks,2,nkv,HEAD_SIZE]
+    const float scale,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int num_kv_heads,
+    const int num_sel, const int sink_tiles, const int win_tiles) {
+  const int kv_head = blockIdx.x;
+  const int seq_idx = blockIdx.y;
+  const int seq_len = seq_lens[seq_idx];
+  const int n_blocks = GEMMA_CDIV(seq_len, BLOCK_SIZE);
+  const int warp_idx = threadIdx.x / WARP_SIZE;
+  const int lane = threadIdx.x % WARP_SIZE;
+  constexpr int EPT = HEAD_SIZE / WARP_SIZE;
+  static_assert(HEAD_SIZE % WARP_SIZE == 0);
+  const int dim_start = lane * EPT;
+  const int plane = num_kv_heads * HEAD_SIZE;
+  const int64_t bb_block = (int64_t)2 * plane;
+
+  extern __shared__ float s_scores[];
+
+  float q_regs[GROUP][EPT];
+#pragma unroll
+  for (int g = 0; g < GROUP; g++) {
+    const scalar_t* qp = q + (int64_t)seq_idx * q_stride
+                           + (int64_t)(kv_head * GROUP + g) * HEAD_SIZE
+                           + dim_start;
+#pragma unroll
+    for (int e = 0; e < EPT; e++) q_regs[g][e] = static_cast<float>(qp[e]);
+  }
+
+  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+  for (int blk = warp_idx; blk < n_blocks; blk += NUM_WARPS) {
+    const int64_t phys = block_table[blk];
+    const float* bmin = block_bounds + phys * bb_block
+                      + (int64_t)kv_head * HEAD_SIZE + dim_start;
+    const float* bmax = bmin + plane;
+    float bmn[EPT], bmx[EPT];
+#pragma unroll
+    for (int e = 0; e < EPT; e++) { bmn[e] = bmin[e]; bmx[e] = bmax[e]; }
+    float best = -FLT_MAX;
+#pragma unroll
+    for (int g = 0; g < GROUP; g++) {
+      float part = 0.f;
+#pragma unroll
+      for (int e = 0; e < EPT; e++) {
+        const float qd = q_regs[g][e];
+        part += (qd > 0.f) ? qd * bmx[e] : qd * bmn[e];
+      }
+      part = warp_reduce_sum(part);
+      best = fmaxf(best, part);
+    }
+    if (lane == 0) s_scores[blk] = best * scale;
+  }
+  __syncthreads();
+
+  for (int t = threadIdx.x; t < n_blocks; t += blockDim.x)
+    if (t < sink_tiles || t >= n_blocks - win_tiles) s_scores[t] = FLT_MAX;
+  __syncthreads();
+
+  if (warp_idx == 0) {
+    int* outp = selected_tiles
+              + ((int64_t)seq_idx * num_kv_heads + kv_head) * num_sel;
+    const int cnt = (num_sel < n_blocks) ? num_sel : n_blocks;
+    for (int i = 0; i < cnt; i++) {
+      float bv = -FLT_MAX;
+      int bi = n_blocks;
+      for (int t = lane; t < n_blocks; t += WARP_SIZE) {
+        const float v = s_scores[t];
+        if (v > bv || (v == bv && t < bi)) { bv = v; bi = t; }
+      }
+      warp_argmax(bv, bi);
+      if (lane == 0) { outp[i] = bi; s_scores[bi] = -FLT_MAX; }
+      __syncwarp();
+    }
+    if (lane == 0)
+      for (int i = cnt; i < num_sel; i++) outp[i] = (cnt > 0) ? outp[cnt - 1] : 0;
+  }
+}
+
 // 128-bit (uint4) vectorized load of N contiguous cache_t elements into buf.
 // Falls back to scalar when N is not a multiple of the 16-byte vector width.
 template <typename cache_t, int N>

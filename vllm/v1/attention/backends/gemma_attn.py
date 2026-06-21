@@ -379,6 +379,25 @@ class GemmaAttentionImpl(AttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
+        # Lossy query-adaptive top-k (P2, Quest-style) for FULL k_eq_v layers,
+        # decode only. Experimentation knobs (env), OFF (k=0) by default ->
+        # full attention (lossless). k = adaptive tiles beyond the forced sink
+        # + recent window. Only valid on the SIMT decode path (group<=2).
+        import os
+        self.topk_k = int(os.environ.get("GEMMA_TOPK_K", "0"))
+        self.topk_sink = int(os.environ.get("GEMMA_TOPK_SINK", "0"))
+        self.topk_window = int(os.environ.get("GEMMA_TOPK_WINDOW", "0"))
+        self.topk_enabled = (
+            self.topk_k > 0 and self.k_eq_v and self.num_queries_per_kv <= 2
+        )
+        # Bounds scoring (read maintained min/max bounds, NOT full K) = the speed
+        # path; default ON when top-k is on. GEMMA_TOPK_EXACT=1 forces the
+        # read-K reference path (slower; for parity/debug). block_bounds is
+        # lazily allocated to [num_blocks,2,num_kv_heads,head_size] on first KV
+        # write and maintained per step (full k_eq_v layers only).
+        self.topk_bounds = os.environ.get("GEMMA_TOPK_EXACT", "0") != "1"
+        self.block_bounds: torch.Tensor | None = None
+
     def _ensure_partition_buffers(
         self, num_seqs: int, max_seq_len: int,
         dtype: torch.dtype, device: torch.device,
@@ -531,6 +550,14 @@ class GemmaAttentionImpl(AttentionImpl):
             query.dtype, query.device,
         )
 
+        # Lossy top-k: pick the most relevant KV tiles per (seq, kv_head) and
+        # have the decode kernel walk only those (sink + recent always kept).
+        # Gated to long-enough batches so every seq has >num_sel distinct tiles
+        # (else full attention, lossless). None -> full attention.
+        selected_tiles = self._maybe_select_tiles(
+            query, key_cache, attn_metadata,
+        )
+
         gemma_paged_attention(
             out=output,
             exp_sums=exp_sums,
@@ -551,8 +578,48 @@ class GemmaAttentionImpl(AttentionImpl):
             actual_head_size=self.actual_head_size,
             k_eq_v=self.k_eq_v,
             sliding_window=self.sliding_window,
+            selected_tiles=selected_tiles,
         )
         return output
+
+    def _maybe_select_tiles(
+        self, query: torch.Tensor, key_cache: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+    ) -> torch.Tensor | None:
+        """Build per-(seq,kv_head) top-k selected_tiles, or None for full attn.
+
+        Returns None unless top-k is enabled AND every sequence in the batch has
+        strictly more than num_sel KV tiles (so the selection is num_sel distinct
+        tiles per seq; shorter batches stay lossless). Scoring reads K (the
+        quality reference); maintained-bounds scoring is the speed follow-up.
+        """
+        if not self.topk_enabled:
+            return None
+        block_size = key_cache.shape[1]
+        sink_tiles = (self.topk_sink + block_size - 1) // block_size
+        win_tiles = (self.topk_window + block_size - 1) // block_size
+        num_sel = self.topk_k + sink_tiles + win_tiles
+        seq_lens = attn_metadata.seq_lens
+        num_seqs = query.shape[0]
+        min_seq = int(seq_lens.min().item())
+        min_tiles = (min_seq + block_size - 1) // block_size
+        if min_tiles <= num_sel:
+            return None  # some seq too short -> full attention (lossless)
+        # Bounds scoring (no full-K read) when bounds are available, else exact.
+        if self.topk_bounds and self.block_bounds is not None:
+            block_bounds = self.block_bounds
+        else:
+            block_bounds = query.new_empty(0, dtype=torch.float32)
+        selected_tiles = torch.empty(
+            num_seqs, self.num_kv_heads, num_sel,
+            dtype=torch.int32, device=query.device,
+        )
+        torch.ops._C.gemma_topk_select(
+            selected_tiles, query, key_cache, block_bounds, self.scale,
+            attn_metadata.block_table, seq_lens, self.num_kv_heads,
+            block_size, self.kv_cache_dtype, sink_tiles, win_tiles,
+        )
+        return selected_tiles
 
     def _forward_cascade(
         self,
@@ -666,4 +733,37 @@ class GemmaAttentionImpl(AttentionImpl):
             self.kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
+        )
+
+        # Maintain per-block min/max key bounds for bounds-scoring top-k (speed
+        # path). Recompute only the blocks touched this step from the cache:
+        # correct, race-free, and paged-recycle-safe (reused blocks recompute
+        # from offset 0 on their first write). Full k_eq_v layers only.
+        if self.topk_enabled and self.topk_bounds:
+            self._update_block_bounds(key_cache, slot_mapping)
+
+    def _update_block_bounds(
+        self, key_cache: torch.Tensor, slot_mapping: torch.Tensor,
+    ) -> None:
+        block_size = key_cache.shape[1]
+        slot = slot_mapping
+        slot = slot[slot >= 0]
+        if slot.numel() == 0:
+            return
+        if self.block_bounds is None:
+            num_blocks = key_cache.shape[0]
+            self.block_bounds = torch.zeros(
+                num_blocks, 2, self.num_kv_heads, self.actual_head_size,
+                dtype=torch.float32, device=key_cache.device,
+            )
+        blocks = (slot // block_size).to(torch.int32)
+        offs = (slot % block_size)
+        uniq, inv = torch.unique(blocks, return_inverse=True)
+        ntok = torch.zeros(uniq.shape[0], dtype=torch.int32,
+                           device=key_cache.device)
+        ntok.scatter_reduce_(0, inv, (offs + 1).to(torch.int32),
+                             reduce="amax", include_self=True)
+        torch.ops._C.gemma_update_kv_bounds(
+            self.block_bounds, key_cache, uniq.to(torch.int32), ntok,
+            self.num_kv_heads, block_size, self.kv_cache_dtype,
         )

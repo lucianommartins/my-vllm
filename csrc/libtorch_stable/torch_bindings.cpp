@@ -638,6 +638,22 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int sliding_window, Tensor! lse_out,"
       "    Tensor selected_tiles) -> ()");
 
+  // Lossy top-k block selection (produces selected_tiles for the decode op).
+  // block_bounds empty -> exact (read-K) scoring; non-empty -> bounds scoring.
+  ops.def(
+      "gemma_topk_select("
+      "    Tensor! selected_tiles, Tensor query, Tensor key_cache,"
+      "    Tensor block_bounds, float scale, Tensor block_tables,"
+      "    Tensor seq_lens, int num_kv_heads, int block_size,"
+      "    str kv_cache_dtype, int sink_tiles, int win_tiles) -> ()");
+
+  // Maintain per-block min/max key bounds for bounds-scoring top-k.
+  ops.def(
+      "gemma_update_kv_bounds("
+      "    Tensor! block_bounds, Tensor key_cache, Tensor uniq_blocks,"
+      "    Tensor ntoks, int num_kv_heads, int block_size,"
+      "    str kv_cache_dtype) -> ()");
+
   // Gemma4-optimized tensor-core prefill attention (hd=512)
   ops.def(
       "gemma_prefill_attention("
@@ -770,6 +786,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("paged_attention_v1", TORCH_BOX(&paged_attention_v1));
   ops.impl("paged_attention_v2", TORCH_BOX(&paged_attention_v2));
   ops.impl("gemma_paged_attention", TORCH_BOX(&gemma_paged_attention));
+  ops.impl("gemma_topk_select", TORCH_BOX(&gemma_topk_select));
+  ops.impl("gemma_update_kv_bounds", TORCH_BOX(&gemma_update_kv_bounds));
   ops.impl("gemma_prefill_attention", TORCH_BOX(&gemma_prefill_attention));
 }
 

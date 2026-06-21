@@ -488,6 +488,19 @@ void gemma_paged_attention(
     int64_t sliding_window, torch::stable::Tensor& lse_out,
     torch::stable::Tensor& selected_tiles);
 
+void gemma_topk_select(
+    torch::stable::Tensor& selected_tiles, torch::stable::Tensor& query,
+    torch::stable::Tensor& key_cache, torch::stable::Tensor& block_bounds,
+    double scale, torch::stable::Tensor& block_tables,
+    torch::stable::Tensor& seq_lens, int64_t num_kv_heads, int64_t block_size,
+    const std::string& kv_cache_dtype, int64_t sink_tiles, int64_t win_tiles);
+
+void gemma_update_kv_bounds(
+    torch::stable::Tensor& block_bounds, torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& uniq_blocks, torch::stable::Tensor& ntoks,
+    int64_t num_kv_heads, int64_t block_size,
+    const std::string& kv_cache_dtype);
+
 void gemma_prefill_attention(
     torch::stable::Tensor& out, torch::stable::Tensor& query,
     torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
