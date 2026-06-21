@@ -27,6 +27,7 @@ def gemma_paged_attention(
     actual_head_size: int,
     k_eq_v: bool,
     sliding_window: int,
+    lse_out: torch.Tensor | None = None,
 ) -> None:
     """Gemma4-optimized paged attention decode kernel.
 
@@ -56,7 +57,11 @@ def gemma_paged_attention(
         actual_head_size: Real head dim (256 for sliding, 512 for full)
         k_eq_v: Whether K==V (full attention layers with k_eq_v config)
         sliding_window: Sliding window size (0 = disabled)
+        lse_out: Optional natural-log LSE output [num_heads, num_seqs] for
+            cascade attention; None (empty) skips it.
     """
+    if lse_out is None:
+        lse_out = out.new_empty(0, dtype=torch.float32)
     ops.gemma_paged_attention(
         out,
         exp_sums,
@@ -77,4 +82,5 @@ def gemma_paged_attention(
         actual_head_size,
         k_eq_v,
         sliding_window,
+        lse_out,
     )

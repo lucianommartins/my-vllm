@@ -7,6 +7,7 @@ architectural properties (dual head_dim, k_eq_v, sliding window pruning)
 and falls back to Triton prefill for non-decode requests.
 """
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -119,6 +120,16 @@ class GemmaAttentionMetadata:
     # get bidirectional attention).
     mm_prefix_range: dict | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    # Cascade (prefix-shared) attention: when a common prefix is shared across
+    # the batch, attend to it ONCE (prefix pass) + per-request suffix + LSE
+    # merge. Populated only on full-attn layers (the sliding group's builder
+    # returns use_cascade_attention()->False, so common_prefix_len==0 there).
+    use_cascade: bool = False
+    common_prefix_len: int = 0
+    num_common_kv_blocks: int = 0
+    cu_prefix_query_lens: torch.Tensor | None = None
+    prefix_kv_lens: torch.Tensor | None = None
+    suffix_kv_lens: torch.Tensor | None = None
 
 
 class GemmaAttentionMetadataBuilder(
@@ -147,6 +158,35 @@ class GemmaAttentionMetadataBuilder(
         )
         self.head_size = model_config.get_head_size()
 
+    def use_cascade_attention(self, *args, **kwargs) -> bool:
+        # Decode-only cascade for now: the prefix pass treats every 1-token
+        # decode query as one merged sequence vs the shared prefix. Mixed /
+        # chunked-prefill cascade is a follow-up.
+        query_lens = kwargs.get("query_lens")
+        if query_lens is None and len(args) >= 2:
+            query_lens = args[1]
+        if query_lens is None or not bool((query_lens == 1).all()):
+            return False
+        # Cascade applies to full-attn layers only (the sliding group never
+        # benefits and the prefix pass has no sliding bound). Exclude the same
+        # special cases FlashAttention does.
+        if (kwargs.get("use_sliding_window") or kwargs.get("use_alibi")
+                or kwargs.get("use_local_attention")):
+            return False
+        common_prefix_len = kwargs.get("common_prefix_len")
+        if common_prefix_len is None and args:
+            common_prefix_len = args[0]
+        # Test/debug: fire cascade for any usable shared prefix, bypassing the
+        # perf heuristic (which is tuned to skip cascade at small batch).
+        if os.environ.get("GEMMA_FORCE_CASCADE") == "1":
+            return bool(common_prefix_len and common_prefix_len >= 256)
+        # Otherwise defer the >=256-prefix / >=8-reqs / perf-model decision to
+        # FlashAttention's heuristic.
+        from vllm.v1.attention.backends.flash_attn import (
+            use_cascade_attention as _fa_use_cascade,
+        )
+        return _fa_use_cascade(*args, **kwargs)
+
     def build(
         self,
         common_prefix_len: int,
@@ -160,6 +200,30 @@ class GemmaAttentionMetadataBuilder(
                 mm_ranges, common_attn_metadata.num_reqs,
                 common_attn_metadata.seq_lens.device,
             )
+
+        # Cascade metadata. The runner passes common_prefix_len>0 only when it
+        # already decided to use cascade (use_cascade_attention above); it's 0
+        # for the sliding group and non-cascade batches.
+        use_cascade = common_prefix_len > 0
+        cu_prefix_query_lens = None
+        prefix_kv_lens = None
+        suffix_kv_lens = None
+        num_common_kv_blocks = 0
+        if use_cascade:
+            device = common_attn_metadata.seq_lens.device
+            num_reqs = common_attn_metadata.num_reqs
+            cu_prefix_query_lens = torch.tensor(
+                [0, common_attn_metadata.num_actual_tokens],
+                dtype=torch.int32, device=device,
+            )
+            prefix_kv_lens = torch.tensor(
+                [common_prefix_len], dtype=torch.int32, device=device,
+            )
+            suffix_kv_lens = (
+                common_attn_metadata.seq_lens[:num_reqs] - common_prefix_len
+            ).to(torch.int32)
+            num_common_kv_blocks = common_prefix_len // self.block_size
+
         return GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -170,6 +234,12 @@ class GemmaAttentionMetadataBuilder(
             slot_mapping=common_attn_metadata.slot_mapping,
             mm_prefix_range=mm_ranges,
             mm_prefix_range_tensor=mm_range_tensor,
+            use_cascade=use_cascade,
+            common_prefix_len=common_prefix_len,
+            num_common_kv_blocks=num_common_kv_blocks,
+            cu_prefix_query_lens=cu_prefix_query_lens,
+            prefix_kv_lens=prefix_kv_lens,
+            suffix_kv_lens=suffix_kv_lens,
         )
 
 
@@ -259,10 +329,6 @@ class GemmaAttentionBackend(AttentionBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability >= DeviceCapability(8, 0)
-
-    @staticmethod
-    def use_cascade_attention(*args, **kwargs) -> bool:
-        return False
 
 
 class GemmaAttentionImpl(AttentionImpl):
@@ -357,6 +423,16 @@ class GemmaAttentionImpl(AttentionImpl):
                 attn_metadata,
             )
 
+        if attn_metadata.use_cascade:
+            return self._forward_cascade(
+                layer,
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                attn_metadata,
+            )
+
         return self._forward_decode(
             layer,
             query[:num_actual_tokens],
@@ -405,6 +481,8 @@ class GemmaAttentionImpl(AttentionImpl):
                 self.k_eq_v,
                 self.sliding_window,
                 mm_ranges,
+                False,  # non_causal (cascade prefix uses True)
+                torch.empty(0, dtype=torch.float32, device=query.device),
             )
             return output
 
@@ -474,6 +552,93 @@ class GemmaAttentionImpl(AttentionImpl):
             k_eq_v=self.k_eq_v,
             sliding_window=self.sliding_window,
         )
+        return output
+
+    def _forward_cascade(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+    ) -> torch.Tensor:
+        """Prefix-shared (cascade) decode: attend to the common prefix ONCE for
+        the whole batch (non-causal prefix pass), per-request causal suffix, then
+        merge via log-sum-exp. Lossless. Full (hd512) layers only — the sliding
+        group never reaches here (use_cascade_attention returns False for it)."""
+        from vllm.v1.attention.ops.gemma_paged_attention import (
+            gemma_paged_attention,
+        )
+        from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+
+        num_seqs, nq, _ = query.shape
+        block_size = key_cache.shape[1]
+        ncb = attn_metadata.num_common_kv_blocks
+        dev = query.device
+        logger.info_once(
+            "GEMMA_ATTN cascade active (common_prefix_len=%d, num_seqs=%d)",
+            attn_metadata.common_prefix_len, num_seqs,
+        )
+
+        prefix_out = torch.empty_like(query)
+        suffix_out = torch.empty_like(query)
+        prefix_lse = torch.empty(nq, num_seqs, dtype=torch.float32, device=dev)
+        suffix_lse = torch.empty(nq, num_seqs, dtype=torch.float32, device=dev)
+        empty_mm = torch.empty(0, dtype=torch.int32, device=dev)
+
+        # Prefix pass: all decode queries (as one merged sequence) attend to the
+        # shared prefix blocks (block_table row 0), non-causal, via the prefill
+        # kernel. seq_lens=[common_prefix_len], cu_q=[0, num_seqs].
+        torch.ops._C.gemma_prefill_attention(
+            prefix_out,
+            query,
+            key_cache,
+            value_cache,
+            self.num_kv_heads,
+            self.scale,
+            attn_metadata.block_table[:1],
+            attn_metadata.prefix_kv_lens,
+            attn_metadata.cu_prefix_query_lens,
+            num_seqs,            # max_q_len: every decode token is in this seq
+            block_size,
+            self.k_eq_v,
+            0,                   # sliding_window (full layers only here)
+            empty_mm,
+            True,                # non_causal
+            prefix_lse,
+        )
+
+        # Suffix pass: per-request causal decode over the post-prefix KV.
+        suffix_bt = attn_metadata.block_table[:, ncb:].contiguous()
+        exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
+            num_seqs, attn_metadata.max_seq_len, query.dtype, dev,
+        )
+        gemma_paged_attention(
+            out=suffix_out,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            tmp_out=tmp_out,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            num_kv_heads=self.num_kv_heads,
+            scale=self.scale,
+            block_tables=suffix_bt,
+            seq_lens=attn_metadata.suffix_kv_lens,
+            block_size=block_size,
+            max_seq_len=attn_metadata.max_seq_len,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=layer._k_scale,
+            v_scale=layer._v_scale,
+            actual_head_size=self.actual_head_size,
+            k_eq_v=self.k_eq_v,
+            sliding_window=self.sliding_window,
+            lse_out=suffix_lse,
+        )
+
+        # Lossless log-sum-exp merge of the two partial attentions.
+        merge_attn_states(output, prefix_out, prefix_lse, suffix_out, suffix_lse)
         return output
 
     def do_kv_cache_update(

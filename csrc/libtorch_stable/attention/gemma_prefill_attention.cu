@@ -75,7 +75,8 @@ static constexpr int PF_MINCTA_256 = 3;
         block_tables_ptr, seq_lens_ptr, cu_seqlens_q_ptr,                      \
         max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
         kv_stride_slot, kv_stride_head, sliding_window,                        \
-        mm_prefix_ranges_ptr, max_mm_ranges);                                  \
+        mm_prefix_ranges_ptr, max_mm_ranges,                                   \
+        non_causal, lse_out_ptr, num_tokens);                                 \
   } while (0)
 
 #define LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, MMPF, KEQV, USW)             \
@@ -96,10 +97,12 @@ void gemma_prefill_launcher(
     int num_kv_heads, float scale, torch::stable::Tensor& block_tables,
     torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
     int max_q_len, int page_size, bool k_eq_v, int sliding_window,
-    torch::stable::Tensor& mm_prefix_ranges) {
+    torch::stable::Tensor& mm_prefix_ranges, bool non_causal,
+    torch::stable::Tensor& lse_out) {
   const int num_q_heads = query.size(1);
   const int head_size = query.size(2);
   const int num_seqs = seq_lens.size(0);
+  const int num_tokens = static_cast<int>(out.size(0));
   const int max_num_blocks_per_seq = block_tables.size(1);
   const int q_stride = query.stride(0);
   const int64_t kv_stride_block = key_cache.stride(0);
@@ -122,6 +125,10 @@ void gemma_prefill_launcher(
     mm_prefix_ranges_ptr = mm_prefix_ranges.mutable_data_ptr<int>();
     max_mm_ranges = mm_prefix_ranges.size(1);
   }
+  // Optional natural-log LSE output for cascade attention (empty == skip).
+  float* lse_out_ptr = (lse_out.numel() > 0)
+                           ? reinterpret_cast<float*>(lse_out.data_ptr())
+                           : nullptr;
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       query.get_device_index());
@@ -164,12 +171,13 @@ void gemma_prefill_attention(
     int64_t num_kv_heads, double scale, torch::stable::Tensor& block_tables,
     torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
     int64_t max_q_len, int64_t block_size, bool k_eq_v,
-    int64_t sliding_window, torch::stable::Tensor& mm_prefix_ranges) {
+    int64_t sliding_window, torch::stable::Tensor& mm_prefix_ranges,
+    bool non_causal, torch::stable::Tensor& lse_out) {
   STD_TORCH_CHECK(
       query.scalar_type() == torch::headeronly::ScalarType::BFloat16,
       "Gemma prefill kernel currently supports bfloat16 only");
   gemma_prefill_launcher<__nv_bfloat16, __nv_bfloat16>(
       out, query, key_cache, value_cache, num_kv_heads, (float)scale,
       block_tables, seq_lens, cu_seqlens_q, max_q_len, block_size, k_eq_v,
-      sliding_window, mm_prefix_ranges);
+      sliding_window, mm_prefix_ranges, non_causal, lse_out);
 }

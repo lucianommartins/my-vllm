@@ -704,7 +704,8 @@ gemma_decode_stream_kernel(
     const int max_num_blocks_per_seq, const int page_size, const int q_stride,
     const int64_t kv_stride_block, const int64_t kv_stride_slot,
     const int64_t kv_stride_head, const int sliding_window,
-    const int num_splits, const int max_parts) {
+    const int num_splits, const int max_parts,
+    float* __restrict__ lse_out = nullptr) {  // [num_q_heads,num_seqs] natural-log
   constexpr int BLOCK_M = 16;
   constexpr int MT = BLOCK_M / 16;          // == 1
   constexpr int NT = BLOCK_N / 16;          // QK N tiles
@@ -998,6 +999,18 @@ gemma_decode_stream_kernel(
                        + qh * HEAD_SIZE + dv;
       *reinterpret_cast<uint4*>(go) = *reinterpret_cast<uint4*>(tmp);
     }
+    // Natural-log LSE per (q_head, seq) for cascade merge. sM is the raw running
+    // max and sL = sum exp((s_i - sM) * scale), so LSE = sM*scale + ln(sL).
+    if (lse_out != nullptr) {
+      const int num_seqs = gridDim.y;
+      for (int r = warp; r < GQA_GROUP; r += NUM_WARPS)
+        if (lane == 0) {
+          const int qh = kv_head * GQA_GROUP + r;
+          const float l = sL[r];
+          lse_out[(int64_t)qh * num_seqs + seq_idx] =
+              sM[r] * scale + logf(l > 0.f ? l : 1e-30f);
+        }
+    }
   }
 #undef DS_STAGE
 #undef DS_KBUF
@@ -1017,7 +1030,8 @@ __global__ void gemma_split_reduce_kernel(
     const float* __restrict__ exp_sums,    // [num_seqs, num_q_heads, max_parts] (L)
     const float* __restrict__ max_logits,  // [num_seqs, num_q_heads, max_parts] (M)
     const int num_splits,
-    const int max_parts) {
+    const int max_parts,
+    float* __restrict__ lse_out = nullptr) {  // [num_q_heads,num_seqs] natural-log
   const int q_head = blockIdx.x;
   const int seq = blockIdx.y;
   const int num_q_heads = gridDim.x;
@@ -1038,6 +1052,14 @@ __global__ void gemma_split_reduce_kernel(
     if (m_ptr[s] > -FLT_MAX) denom += l_ptr[s] * exp2f(m_ptr[s] - M_g);
   }
   const float inv = (denom > 0.f) ? (1.f / denom) : 0.f;
+
+  // Natural-log LSE for cascade merge. m_ptr/M_g are base-2 exponent units and
+  // denom = sum L_i * exp2(m_i - M_g), so LSE = M_g*ln2 + ln(denom).
+  if (lse_out != nullptr && lane == 0) {
+    const int num_seqs = gridDim.y;
+    lse_out[(int64_t)q_head * num_seqs + seq] =
+        M_g * 0.69314718055994531f + logf(denom > 0.f ? denom : 1e-30f);
+  }
 
   float acc[ELEMS];
 #pragma unroll

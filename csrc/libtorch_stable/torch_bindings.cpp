@@ -635,7 +635,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int max_seq_len,"
       "    str kv_cache_dtype, Tensor k_scale, Tensor v_scale,"
       "    int actual_head_size, bool k_eq_v,"
-      "    int sliding_window) -> ()");
+      "    int sliding_window, Tensor! lse_out) -> ()");
 
   // Gemma4-optimized tensor-core prefill attention (hd=512)
   ops.def(
@@ -643,7 +643,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    Tensor! out, Tensor query, Tensor key_cache, Tensor value_cache,"
       "    int num_kv_heads, float scale, Tensor block_tables, Tensor seq_lens,"
       "    Tensor cu_seqlens_q, int max_q_len, int block_size, bool k_eq_v,"
-      "    int sliding_window, Tensor mm_prefix_ranges) -> ()");
+      "    int sliding_window, Tensor mm_prefix_ranges, bool non_causal,"
+      "    Tensor! lse_out) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {

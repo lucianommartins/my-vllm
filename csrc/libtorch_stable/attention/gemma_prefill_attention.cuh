@@ -281,7 +281,12 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     // Multimodal bidirectional ("mm-prefix") image-token spans, int32
     // [num_seqs, max_mm_ranges, 2] (absolute [start,end] inclusive; valid iff
     // start<end). max_mm_ranges==0 -> no mm-prefix (text-only / full layers).
-    const int* __restrict__ mm_prefix_ranges, const int max_mm_ranges) {
+    const int* __restrict__ mm_prefix_ranges, const int max_mm_ranges,
+    // Cascade: non_causal makes every query attend to the whole key range (the
+    // shared-prefix pass). lse_out [num_q_heads, num_tokens] natural-log (or
+    // nullptr to skip). num_tokens is the head stride for lse_out.
+    const bool non_causal = false, float* __restrict__ lse_out = nullptr,
+    const int num_tokens = 0) {
   constexpr int MT = BLOCK_M / 16;            // M tiles
   constexpr int NT = BLOCK_N / 16;            // QK N tiles
   constexpr int DT = HEAD_SIZE / 16;          // total head tiles
@@ -368,7 +373,8 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
   const float scale_log2 = scale * LOG2E;
   const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
   const int last_q_abs = context + min(row0 + BLOCK_M - 1, q_len - 1);
-  int kv_end = min(last_q_abs + 1, seq_len);
+  // Non-causal (cascade prefix): every query attends to the entire key range.
+  int kv_end = non_causal ? seq_len : min(last_q_abs + 1, seq_len);
   int kv_begin = 0;
   if (USE_SLIDING_WINDOW && sliding_window > 0) {
     const int first_q_abs = context + row0;
@@ -446,7 +452,8 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
         const int k_abs = kv0 + c;
         // keep = (causal AND sliding) OR mm_prefix(bidirectional within an image
         // span). The mm-prefix OR overrides causal+sliding inside a span.
-        bool keep = (k_abs <= q_abs);
+        // non_causal (cascade prefix pass) drops the causal bound entirely.
+        bool keep = non_causal ? true : (k_abs <= q_abs);
         if (USE_SLIDING_WINDOW && sliding_window > 0)
           keep = keep && (k_abs > q_abs - sliding_window);
         if constexpr (USE_MM_PREFIX) {
@@ -564,6 +571,18 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     scalar_t* go = out + (int64_t)(q_start + qr) * num_q_heads * HEAD_SIZE
                      + q_head * HEAD_SIZE + dv;
     *reinterpret_cast<uint4*>(go) = *reinterpret_cast<uint4*>(tmp);
+  }
+  // Natural-log LSE per (q_head, token) for cascade merge. sM is the raw running
+  // max and sL = sum exp((s_i - sM) * scale), so LSE = sM*scale + ln(sL).
+  if (lse_out != nullptr) {
+    for (int r = warp; r < BLOCK_M; r += NUM_WARPS) {
+      const int qr = row0 + r;
+      if (qr < q_len && lane == 0) {
+        const float l = sL[r];
+        lse_out[(int64_t)q_head * num_tokens + (q_start + qr)] =
+            sM[r] * scale + logf(l > 0.f ? l : 1e-30f);
+      }
+    }
   }
 }
 
