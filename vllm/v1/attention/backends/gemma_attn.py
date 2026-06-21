@@ -46,6 +46,64 @@ SPLIT_PARTITION_CAP = 128
 TOKENS_PER_SPLIT = 256
 
 
+# Split-KV scratch is pure per-step working memory: each decode op writes its
+# partials and reduces them within the same call, on the same stream, before the
+# next layer runs. So a single set of buffers can be shared by every attention
+# layer instead of one set per layer (~60 layers on 31B -> the previously
+# observed ~13GB over-allocation that OOM'd 31B on a single 80GB GPU). We key by
+# the dims that actually change the shape (device, head_size, num_heads, dtype),
+# so the two Gemma4 head sizes (256 sliding / 512 full) get one shared buffer
+# each. Growth is monotonic so an already-captured CUDA graph never sees a freed
+# buffer. This matches how Triton/FA keep a single compact workspace.
+_DECODE_PARTITION_CACHE: dict[
+    tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _get_decode_partition_buffers(
+    num_seqs: int,
+    num_heads: int,
+    head_size: int,
+    max_seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_num_partitions = max(
+        1,
+        min(
+            SPLIT_PARTITION_CAP,
+            (max_seq_len + TOKENS_PER_SPLIT - 1) // TOKENS_PER_SPLIT,
+        ),
+    )
+    key = (device, head_size, num_heads, dtype)
+    cached = _DECODE_PARTITION_CACHE.get(key)
+    if (
+        cached is None
+        or cached[0].shape[0] < num_seqs
+        or cached[0].shape[2] < max_num_partitions
+    ):
+        # Grow monotonically: never shrink a dimension, so buffers captured by an
+        # existing CUDA graph stay valid.
+        ns = num_seqs if cached is None else max(num_seqs, cached[0].shape[0])
+        mp = (
+            max_num_partitions
+            if cached is None
+            else max(max_num_partitions, cached[0].shape[2])
+        )
+        exp_sums = torch.zeros(
+            ns, num_heads, mp, dtype=torch.float32, device=device
+        )
+        max_logits = torch.zeros(
+            ns, num_heads, mp, dtype=torch.float32, device=device
+        )
+        tmp_out = torch.zeros(
+            ns, num_heads, mp, head_size, dtype=dtype, device=device
+        )
+        cached = (exp_sums, max_logits, tmp_out)
+        _DECODE_PARTITION_CACHE[key] = cached
+    return cached
+
+
 @dataclass
 class GemmaAttentionMetadata:
     num_actual_tokens: int
@@ -255,39 +313,15 @@ class GemmaAttentionImpl(AttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        self._exp_sums: torch.Tensor | None = None
-        self._max_logits: torch.Tensor | None = None
-        self._tmp_out: torch.Tensor | None = None
-
     def _ensure_partition_buffers(
         self, num_seqs: int, max_seq_len: int,
         dtype: torch.dtype, device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        max_num_partitions = max(
-            1,
-            min(
-                SPLIT_PARTITION_CAP,
-                (max_seq_len + TOKENS_PER_SPLIT - 1) // TOKENS_PER_SPLIT,
-            ),
+        # Shared across all attention layers (see _get_decode_partition_buffers).
+        return _get_decode_partition_buffers(
+            num_seqs, self.num_heads, self.head_size,
+            max_seq_len, dtype, device,
         )
-        if (
-            self._exp_sums is None
-            or self._exp_sums.shape[0] < num_seqs
-            or self._exp_sums.shape[2] < max_num_partitions
-        ):
-            self._exp_sums = torch.zeros(
-                num_seqs, self.num_heads, max_num_partitions,
-                dtype=torch.float32, device=device,
-            )
-            self._max_logits = torch.zeros(
-                num_seqs, self.num_heads, max_num_partitions,
-                dtype=torch.float32, device=device,
-            )
-            self._tmp_out = torch.zeros(
-                num_seqs, self.num_heads, max_num_partitions, self.head_size,
-                dtype=dtype, device=device,
-            )
-        return self._exp_sums, self._max_logits, self._tmp_out
 
     def forward(
         self,
