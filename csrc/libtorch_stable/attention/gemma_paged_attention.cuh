@@ -1019,6 +1019,265 @@ gemma_decode_stream_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Bandwidth-first SIMT decode (no tensor cores). The wmma stream kernel is
+// occupancy-limited (79 reg + 52KB smem -> 3 CTA/SM -> 37.5% occ -> 40% DRAM,
+// latency-bound). This kernel is lean: O accumulated in registers (no wmma
+// fragments), only a small single-buffered K tile in smem (shared by the GQA
+// group, k_eq_v reuses it as V), so many CTAs fit per SM -> latency hidden ->
+// HBM saturated. One warp per query head; the warp's 32 lanes own a head slice
+// (EPL = HEAD_SIZE/32 contiguous dims) for coalesced loads + register O.
+// k_eq_v only (the 2x-over-Triton target = full hd512 layers). bf16 only.
+// Matches the stream kernel's base-2 online-softmax convention so the existing
+// split-reduce + LSE path is reused verbatim.
+// ---------------------------------------------------------------------------
+template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_N,
+          int BDY, int BDZ, bool USE_SLIDING_WINDOW, bool SPLIT, int MIN_CTA = 1>
+__global__ void __launch_bounds__(BDY * BDZ * 32, MIN_CTA)
+gemma_decode_simt_kernel(
+    scalar_t* __restrict__ out_or_tmp,   // SPLIT ? tmp_out partials : final out
+    float* __restrict__ exp_sums,        // [num_seqs,num_q_heads,max_parts]
+    float* __restrict__ max_logits,
+    const scalar_t* __restrict__ q,
+    const cache_t* __restrict__ k_cache,
+    const int num_kv_heads, const float scale,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int max_num_blocks_per_seq, const int page_size, const int q_stride,
+    const int64_t kv_stride_block, const int64_t kv_stride_slot,
+    const int64_t kv_stride_head, const int sliding_window,
+    const int num_splits, const int max_parts,
+    float* __restrict__ lse_out = nullptr) {
+  constexpr int EPL = HEAD_SIZE / 32;     // head dims per lane
+  constexpr int VEC = 16 / sizeof(cache_t);  // bf16 -> 8 per uint4
+  const int kv_head = blockIdx.x;
+  const int seq_idx = blockIdx.y;
+  const int split_idx = SPLIT ? blockIdx.z : 0;
+  const int nsplits = SPLIT ? num_splits : 1;
+  const int num_q_heads = gridDim.x * BDY;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int ty = warp % BDY;               // query head within the group
+  const int tz = warp / BDY;               // bdz: KV-split group (occupancy)
+  const int qh = kv_head * BDY + ty;
+  const int seq_len = seq_lens[seq_idx];
+  const int nthreads = BDY * BDZ * 32;
+  constexpr int TPZ = BLOCK_N / BDZ;       // tile tokens this tz-group handles
+  const float scale_log2 = scale * LOG2E;
+
+#define DSIMT_PART(h) \
+  (((int64_t)(seq_idx) * num_q_heads + (h)) * max_parts + split_idx)
+
+  // Sliding-window lower bound (tile-aligned), then split the tile range.
+  int kv_begin = 0;
+  if (USE_SLIDING_WINDOW && sliding_window > 0) {
+    const int lo = seq_len - sliding_window;
+    kv_begin = (lo > 0) ? (lo / BLOCK_N) * BLOCK_N : 0;
+  }
+  const int n_tiles = GEMMA_CDIV(seq_len - kv_begin, BLOCK_N);
+  const int tiles_per_split = GEMMA_CDIV(n_tiles, nsplits);
+  const int tile_lo = split_idx * tiles_per_split;
+  int tile_hi = tile_lo + tiles_per_split;
+  if (tile_hi > n_tiles) tile_hi = n_tiles;
+
+  if (SPLIT && tile_lo >= tile_hi) {     // empty split -> neutral partial
+    if (lane == 0) {
+      max_logits[DSIMT_PART(qh)] = -FLT_MAX;
+      exp_sums[DSIMT_PART(qh)] = 0.f;
+    }
+    scalar_t* to = out_or_tmp + DSIMT_PART(qh) * HEAD_SIZE + lane * EPL;
+#pragma unroll
+    for (int e = 0; e < EPL; e++) from_float(to[e], 0.f);
+    return;
+  }
+  const int kv0_lo = kv_begin + tile_lo * BLOCK_N;
+  const int kv0_hi = kv_begin + tile_hi * BLOCK_N;
+
+  // Q into registers (lane owns dims [lane*EPL, +EPL)); O accumulator in regs.
+  float q_reg[EPL], o_reg[EPL];
+  const scalar_t* qp =
+      q + (int64_t)seq_idx * q_stride + qh * HEAD_SIZE + lane * EPL;
+#pragma unroll
+  for (int e = 0; e < EPL; e++) {
+    q_reg[e] = static_cast<float>(qp[e]);
+    o_reg[e] = 0.f;
+  }
+  float m = -FLT_MAX, l = 0.f;
+
+  // smem holds ONLY the K tile (BLOCK_N tokens) -> the GQA group's BDY query-head
+  // warps read it once (GQA reuse), k_eq_v reuses it as V. Q/scores/O stay in
+  // registers (small smem -> high occupancy, unlike the wmma kernel's 52KB).
+  // Tile-parallel softmax: BLOCK_N independent dots, then ONE online-softmax
+  // update per tile -> breaks the per-token serial recurrence.
+  // Double-buffered: smem holds 2 K tiles so tile t+1 streams (cp.async) while
+  // tile t computes -> HBM latency hidden (the wmma kernel's edge, now here too).
+  extern __shared__ char simt_smem[];
+  cache_t* sK = reinterpret_cast<cache_t*>(simt_smem);  // [2][BLOCK_N, HEAD_SIZE]
+  const int* bt = block_tables + seq_idx * max_num_blocks_per_seq;
+  constexpr int U4_PER_TOK = HEAD_SIZE / VEC;
+  constexpr int TILE_ELT = BLOCK_N * HEAD_SIZE;  // elements per K buffer
+  const int koff = lane * EPL;
+
+#define SIMT_ISSUE(BUF, KV0)                                                    \
+  do {                                                                          \
+    const int nt_ = min(BLOCK_N, seq_len - (KV0));                             \
+    for (int i = threadIdx.x; i < BLOCK_N * U4_PER_TOK; i += nthreads) {       \
+      const int tok = i / U4_PER_TOK;                                          \
+      const int d = (i % U4_PER_TOK) * VEC;                                    \
+      if (tok < nt_) {                                                          \
+        const int g = (KV0) + tok;                                            \
+        const int64_t phys = bt[g / page_size];                              \
+        const cache_t* gk = k_cache + phys * kv_stride_block                  \
+            + (int64_t)(g % page_size) * kv_stride_slot                       \
+            + kv_head * kv_stride_head + d;                                    \
+        __pipeline_memcpy_async(                                              \
+            sK + (BUF) * TILE_ELT + tok * HEAD_SIZE + d, gk, 16);             \
+      }                                                                        \
+    }                                                                          \
+    __pipeline_commit();                                                      \
+  } while (0)
+
+  int buf = 0;
+  SIMT_ISSUE(0, kv0_lo);
+  for (int kv0 = kv0_lo; kv0 < kv0_hi; kv0 += BLOCK_N) {
+    const int ntok = min(BLOCK_N, seq_len - kv0);
+    const int kvn = kv0 + BLOCK_N;
+    if (kvn < kv0_hi) {
+      SIMT_ISSUE(buf ^ 1, kvn);
+      __pipeline_wait_prior(1);  // tile t ready; tile t+1 stays in flight
+    } else {
+      __pipeline_wait_prior(0);
+    }
+    __syncthreads();
+    const cache_t* kbuf = sK + buf * TILE_ELT;
+
+    // This bdz-group owns tile tokens [tz*TPZ, tz*TPZ+TPZ). TPZ independent dots
+    // (lane owns a head slice; warp-reduce per token), then ONE softmax update.
+    float s[TPZ];
+    float tmax = -FLT_MAX;
+#pragma unroll
+    for (int j = 0; j < TPZ; j++) {
+      const int t = tz * TPZ + j;
+      float dot = -FLT_MAX;
+      if (t < ntok) {
+        const cache_t* kt = kbuf + t * HEAD_SIZE + koff;
+        cache_t kv[EPL];  // vectorized smem read (uint4) -> registers
+#pragma unroll
+        for (int u = 0; u < EPL / VEC; u++)
+          *reinterpret_cast<uint4*>(&kv[u * VEC]) =
+              *reinterpret_cast<const uint4*>(kt + u * VEC);
+        dot = 0.f;
+#pragma unroll
+        for (int e = 0; e < EPL; e++)
+          dot += q_reg[e] * static_cast<float>(kv[e]);
+#pragma unroll
+        for (int o = 16; o >= 1; o >>= 1)
+          dot += __shfl_xor_sync(0xffffffffu, dot, o);
+      }
+      s[j] = dot;
+      tmax = fmaxf(tmax, dot);
+    }
+    const float m_new = fmaxf(m, tmax);
+    const float alpha = (m <= -FLT_MAX) ? 0.f : exp2f((m - m_new) * scale_log2);
+    float dsum = 0.f;
+#pragma unroll
+    for (int j = 0; j < TPZ; j++) {
+      s[j] = (s[j] <= -FLT_MAX) ? 0.f : exp2f((s[j] - m_new) * scale_log2);
+      dsum += s[j];
+    }
+    l = l * alpha + dsum;
+#pragma unroll
+    for (int e = 0; e < EPL; e++) o_reg[e] *= alpha;
+#pragma unroll
+    for (int j = 0; j < TPZ; j++) {
+      if (s[j] != 0.f) {
+        const cache_t* kt = kbuf + (tz * TPZ + j) * HEAD_SIZE + koff;
+        cache_t kv[EPL];
+#pragma unroll
+        for (int u = 0; u < EPL / VEC; u++)
+          *reinterpret_cast<uint4*>(&kv[u * VEC]) =
+              *reinterpret_cast<const uint4*>(kt + u * VEC);
+#pragma unroll
+        for (int e = 0; e < EPL; e++)
+          o_reg[e] += s[j] * static_cast<float>(kv[e]);
+      }
+    }
+    m = m_new;
+    __syncthreads();
+    buf ^= 1;
+  }
+#undef SIMT_ISSUE
+
+  if constexpr (BDZ == 1) {
+    const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+    if (SPLIT) {
+      if (lane == 0) {
+        max_logits[DSIMT_PART(qh)] = m * scale_log2;
+        exp_sums[DSIMT_PART(qh)] = l;
+      }
+      scalar_t* to = out_or_tmp + DSIMT_PART(qh) * HEAD_SIZE + lane * EPL;
+#pragma unroll
+      for (int e = 0; e < EPL; e++) from_float(to[e], o_reg[e] * inv);
+    } else {
+      scalar_t* go = out_or_tmp + (int64_t)seq_idx * num_q_heads * HEAD_SIZE
+                       + qh * HEAD_SIZE + lane * EPL;
+#pragma unroll
+      for (int e = 0; e < EPL; e++) from_float(go[e], o_reg[e] * inv);
+      if (lse_out != nullptr && lane == 0)
+        lse_out[(int64_t)qh * gridDim.y + seq_idx] =
+            m * scale + logf(l > 0.f ? l : 1e-30f);
+    }
+  } else {
+    // Combine the BDZ partials per head via smem (reuse the K-tile region).
+    float* csM = reinterpret_cast<float*>(simt_smem);          // [BDY*BDZ]
+    float* csL = csM + BDY * BDZ;                              // [BDY*BDZ]
+    float* csO = csL + BDY * BDZ;                              // [BDY*BDZ*HEAD]
+    __syncthreads();  // K-tile readers done -> safe to reuse smem as combine buf
+    const int slot = ty * BDZ + tz;
+    if (lane == 0) { csM[slot] = m; csL[slot] = l; }
+#pragma unroll
+    for (int e = 0; e < EPL; e++) csO[slot * HEAD_SIZE + koff + e] = o_reg[e];
+    __syncthreads();
+    if (tz == 0) {
+      float Mf = -FLT_MAX;
+#pragma unroll
+      for (int z = 0; z < BDZ; z++) Mf = fmaxf(Mf, csM[ty * BDZ + z]);
+      float Lf = 0.f, acc[EPL];
+#pragma unroll
+      for (int e = 0; e < EPL; e++) acc[e] = 0.f;
+#pragma unroll
+      for (int z = 0; z < BDZ; z++) {
+        const float mz = csM[ty * BDZ + z];
+        if (mz <= -FLT_MAX) continue;
+        const float w = exp2f((mz - Mf) * scale_log2);
+        Lf += csL[ty * BDZ + z] * w;
+#pragma unroll
+        for (int e = 0; e < EPL; e++)
+          acc[e] += w * csO[(ty * BDZ + z) * HEAD_SIZE + koff + e];
+      }
+      const float inv = (Lf > 0.f) ? (1.f / Lf) : 0.f;
+      if (SPLIT) {
+        if (lane == 0) {
+          max_logits[DSIMT_PART(qh)] = Mf * scale_log2;
+          exp_sums[DSIMT_PART(qh)] = Lf;
+        }
+        scalar_t* to = out_or_tmp + DSIMT_PART(qh) * HEAD_SIZE + lane * EPL;
+#pragma unroll
+        for (int e = 0; e < EPL; e++) from_float(to[e], acc[e] * inv);
+      } else {
+        scalar_t* go = out_or_tmp + (int64_t)seq_idx * num_q_heads * HEAD_SIZE
+                         + qh * HEAD_SIZE + lane * EPL;
+#pragma unroll
+        for (int e = 0; e < EPL; e++) from_float(go[e], acc[e] * inv);
+        if (lse_out != nullptr && lane == 0)
+          lse_out[(int64_t)qh * gridDim.y + seq_idx] =
+              Mf * scale + logf(Lf > 0.f ? Lf : 1e-30f);
+      }
+    }
+  }
+#undef DSIMT_PART
+}
+
+// ---------------------------------------------------------------------------
 // Split-KV combine (prototype, phase 2): merge num_splits partials per
 // (seq, q_head) via the numerically-stable base-2 LSE recurrence.
 // Grid: (num_q_heads, num_seqs). Block: WARP_SIZE (head dim across lanes).

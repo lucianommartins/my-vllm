@@ -171,6 +171,57 @@ static constexpr int DS_MINCTA_256 = 3;
     }                                                                          \
   } while (0)
 
+// Bandwidth-first SIMT decode (k_eq_v only): O/Q/scores in registers, only the
+// K tile in smem. BDY = GQA heads/block, BDZ = within-block KV-split (occupancy
+// for small groups) combined via smem. Targets ~8 warps/block. MINCTA drives the
+// register cap via __launch_bounds__.
+#define LAUNCH_GEMMA_SIMT(HEAD, BN, BDY, BDZ, USW, SPLITB, MINCTA)             \
+  do {                                                                         \
+    const dim3 sgrid = (SPLITB) ? dim3(num_kv_heads, num_seqs, num_splits)     \
+                                : dim3(num_kv_heads, num_seqs);                 \
+    size_t ktile = (size_t)2 * (BN) * (HEAD) * sizeof(CACHE_T);                 \
+    size_t comb = (size_t)((BDY) * (BDZ)) * ((HEAD) + 2) * sizeof(float);       \
+    size_t smem = ktile > comb ? ktile : comb;                                 \
+    auto sk = vllm::gemma::gemma_decode_simt_kernel<                           \
+        T, CACHE_T, HEAD, BN, BDY, BDZ, USW, SPLITB, MINCTA>;                  \
+    if (smem > 48 * 1024)                                                      \
+      cudaFuncSetAttribute(                                                    \
+          sk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);             \
+    T* sout = (SPLITB) ? tmp_out_ptr : out_ptr;                               \
+    sk<<<sgrid, (BDY) * (BDZ) * WARP_SIZE, smem, stream>>>(                   \
+        sout, exp_sums_ptr, max_logits_ptr, query_ptr, key_cache_ptr,        \
+        num_kv_heads, scale, block_tables_ptr, seq_lens_ptr,                  \
+        max_num_blocks_per_seq, BLOCK_SIZE, q_stride, kv_stride_block,        \
+        kv_stride_slot, kv_stride_head, sliding_window, num_splits, max_parts,\
+        (SPLITB) ? nullptr : lse_out_ptr);                                    \
+    if (SPLITB) {                                                             \
+      const dim3 cg(num_kv_heads * (BDY), num_seqs);                          \
+      vllm::gemma::gemma_split_reduce_kernel<T, HEAD>                         \
+          <<<cg, WARP_SIZE, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr,  \
+                                         max_logits_ptr, num_splits,          \
+                                         max_parts, lse_out_ptr);             \
+    }                                                                         \
+  } while (0)
+
+#define LAUNCH_GEMMA_SIMT_SB(HEAD, BN, BDY, BDZ, USW, MINCTA)                  \
+  do {                                                                         \
+    if (num_splits > 1) {                                                      \
+      LAUNCH_GEMMA_SIMT(HEAD, BN, BDY, BDZ, USW, true, MINCTA);                \
+    } else {                                                                   \
+      LAUNCH_GEMMA_SIMT(HEAD, BN, BDY, BDZ, USW, false, MINCTA);              \
+    }                                                                          \
+  } while (0)
+
+// BDY*BDZ ~= 8 warps. BN must be divisible by BDZ (TPZ = BN/BDZ).
+#define LAUNCH_GEMMA_SIMT_HEAD(HEAD, BN, USW)                                  \
+  switch (gqa_group) {                                                         \
+    case 2:  LAUNCH_GEMMA_SIMT_SB(HEAD, BN, 2, 4, USW, 4); break;              \
+    case 4:  LAUNCH_GEMMA_SIMT_SB(HEAD, BN, 4, 2, USW, 4); break;              \
+    case 8:  LAUNCH_GEMMA_SIMT_SB(HEAD, BN, 8, 1, USW, 4); break;              \
+    case 16: LAUNCH_GEMMA_SIMT_SB(HEAD, BN, 16, 1, USW, 2); break;             \
+    default: STD_TORCH_CHECK(false, "simt decode bad group ", gqa_group);      \
+  }
+
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE>
 void gemma_paged_attention_launcher(
@@ -282,6 +333,21 @@ void gemma_paged_attention_launcher(
       std::is_same<T, __nv_bfloat16>::value &&
       (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto);
   constexpr bool use_stream = DS_DTYPE_OK;
+  // Opt-in bandwidth-first SIMT decode (k_eq_v only) for A/B vs the wmma stream
+  // kernel. Read once. The wmma path is occupancy-limited (~37% -> ~40% DRAM);
+  // SIMT trades tensor cores for occupancy to saturate HBM.
+  // SIMT mode: 0 = auto (default; SIMT for k_eq_v small groups where it wins,
+  // wmma otherwise), 1 = force SIMT for all k_eq_v, -1 = disable SIMT.
+  static const int simt_mode = []() {
+    const char* e = getenv("GEMMA_DECODE_SIMT");
+    if (e == nullptr) return 0;
+    return e[0] == '1' ? 1 : (e[0] == '0' ? -1 : 0);
+  }();
+  // The bandwidth-first SIMT decode beats the wmma kernel on small GQA groups
+  // (group<=2: 31B/12B full layers -> ~1.3x over Triton, k_eq_v half-bytes). At
+  // larger groups wmma still wins, so auto-mode keeps wmma there.
+  const bool use_simt =
+      (simt_mode == 1) || (simt_mode == 0 && gqa_group <= 2);
 
   // GQA-reuse dispatch (always on): A2 split-KV when the batch underfills the
   // SMs, else the A1 single-CTA GQA kernel. For cases where actual_head_size ==
@@ -290,7 +356,13 @@ void gemma_paged_attention_launcher(
   do {                                                              \
     bool did_stream = false;                                       \
     if constexpr (DS_DTYPE_OK) {                                   \
-      if (use_stream) {                                            \
+      if constexpr (KEQV) {                                        \
+        if (use_simt) {                                            \
+          LAUNCH_GEMMA_SIMT_HEAD(HS, DS_BN, USW);                  \
+          did_stream = true;                                       \
+        }                                                          \
+      }                                                            \
+      if (!did_stream && use_stream) {                             \
         LAUNCH_GEMMA_STREAM_HEAD(                                  \
             HS, (HS == 512 ? DS_NW_512 : DS_NW_256),               \
             (HS == 512 ? DS_MINCTA_512 : DS_MINCTA_256),          \
