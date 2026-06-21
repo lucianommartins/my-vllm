@@ -635,7 +635,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int max_seq_len,"
       "    str kv_cache_dtype, Tensor k_scale, Tensor v_scale,"
       "    int actual_head_size, bool k_eq_v,"
-      "    int sliding_window, Tensor! lse_out) -> ()");
+      "    int sliding_window, Tensor! lse_out,"
+      "    Tensor selected_tiles) -> ()");
 
   // Gemma4-optimized tensor-core prefill attention (hd=512)
   ops.def(

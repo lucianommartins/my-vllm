@@ -35,6 +35,39 @@ namespace gemma {
 using namespace nvcuda;
 static constexpr float LOG2E = 1.4426950408889634f;
 
+// ---- sm80 mma.sync helpers for the lean tensor-core decode (GEMMA_DECODE_MMA).
+// Validated layouts in /tmp/mma_attn_test.cu (full attention, maxerr 3.7e-4).
+__device__ __forceinline__ uint32_t mma_smem_addr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ void mma_ldm_x4(uint32_t* r, const void* p) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+      : "r"(mma_smem_addr(p)));
+}
+__device__ __forceinline__ void mma_ldm_x2(uint32_t* r, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(r[0]), "=r"(r[1]) : "r"(mma_smem_addr(p)));
+}
+__device__ __forceinline__ void mma_ldm_x4t(uint32_t* r, const void* p) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+      : "r"(mma_smem_addr(p)));
+}
+// D[16x8] += A[16x16] * B[16x8].  A row-major (MxK), B col-major (KxN), f32 acc.
+__device__ __forceinline__ void mma_m16n8k16(float* d, const uint32_t* a,
+                                             const uint32_t* b,
+                                             const float* c) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+        "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
 inline __device__ float warp_reduce_sum(float val) {
 #pragma unroll
   for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2)
@@ -1019,6 +1052,200 @@ gemma_decode_stream_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Lean tensor-core (mma.sync) flash-decode. k_eq_v + full (non-sliding) layers,
+// non-split. Removes BOTH walls: tensor cores kill the SIMT shuffle-compute
+// ceiling, and (unlike wmma) the only big smem buffer is the K tile -> Q is
+// built directly into registers (no 16KB sQ), scores/O stay register/tiny-smem,
+// so occupancy stays ~SIMT-level. 8 warps: split-K QK -> atomic smem-S reduce ->
+// online softmax (warp0) -> hd-split PV (each warp owns HEAD/8 of O). bf16.
+// ---------------------------------------------------------------------------
+template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_N,
+          int GQA_GROUP, int MIN_CTA = 1>
+__global__ void __launch_bounds__(256, MIN_CTA)
+gemma_decode_mma_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ q,
+    const cache_t* __restrict__ k_cache, const int num_kv_heads,
+    const float scale, const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens, const int max_num_blocks_per_seq,
+    const int page_size, const int q_stride, const int64_t kv_stride_block,
+    const int64_t kv_stride_slot, const int64_t kv_stride_head,
+    float* __restrict__ lse_out = nullptr) {
+  constexpr int NWARP = 8;
+  constexpr int KCH = HEAD_SIZE / 16;      // QK k-chunks
+  constexpr int KPW = KCH / NWARP;         // k-chunks per warp (QK split-K)
+  constexpr int HDPW = HEAD_SIZE / NWARP;  // hd output owned per warp (PV split)
+  constexpr int NPV = HDPW / 8;            // PV n-tiles per warp
+  constexpr int NTILE = BLOCK_N / 8;       // QK n-tiles
+  constexpr int U4 = HEAD_SIZE / 8;        // uint4 per token row (smem load)
+
+  const int kv_head = blockIdx.x;
+  const int seq_idx = blockIdx.y;
+  const int num_q_heads = gridDim.x * GQA_GROUP;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int group = lane >> 2, tg = lane & 3;
+  const int seq_len = seq_lens[seq_idx];
+
+  extern __shared__ char mma_smem[];
+  cache_t* sQ = reinterpret_cast<cache_t*>(mma_smem);            // [GQA_GROUP,HD]
+  cache_t* sK = sQ + GQA_GROUP * HEAD_SIZE;                      // [2,BN,HD]
+  // Per-warp partial S (non-atomic reduce): the softmax sums across warps.
+  float* sSp = reinterpret_cast<float*>(sK + 2 * BLOCK_N * HEAD_SIZE);  // [NWARP,16,16]
+  float* sM = sSp + NWARP * 16 * 16;                             // [16]
+  float* sL = sM + 16;                                           // [16]
+  float* sAl = sL + 16;                                          // [16]
+  cache_t* sP = reinterpret_cast<cache_t*>(sAl + 16);           // [16,16]
+
+  // Q -> smem (real heads only). q row for (seq, qh=kv_head*GQA_GROUP+h).
+  for (int i = tid; i < GQA_GROUP * HEAD_SIZE; i += 256) {
+    const int h = i / HEAD_SIZE, d = i % HEAD_SIZE;
+    sQ[i] = q[(int64_t)seq_idx * q_stride +
+              (kv_head * GQA_GROUP + h) * HEAD_SIZE + d];
+  }
+  for (int i = tid; i < 16; i += 256) { sM[i] = -FLT_MAX; sL[i] = 0.f; }
+  __syncthreads();
+
+  // O accumulator: warp owns hd-chunk [warp*HDPW, +HDPW), NPV n-tiles, C-frag.
+  float oacc[NPV][4];
+#pragma unroll
+  for (int n = 0; n < NPV; n++)
+    oacc[n][0] = oacc[n][1] = oacc[n][2] = oacc[n][3] = 0.f;
+
+  const int* bt = block_tables + seq_idx * max_num_blocks_per_seq;
+  const int n_tiles = GEMMA_CDIV(seq_len, BLOCK_N);
+
+#define MMA_ISSUE(BUF, KV0)                                                    \
+  do {                                                                         \
+    const int nt_ = min(BLOCK_N, seq_len - (KV0));                            \
+    for (int i = tid; i < BLOCK_N * U4; i += 256) {                           \
+      const int tok = i / U4, dv = (i % U4) * 8;                              \
+      if (tok < nt_) {                                                         \
+        const int g = (KV0) + tok;                                           \
+        const int64_t phys = bt[g / page_size];                             \
+        const cache_t* gk = k_cache + phys * kv_stride_block                 \
+            + (int64_t)(g % page_size) * kv_stride_slot                      \
+            + kv_head * kv_stride_head + dv;                                  \
+        __pipeline_memcpy_async(                                             \
+            sK + (BUF) * BLOCK_N * HEAD_SIZE + tok * HEAD_SIZE + dv, gk, 16); \
+      }                                                                       \
+    }                                                                         \
+    __pipeline_commit();                                                     \
+  } while (0)
+
+  int buf = 0;
+  MMA_ISSUE(0, 0);
+  for (int ti = 0; ti < n_tiles; ti++) {
+    const int kv0 = ti * BLOCK_N;
+    const int ntok = min(BLOCK_N, seq_len - kv0);
+    if (ti + 1 < n_tiles) { MMA_ISSUE(buf ^ 1, kv0 + BLOCK_N); __pipeline_wait_prior(1); }
+    else __pipeline_wait_prior(0);
+    __syncthreads();
+    cache_t* kbuf = sK + buf * BLOCK_N * HEAD_SIZE;
+
+    // QK split-K: this warp does k-chunks [warp*KPW, +KPW).
+    float spart[NTILE][4];
+#pragma unroll
+    for (int n = 0; n < NTILE; n++)
+      spart[n][0] = spart[n][1] = spart[n][2] = spart[n][3] = 0.f;
+#pragma unroll
+    for (int kc = 0; kc < KPW; kc++) {
+      const int c = warp * KPW + kc;
+      uint32_t qa[4] = {0, 0, 0, 0};
+      if (group < GQA_GROUP) {
+        const cache_t* qr = sQ + group * HEAD_SIZE + c * 16;
+        qa[0] = *reinterpret_cast<const uint32_t*>(qr + 2 * tg);
+        qa[2] = *reinterpret_cast<const uint32_t*>(qr + 2 * tg + 8);
+      }
+#pragma unroll
+      for (int n = 0; n < NTILE; n++) {
+        uint32_t kb[2];
+        mma_ldm_x2(kb, kbuf + (n * 8 + lane % 8) * HEAD_SIZE + c * 16
+                            + (lane / 8) * 8);
+        mma_m16n8k16(spart[n], qa, kb, spart[n]);
+      }
+    }
+    // Non-atomic reduce: each warp writes its partial S to its own region.
+#pragma unroll
+    for (int n = 0; n < NTILE; n++) {
+      const int b = warp * 256;
+      sSp[b + group * 16 + n * 8 + 2 * tg] = spart[n][0];
+      sSp[b + group * 16 + n * 8 + 2 * tg + 1] = spart[n][1];
+      sSp[b + (group + 8) * 16 + n * 8 + 2 * tg] = spart[n][2];
+      sSp[b + (group + 8) * 16 + n * 8 + 2 * tg + 1] = spart[n][3];
+    }
+    __syncthreads();
+
+    // online softmax (warp 0 only), summing the per-warp partials across warps.
+    if (warp == 0 && group < GQA_GROUP) {
+      float s16[16];
+#pragma unroll
+      for (int c = 0; c < 16; c++) {
+        float v = 0.f;
+#pragma unroll
+        for (int w = 0; w < NWARP; w++) v += sSp[w * 256 + group * 16 + c];
+        s16[c] = v * scale;
+      }
+      float tmax = -FLT_MAX;
+      for (int c = 0; c < ntok; c++) tmax = fmaxf(tmax, s16[c]);
+      const float m_old = sM[group];
+      const float m_new = fmaxf(m_old, tmax);
+      const float al = (m_old <= -FLT_MAX) ? 0.f : __expf(m_old - m_new);
+      float ssum = 0.f;
+#pragma unroll
+      for (int c = 0; c < 16; c++) {
+        float p = (c < ntok) ? __expf(s16[c] - m_new) : 0.f;
+        from_float(sP[group * 16 + c], p);
+        ssum += p;
+      }
+      if (tg == 0) {
+        sM[group] = m_new;
+        sL[group] = sL[group] * al + ssum;
+        sAl[group] = al;
+      }
+    }
+    // zero sP for padded rows (>=GQA_GROUP) once
+    if (warp == 0 && group >= GQA_GROUP)
+      for (int c = tg; c < 16; c += 4) from_float(sP[group * 16 + c], 0.f);
+    __syncthreads();
+
+    // rescale O by alpha (row group), then PV mma.
+    const float al = (group < GQA_GROUP) ? sAl[group] : 0.f;
+#pragma unroll
+    for (int n = 0; n < NPV; n++) { oacc[n][0] *= al; oacc[n][1] *= al; }
+    uint32_t pa[4];
+    mma_ldm_x4(pa, sP + (lane % 16) * 16 + (lane / 16) * 8);
+#pragma unroll
+    for (int b = 0; b < NPV / 2; b++) {       // one ldm_x4t covers 16 hd = 2 mmas
+      const int hd = warp * HDPW + b * 16;
+      uint32_t vb[4];
+      mma_ldm_x4t(vb, kbuf + (lane % 16) * HEAD_SIZE + hd + (lane / 16) * 8);
+      mma_m16n8k16(oacc[2 * b], pa, &vb[0], oacc[2 * b]);      // hd b*16+0..7
+      mma_m16n8k16(oacc[2 * b + 1], pa, &vb[2], oacc[2 * b + 1]);  // +8..15
+    }
+    __syncthreads();
+    buf ^= 1;
+  }
+#undef MMA_ISSUE
+
+  // normalize + write (warp owns hd-chunk). O row = group (real if <GQA_GROUP).
+  if (group < GQA_GROUP) {
+    const float inv = (sL[group] > 0.f) ? (1.f / sL[group]) : 0.f;
+    const int qh = kv_head * GQA_GROUP + group;
+    scalar_t* go = out + (int64_t)seq_idx * num_q_heads * HEAD_SIZE
+                     + qh * HEAD_SIZE;
+#pragma unroll
+    for (int n = 0; n < NPV; n++) {
+      const int hd = warp * HDPW + (n / 2) * 16 + (n % 2) * 8;
+      from_float(go[hd + 2 * tg], oacc[n][0] * inv);
+      from_float(go[hd + 2 * tg + 1], oacc[n][1] * inv);
+    }
+    if (lse_out != nullptr && warp == 0 && tg == 0)
+      lse_out[(int64_t)qh * gridDim.y + seq_idx] =
+          sM[group] + logf(sL[group] > 0.f ? sL[group] : 1e-30f);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Bandwidth-first SIMT decode (no tensor cores). The wmma stream kernel is
 // occupancy-limited (79 reg + 52KB smem -> 3 CTA/SM -> 37.5% occ -> 40% DRAM,
 // latency-bound). This kernel is lean: O accumulated in registers (no wmma
@@ -1046,7 +1273,11 @@ gemma_decode_simt_kernel(
     const int64_t kv_stride_block, const int64_t kv_stride_slot,
     const int64_t kv_stride_head, const int sliding_window,
     const int num_splits, const int max_parts,
-    float* __restrict__ lse_out = nullptr) {
+    float* __restrict__ lse_out = nullptr,
+    const int full_sink = 0, const int full_window = 0,  // lossy sink+window
+    // Lossy top-k: per-(seq,kv_head) list of selected tile indices to attend
+    // [num_seqs, num_kv_heads, num_sel] int32 (nullptr -> use sink+window/full).
+    const int* __restrict__ selected_tiles = nullptr, const int num_sel = 0) {
   constexpr int EPL = HEAD_SIZE / 32;     // head dims per lane
   constexpr int VEC = 16 / sizeof(cache_t);  // bf16 -> 8 per uint4
   const int kv_head = blockIdx.x;
@@ -1073,7 +1304,29 @@ gemma_decode_simt_kernel(
     const int lo = seq_len - sliding_window;
     kv_begin = (lo > 0) ? (lo / BLOCK_N) * BLOCK_N : 0;
   }
-  const int n_tiles = GEMMA_CDIV(seq_len - kv_begin, BLOCK_N);
+  // Effective tile sequence. Sliding layers keep their lossless windowed range
+  // [kv_begin, L). Full layers may use LOSSY sink+window: attend only
+  // [0, full_sink) U [L-full_window, L). Degenerate (overlap / short seq) ->
+  // full attention (lossless). The map (SIMT_KV0) is transparent to the compute
+  // (decode has no causal mask; only the tile boundary `ntok` matters).
+  const int eff_begin_tile = kv_begin / BLOCK_N;
+  int n_tiles = GEMMA_CDIV(seq_len - kv_begin, BLOCK_N);
+  int sink_tiles = 0, win_start_tile = 0;
+  bool sw = (!USE_SLIDING_WINDOW) && (full_sink > 0) && (full_window > 0);
+  if (sw) {
+    const int n_full = GEMMA_CDIV(seq_len, BLOCK_N);
+    sink_tiles = GEMMA_CDIV(full_sink, BLOCK_N);
+    win_start_tile =
+        (seq_len > full_window) ? ((seq_len - full_window) / BLOCK_N) : 0;
+    if (win_start_tile <= sink_tiles) {
+      sw = false;  // ranges touch -> full attention (lossless)
+    } else {
+      n_tiles = sink_tiles + (n_full - win_start_tile);
+    }
+  }
+  // Top-k (P2): an explicit per-(seq,kv_head) selected-tile list overrides the
+  // sink+window/full map. n_tiles becomes the selected count.
+  if (selected_tiles != nullptr) { n_tiles = num_sel; sw = false; }
   const int tiles_per_split = GEMMA_CDIV(n_tiles, nsplits);
   const int tile_lo = split_idx * tiles_per_split;
   int tile_hi = tile_lo + tiles_per_split;
@@ -1089,8 +1342,16 @@ gemma_decode_simt_kernel(
     for (int e = 0; e < EPL; e++) from_float(to[e], 0.f);
     return;
   }
-  const int kv0_lo = kv_begin + tile_lo * BLOCK_N;
-  const int kv0_hi = kv_begin + tile_hi * BLOCK_N;
+  // Map a logical tile index -> physical first-token: explicit selected-tile
+  // list (top-k) if provided, else the sink+window/full map.
+#define SIMT_KV0(LT)                                                          \
+  ((selected_tiles != nullptr)                                                \
+       ? (selected_tiles[((int64_t)seq_idx * gridDim.x + kv_head) * num_sel   \
+                         + (LT)] * BLOCK_N)                                    \
+       : ((sw ? ((LT) < sink_tiles                                            \
+                     ? (LT)                                                    \
+                     : (win_start_tile + ((LT) - sink_tiles)))                \
+              : (eff_begin_tile + (LT))) * BLOCK_N))
 
   // Q into registers (lane owns dims [lane*EPL, +EPL)); O accumulator in regs.
   float q_reg[EPL], o_reg[EPL];
@@ -1137,12 +1398,12 @@ gemma_decode_simt_kernel(
   } while (0)
 
   int buf = 0;
-  SIMT_ISSUE(0, kv0_lo);
-  for (int kv0 = kv0_lo; kv0 < kv0_hi; kv0 += BLOCK_N) {
+  SIMT_ISSUE(0, SIMT_KV0(tile_lo));
+  for (int lt = tile_lo; lt < tile_hi; lt++) {
+    const int kv0 = SIMT_KV0(lt);
     const int ntok = min(BLOCK_N, seq_len - kv0);
-    const int kvn = kv0 + BLOCK_N;
-    if (kvn < kv0_hi) {
-      SIMT_ISSUE(buf ^ 1, kvn);
+    if (lt + 1 < tile_hi) {
+      SIMT_ISSUE(buf ^ 1, SIMT_KV0(lt + 1));
       __pipeline_wait_prior(1);  // tile t ready; tile t+1 stays in flight
     } else {
       __pipeline_wait_prior(0);
@@ -1206,6 +1467,7 @@ gemma_decode_simt_kernel(
     buf ^= 1;
   }
 #undef SIMT_ISSUE
+#undef SIMT_KV0
 
   if constexpr (BDZ == 1) {
     const float inv = (l > 0.f) ? (1.f / l) : 0.f;

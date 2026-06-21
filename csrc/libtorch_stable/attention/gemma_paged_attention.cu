@@ -193,7 +193,8 @@ static constexpr int DS_MINCTA_256 = 3;
         num_kv_heads, scale, block_tables_ptr, seq_lens_ptr,                  \
         max_num_blocks_per_seq, BLOCK_SIZE, q_stride, kv_stride_block,        \
         kv_stride_slot, kv_stride_head, sliding_window, num_splits, max_parts,\
-        (SPLITB) ? nullptr : lse_out_ptr);                                    \
+        (SPLITB) ? nullptr : lse_out_ptr, full_sink, full_window,             \
+        selected_tiles_ptr, num_sel);                                        \
     if (SPLITB) {                                                             \
       const dim3 cg(num_kv_heads * (BDY), num_seqs);                          \
       vllm::gemma::gemma_split_reduce_kernel<T, HEAD>                         \
@@ -222,6 +223,34 @@ static constexpr int DS_MINCTA_256 = 3;
     default: STD_TORCH_CHECK(false, "simt decode bad group ", gqa_group);      \
   }
 
+// Lean tensor-core (mma.sync) decode: k_eq_v + non-sliding (full layers),
+// non-split. 8 warps, 256 threads. smem = sQ + 2x K tile + tiny S/M/L/P.
+#define LAUNCH_GEMMA_MMA(HEAD, BN, GROUP, MINCTA)                              \
+  do {                                                                         \
+    const dim3 mg(num_kv_heads, num_seqs);                                     \
+    size_t msmem =                                                             \
+        (size_t)((GROUP) * (HEAD) + 2 * (BN) * (HEAD)) * sizeof(CACHE_T)       \
+        + (size_t)(8 * 256 + 48) * sizeof(float) + (size_t)256 * sizeof(CACHE_T); \
+    auto mk = vllm::gemma::gemma_decode_mma_kernel<                            \
+        T, CACHE_T, HEAD, BN, GROUP, MINCTA>;                                  \
+    if (msmem > 48 * 1024)                                                     \
+      cudaFuncSetAttribute(                                                    \
+          mk, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem);            \
+    mk<<<mg, 256, msmem, stream>>>(                                            \
+        out_ptr, query_ptr, key_cache_ptr, num_kv_heads, scale,               \
+        block_tables_ptr, seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE,    \
+        q_stride, kv_stride_block, kv_stride_slot, kv_stride_head,             \
+        lse_out_ptr);                                                          \
+  } while (0)
+
+#define LAUNCH_GEMMA_MMA_HEAD(HEAD, BN)                                        \
+  switch (gqa_group) {                                                         \
+    case 2:  LAUNCH_GEMMA_MMA(HEAD, BN, 2, 4); break;                          \
+    case 4:  LAUNCH_GEMMA_MMA(HEAD, BN, 4, 4); break;                          \
+    case 8:  LAUNCH_GEMMA_MMA(HEAD, BN, 8, 4); break;                          \
+    default: STD_TORCH_CHECK(false, "mma decode bad group ", gqa_group);       \
+  }
+
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE>
 void gemma_paged_attention_launcher(
@@ -242,7 +271,8 @@ void gemma_paged_attention_launcher(
     int actual_head_size,
     bool k_eq_v,
     int sliding_window,
-    torch::stable::Tensor& lse_out) {  // [num_q_heads,num_seqs] or empty
+    torch::stable::Tensor& lse_out,   // [num_q_heads,num_seqs] or empty
+    torch::stable::Tensor& selected_tiles) {  // [seqs,kv_heads,num_sel] or empty
 
   int num_seqs = query.size(0);
   int num_q_heads = query.size(1);
@@ -273,6 +303,18 @@ void gemma_paged_attention_launcher(
   float* lse_out_ptr = (lse_out.numel() > 0)
                            ? reinterpret_cast<float*>(lse_out.data_ptr())
                            : nullptr;
+
+  // Lossy top-k (P2): explicit per-(seq,kv_head) selected-tile list. Empty ->
+  // nullptr -> the SIMT kernel falls back to sink+window/full. num_sel is the
+  // per-(seq,kv_head) selected count (last dim). Only the SIMT decode path
+  // consumes it (the group<=2 full-layer target); see the dispatch check below.
+  const int* selected_tiles_ptr =
+      (selected_tiles.numel() > 0)
+          ? reinterpret_cast<const int*>(selected_tiles.data_ptr())
+          : nullptr;
+  const int num_sel =
+      (selected_tiles.numel() > 0) ? static_cast<int>(selected_tiles.size(2))
+                                   : 0;
 
   // Grid: one CTA per (q_head, seq). All KV work done intra-CTA.
   dim3 grid(num_q_heads, num_seqs);
@@ -348,6 +390,32 @@ void gemma_paged_attention_launcher(
   // larger groups wmma still wins, so auto-mode keeps wmma there.
   const bool use_simt =
       (simt_mode == 1) || (simt_mode == 0 && gqa_group <= 2);
+  // Opt-in lean tensor-core (mma.sync) decode for k_eq_v non-sliding (full)
+  // layers, non-split. Experimental path toward the 2x; off by default.
+  static const bool use_mma = []() {
+    const char* e = getenv("GEMMA_DECODE_MMA");
+    return e != nullptr && e[0] == '1';
+  }();
+  // Lossy sink+window for FULL layers (decode): attend [0,S) U [L-W,L). Off (0)
+  // by default -> full attention (lossless). Experimentation knobs; the kernel
+  // ignores them on sliding layers and when degenerate (L <= S+W).
+  static const int full_sink = []() {
+    const char* e = getenv("GEMMA_FULL_SINK");
+    return e != nullptr ? atoi(e) : 0;
+  }();
+  static const int full_window = []() {
+    const char* e = getenv("GEMMA_FULL_WINDOW");
+    return e != nullptr ? atoi(e) : 0;
+  }();
+  // Top-k is only honored by the SIMT decode path (k_eq_v full layers, the
+  // group<=2 target). Fail loud rather than silently return full attention if a
+  // selected-tile list is handed to a config that won't consume it.
+  if (selected_tiles_ptr != nullptr) {
+    STD_TORCH_CHECK(use_simt && k_eq_v && !use_sw,
+        "selected_tiles (top-k) requires the SIMT decode path "
+        "(k_eq_v full layer, gqa_group<=2); got use_simt=", use_simt,
+        " k_eq_v=", k_eq_v, " sliding_window=", sliding_window);
+  }
 
   // GQA-reuse dispatch (always on): A2 split-KV when the batch underfills the
   // SMs, else the A1 single-CTA GQA kernel. For cases where actual_head_size ==
@@ -356,8 +424,14 @@ void gemma_paged_attention_launcher(
   do {                                                              \
     bool did_stream = false;                                       \
     if constexpr (DS_DTYPE_OK) {                                   \
+      if constexpr (KEQV && !(USW)) {                              \
+        if (use_mma && num_splits == 1) {                         \
+          LAUNCH_GEMMA_MMA_HEAD(HS, 16);                           \
+          did_stream = true;                                       \
+        }                                                          \
+      }                                                            \
       if constexpr (KEQV) {                                        \
-        if (use_simt) {                                            \
+        if (!did_stream && use_simt) {                             \
           LAUNCH_GEMMA_SIMT_HEAD(HS, DS_BN, USW);                  \
           did_stream = true;                                       \
         }                                                          \
@@ -405,7 +479,8 @@ void gemma_paged_attention_launcher(
   gemma_paged_attention_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE>(            \
       out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,       \
       num_kv_heads, scale, block_tables, seq_lens, max_seq_len,                \
-      k_scale, v_scale, actual_head_size, k_eq_v, sliding_window, lse_out);
+      k_scale, v_scale, actual_head_size, k_eq_v, sliding_window, lse_out,     \
+      selected_tiles);
 
 #define CALL_GEMMA_LAUNCHER_BLOCK_SIZE(T, CACHE_T, KV_DTYPE)             \
   switch (block_size) {                                                  \
@@ -443,7 +518,8 @@ void gemma_paged_attention(
     int64_t actual_head_size,
     bool k_eq_v,
     int64_t sliding_window,
-    torch::stable::Tensor& lse_out) {
+    torch::stable::Tensor& lse_out,
+    torch::stable::Tensor& selected_tiles) {
   DISPATCH_BY_KV_CACHE_DTYPE(query.scalar_type(), kv_cache_dtype,
                              CALL_GEMMA_LAUNCHER_BLOCK_SIZE)
 }

@@ -485,7 +485,8 @@ void gemma_paged_attention(
     int64_t block_size, int64_t max_seq_len,
     const std::string& kv_cache_dtype, torch::stable::Tensor& k_scale,
     torch::stable::Tensor& v_scale, int64_t actual_head_size, bool k_eq_v,
-    int64_t sliding_window, torch::stable::Tensor& lse_out);
+    int64_t sliding_window, torch::stable::Tensor& lse_out,
+    torch::stable::Tensor& selected_tiles);
 
 void gemma_prefill_attention(
     torch::stable::Tensor& out, torch::stable::Tensor& query,

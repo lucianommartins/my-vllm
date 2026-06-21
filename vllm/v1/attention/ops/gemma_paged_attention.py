@@ -28,6 +28,7 @@ def gemma_paged_attention(
     k_eq_v: bool,
     sliding_window: int,
     lse_out: torch.Tensor | None = None,
+    selected_tiles: torch.Tensor | None = None,
 ) -> None:
     """Gemma4-optimized paged attention decode kernel.
 
@@ -59,9 +60,15 @@ def gemma_paged_attention(
         sliding_window: Sliding window size (0 = disabled)
         lse_out: Optional natural-log LSE output [num_heads, num_seqs] for
             cascade attention; None (empty) skips it.
+        selected_tiles: Optional lossy top-k tile selection (int32)
+            [num_seqs, num_kv_heads, num_sel]; each entry is a KV tile index to
+            attend. None (empty) -> full / sink+window. Only the SIMT decode
+            path (k_eq_v full layers) consumes it.
     """
     if lse_out is None:
         lse_out = out.new_empty(0, dtype=torch.float32)
+    if selected_tiles is None:
+        selected_tiles = out.new_empty(0, dtype=torch.int32)
     ops.gemma_paged_attention(
         out,
         exp_sums,
@@ -83,4 +90,5 @@ def gemma_paged_attention(
         k_eq_v,
         sliding_window,
         lse_out,
+        selected_tiles,
     )

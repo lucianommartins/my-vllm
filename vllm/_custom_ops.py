@@ -226,9 +226,12 @@ def gemma_paged_attention(
     k_eq_v: bool,
     sliding_window: int,
     lse_out: torch.Tensor | None = None,
+    selected_tiles: torch.Tensor | None = None,
 ) -> None:
     if lse_out is None:
         lse_out = out.new_empty(0, dtype=torch.float32)
+    if selected_tiles is None:
+        selected_tiles = out.new_empty(0, dtype=torch.int32)
     torch.ops._C.gemma_paged_attention(
         out,
         exp_sums,
@@ -250,6 +253,7 @@ def gemma_paged_attention(
         k_eq_v,
         sliding_window,
         lse_out,
+        selected_tiles,
     )
 
 
