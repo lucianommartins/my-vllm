@@ -268,7 +268,7 @@ __global__ void gemma_prefill_kernel(
 // ===========================================================================
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_M,
           int BLOCK_N, int NUM_WARPS, int GQA_GROUP, bool K_EQ_V,
-          bool USE_SLIDING_WINDOW, int MIN_CTA = 1>
+          bool USE_SLIDING_WINDOW, int MIN_CTA = 1, bool USE_MM_PREFIX = false>
 __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     gemma_prefill_kernel_v2(
     scalar_t* __restrict__ out, const scalar_t* __restrict__ q,
@@ -277,12 +277,17 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     const int* __restrict__ seq_lens, const int* __restrict__ cu_seqlens_q,
     const int max_num_blocks_per_seq, const int page_size, const int q_stride,
     const int64_t kv_stride_block, const int64_t kv_stride_slot,
-    const int64_t kv_stride_head, const int sliding_window) {
+    const int64_t kv_stride_head, const int sliding_window,
+    // Multimodal bidirectional ("mm-prefix") image-token spans, int32
+    // [num_seqs, max_mm_ranges, 2] (absolute [start,end] inclusive; valid iff
+    // start<end). max_mm_ranges==0 -> no mm-prefix (text-only / full layers).
+    const int* __restrict__ mm_prefix_ranges, const int max_mm_ranges) {
   constexpr int MT = BLOCK_M / 16;            // M tiles
   constexpr int NT = BLOCK_N / 16;            // QK N tiles
   constexpr int DT = HEAD_SIZE / 16;          // total head tiles
   constexpr int HNT_W = DT / NUM_WARPS;       // head tiles owned per warp
   constexpr int VEC = 16 / sizeof(cache_t);
+  constexpr int MM_RANGE_CAP = 32;            // max image spans/seq we honor
   static_assert(DT % NUM_WARPS == 0, "head tiles must split across warps");
   static_assert(MT * NT <= NUM_WARPS, "QK tiles must fit in warps");
 
@@ -318,6 +323,7 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
   float* sM = sS + BLOCK_M * LDN;                                 // [BM]
   float* sL = sM + BLOCK_M;                                       // [BM]
   float* sA = sL + BLOCK_M;                                       // [BM]
+  int* sMM = reinterpret_cast<int*>(sA + BLOCK_M);               // [MM_RANGE_CAP*2]
 
   // O accumulator fragments (register-resident across the KV loop).
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> Ofrag[MT][HNT_W];
@@ -344,6 +350,21 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
   }
   __syncthreads();
 
+  // Preload this seq's mm-prefix image spans into smem (shared by every (q,k)
+  // mask check below). Compiled out entirely for text-only / full-attn layers
+  // (USE_MM_PREFIX=false) -> zero overhead. nr = #spans; has_mm = seq has a span.
+  int nr = 0;
+  bool has_mm = false;
+  if constexpr (USE_MM_PREFIX) {
+    nr = (max_mm_ranges < MM_RANGE_CAP) ? max_mm_ranges : MM_RANGE_CAP;
+    for (int i = tid; i < nr; i += nthreads) {
+      sMM[2 * i]     = mm_prefix_ranges[(seq_idx * max_mm_ranges + i) * 2];
+      sMM[2 * i + 1] = mm_prefix_ranges[(seq_idx * max_mm_ranges + i) * 2 + 1];
+    }
+    if (nr > 0) __syncthreads();
+    for (int i = 0; i < nr; i++) has_mm |= (sMM[2 * i] < sMM[2 * i + 1]);
+  }
+
   const float scale_log2 = scale * LOG2E;
   const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
   const int last_q_abs = context + min(row0 + BLOCK_M - 1, q_len - 1);
@@ -353,6 +374,16 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     const int first_q_abs = context + row0;
     int lo = first_q_abs - sliding_window + 1;
     kv_begin = (lo > 0) ? (lo / BLOCK_N) * BLOCK_N : 0;
+  }
+  // Bidirectional image spans (<= sliding_window wide) can sit AHEAD of this
+  // q-block's causal end -> extend kv_end to cover them (bounded by sw). kv_begin
+  // (sliding start) already covers span starts since spans are <= sw wide.
+  if constexpr (USE_MM_PREFIX) {
+    if (has_mm) {
+      const int ext = (sliding_window > 0) ? sliding_window : seq_len;
+      const int e2 = last_q_abs + 1 + ext;
+      kv_end = (e2 < seq_len) ? e2 : seq_len;
+    }
   }
 
   for (int kv0 = kv_begin; kv0 < kv_end; kv0 += BLOCK_N) {
@@ -413,9 +444,25 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
       for (int cc = 0; cc < CPL; ++cc) {
         const int c = lane + cc * 32;
         const int k_abs = kv0 + c;
-        bool valid = (qr < q_len) && (c < n_tok) && (k_abs <= q_abs);
+        // keep = (causal AND sliding) OR mm_prefix(bidirectional within an image
+        // span). The mm-prefix OR overrides causal+sliding inside a span.
+        bool keep = (k_abs <= q_abs);
         if (USE_SLIDING_WINDOW && sliding_window > 0)
-          valid = valid && (k_abs > q_abs - sliding_window);
+          keep = keep && (k_abs > q_abs - sliding_window);
+        if constexpr (USE_MM_PREFIX) {
+          if (has_mm) {
+#pragma unroll 1
+            for (int i = 0; i < nr; i++) {
+              const int s = sMM[2 * i], e = sMM[2 * i + 1];
+              if (s < e && q_abs >= s && q_abs <= e && k_abs >= s &&
+                  k_abs <= e) {
+                keep = true;
+                break;
+              }
+            }
+          }
+        }
+        bool valid = (qr < q_len) && (c < n_tok) && keep;
         sv[cc] = valid ? sS[r * LDN + c] : -FLT_MAX;
         rmax = fmaxf(rmax, sv[cc]);
       }

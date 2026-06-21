@@ -643,7 +643,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    Tensor! out, Tensor query, Tensor key_cache, Tensor value_cache,"
       "    int num_kv_heads, float scale, Tensor block_tables, Tensor seq_lens,"
       "    Tensor cu_seqlens_q, int max_q_len, int block_size, bool k_eq_v,"
-      "    int sliding_window) -> ()");
+      "    int sliding_window, Tensor mm_prefix_ranges) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {

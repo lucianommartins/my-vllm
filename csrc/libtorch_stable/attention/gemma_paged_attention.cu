@@ -17,11 +17,11 @@ static constexpr int NUM_WARPS = 4;
 // Phase 1 bandwidth-saturating tensor-core decode (gemma_decode_stream_kernel):
 // per-head warps/CTA + MIN_CTA (__launch_bounds__) to be tuned by the roofline
 // sweep. BLOCK_N=32 (wmma N tile, % 32 for the warp-softmax).
-static constexpr int DS_BN = 32;
-static constexpr int DS_NW_512 = 16;
-static constexpr int DS_NW_256 = 16;
-static constexpr int DS_MINCTA_512 = 1;
-static constexpr int DS_MINCTA_256 = 1;
+static constexpr int DS_BN = 16;
+static constexpr int DS_NW_512 = 8;
+static constexpr int DS_NW_256 = 8;
+static constexpr int DS_MINCTA_512 = 3;
+static constexpr int DS_MINCTA_256 = 3;
 
 #define LAUNCH_GEMMA(HEAD_SIZE, ACTUAL_HEAD_SIZE, K_EQ_V, USE_SW)              \
   vllm::gemma::gemma_flash_decode_kernel<                                      \
@@ -121,8 +121,10 @@ static constexpr int DS_MINCTA_256 = 1;
                                 : dim3(num_kv_heads, num_seqs);                 \
     constexpr int SLDH = (HEAD) + 8;                                           \
     constexpr int SLDN = DS_BN + 8;                                            \
-    constexpr int SKTILE = DS_BN * SLDH;                                       \
-    constexpr int SSTAGE = SKTILE + ((KEQV) ? 0 : SKTILE);                     \
+    constexpr int SKTILE = DS_BN * SLDH;  /* K tile; V staged too only for       \
+        hd256 !k_eq_v (hd512 !k_eq_v reads V from gmem; k_eq_v reuses K) */      \
+    constexpr int SSTAGE =                                                     \
+        SKTILE + (((!(KEQV)) && ((HEAD) < 512)) ? SKTILE : 0);                 \
     size_t ssmem = (size_t)(16 * SLDH + 2 * SSTAGE + 16 * SLDN)                \
                        * sizeof(CACHE_T)                                       \
                    + (size_t)(16 * SLDN + 3 * 16) * sizeof(float);            \
@@ -264,18 +266,16 @@ void gemma_paged_attention_launcher(
     if (num_splits < 1) num_splits = 1;
   }
 
-  // Phase 1 dev toggle: GEMMA_DECODE_STREAM=1 routes the bandwidth-saturating
-  // tensor-core decode (bf16 + non-quant KV only); else the scalar GQA path.
-  // Temporary A/B knob; becomes the default once it beats scalar on the roofline.
+  // The bandwidth-saturating tensor-core decode (gemma_decode_stream_kernel) is
+  // the default for bf16 + non-quant KV: it strictly dominates the scalar GQA
+  // kernel at every measured config (k_eq_v and not, both head sizes) and beats
+  // Triton on the sliding layers + at the decode-heavy regime. fp8/fp16 keep the
+  // scalar path (no tensor-core dequant). The `if constexpr` also avoids
+  // instantiating the wmma kernel for unsupported dtypes on sm80.
   constexpr bool DS_DTYPE_OK =
       std::is_same<T, __nv_bfloat16>::value &&
       (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto);
-  static int ds_mode = []() {
-    const char* e = getenv("GEMMA_DECODE_STREAM");
-    return e ? atoi(e) : 0;
-  }();
-  bool use_stream = false;
-  if constexpr (DS_DTYPE_OK) use_stream = (ds_mode == 1);
+  constexpr bool use_stream = DS_DTYPE_OK;
 
   // GQA-reuse dispatch (always on): A2 split-KV when the batch underfills the
   // SMs, else the A1 single-CTA GQA kernel. For cases where actual_head_size ==

@@ -26,7 +26,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.v1.attention.backends.utils import (
+    compute_mm_prefix_range_tensor,
+    get_kv_cache_layout,
+)
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
@@ -52,6 +55,12 @@ class GemmaAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    # Multimodal bidirectional ("mm-prefix") image-token spans. Field names match
+    # what Gemma4ForConditionalGeneration._clear_mm_prefix_for_full_attn_layers
+    # looks for (it nulls these on full-attention layers so only sliding layers
+    # get bidirectional attention).
+    mm_prefix_range: dict | None = None
+    mm_prefix_range_tensor: torch.Tensor | None = None
 
 
 class GemmaAttentionMetadataBuilder(
@@ -86,6 +95,13 @@ class GemmaAttentionMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> GemmaAttentionMetadata:
+        mm_ranges = common_attn_metadata.mm_req_doc_ranges
+        mm_range_tensor = None
+        if mm_ranges is not None:
+            mm_range_tensor = compute_mm_prefix_range_tensor(
+                mm_ranges, common_attn_metadata.num_reqs,
+                common_attn_metadata.seq_lens.device,
+            )
         return GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -94,6 +110,8 @@ class GemmaAttentionMetadataBuilder(
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            mm_prefix_range=mm_ranges,
+            mm_prefix_range_tensor=mm_range_tensor,
         )
 
 
@@ -170,6 +188,15 @@ class GemmaAttentionBackend(AttentionBackend):
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
         return head_size in (256, 512)
+
+    # The prefill kernel implements the bidirectional mm-prefix (image-token)
+    # mask: within an image span attention is full, overriding causal+sliding
+    # (gemma_prefill_kernel_v2). Decode queries are post-prompt text tokens never
+    # inside a span, so decode stays causal. Gemma4 applies this only to sliding
+    # layers; the model nulls mm_prefix_range_tensor on full-attn layers.
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return True
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -322,6 +349,13 @@ class GemmaAttentionImpl(AttentionImpl):
             and query.dtype == torch.bfloat16
             and not is_quantized_kv_cache(self.kv_cache_dtype)
         ):
+            # mm-prefix bidirectional image-token spans (None on text-only batches
+            # and on full-attn layers the model cleared) -> empty tensor = none.
+            mm_ranges = attn_metadata.mm_prefix_range_tensor
+            if mm_ranges is None:
+                mm_ranges = torch.empty(
+                    0, dtype=torch.int32, device=query.device
+                )
             torch.ops._C.gemma_prefill_attention(
                 output,
                 query,
@@ -336,6 +370,7 @@ class GemmaAttentionImpl(AttentionImpl):
                 key_cache.shape[1],
                 self.k_eq_v,
                 self.sliding_window,
+                mm_ranges,
             )
             return output
 

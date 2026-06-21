@@ -713,7 +713,8 @@ gemma_decode_stream_kernel(
   constexpr int VEC = 16 / sizeof(cache_t);
   static_assert(DT % NUM_WARPS == 0, "head tiles must split across warps");
   static_assert(MT * NT <= NUM_WARPS, "QK tiles must fit in warps");
-  static_assert(BLOCK_N % 32 == 0, "warp-softmax assumes BLOCK_N % 32 == 0");
+  static_assert(BLOCK_N == 16 || BLOCK_N % 32 == 0,
+                "warp-softmax assumes BLOCK_N == 16 or a multiple of 32");
 
   const int kv_head = blockIdx.x;
   const int seq_idx = blockIdx.y;
@@ -759,19 +760,29 @@ gemma_decode_stream_kernel(
   constexpr int LDH = HEAD_SIZE + SPAD;
   constexpr int LDN = BLOCK_N + SPAD;
   constexpr int KTILE = BLOCK_N * LDH;          // elems per staged K tile
-  constexpr int VBUF = K_EQ_V ? 0 : KTILE;      // V staged separately if !k_eq_v
-  constexpr int STAGE = KTILE + VBUF;           // elems per pipeline stage
+  // V handling (3 cases):
+  //  - k_eq_v: V == K, reuse the staged K tile (no extra smem).
+  //  - !k_eq_v, hd512 (V_GMEM): V read straight from global in PV. Each BLOCK_N
+  //    tile == one paged block (BLOCK_N <= page_size), so V is wmma-loadable with
+  //    ldm=kv_stride_slot. Avoids a 2nd hd512 smem stage that would drop us to
+  //    1 CTA/SM -> keeps 3 CTA/SM.
+  //  - !k_eq_v, hd256 (V_SMEM): stage V to smem (prefetched). hd256's V tile is
+  //    small enough to keep 3 CTA/SM, and smem V avoids exposing load latency.
+  constexpr bool V_GMEM = (!K_EQ_V) && (HEAD_SIZE >= 512);
+  constexpr bool V_SMEM = (!K_EQ_V) && !V_GMEM;
+  constexpr int VBUF = V_SMEM ? KTILE : 0;
+  constexpr int STAGE = KTILE + VBUF;
 
   extern __shared__ char ds_smem[];
   cache_t* sQ = reinterpret_cast<cache_t*>(ds_smem);   // [16, LDH]
-  cache_t* sKV = sQ + BLOCK_M * LDH;                    // 2 stages of K(+V)
+  cache_t* sKV = sQ + BLOCK_M * LDH;                    // 2 pipeline stages of K(+V)
   cache_t* sP = sKV + 2 * STAGE;                        // [16, LDN]
   float* sS = reinterpret_cast<float*>(sP + BLOCK_M * LDN);  // [16, LDN]
   float* sM = sS + BLOCK_M * LDN;
   float* sL = sM + BLOCK_M;
   float* sA = sL + BLOCK_M;
 #define DS_KBUF(s) (sKV + (s) * STAGE)
-#define DS_VBUF(s) (K_EQ_V ? DS_KBUF(s) : (DS_KBUF(s) + KTILE))
+#define DS_VBUF(s) (DS_KBUF(s) + KTILE)
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> Ofrag[MT][HNT_W];
 #pragma unroll
@@ -816,7 +827,7 @@ gemma_decode_stream_kernel(
         const int64_t off = phys * kv_stride_block + slot * kv_stride_slot     \
                             + kv_head * kv_stride_head + dv;                   \
         __pipeline_memcpy_async(DS_KBUF(s) + n * LDH + dv, k_cache + off, 16); \
-        if (!K_EQ_V)                                                           \
+        if (V_SMEM)                                                            \
           __pipeline_memcpy_async(DS_VBUF(s) + n * LDH + dv, v_cache + off,    \
                                   16);                                         \
       }                                                                        \
@@ -840,9 +851,15 @@ gemma_decode_stream_kernel(
     const int kv0 = kv_begin + (tile_lo + t) * BLOCK_N;
     const int n_tok = min(BLOCK_N, seq_len - kv0);
     cache_t* kbuf = DS_KBUF(cur);
-    cache_t* vbuf = DS_VBUF(cur);
+    cache_t* vbuf = V_SMEM ? DS_VBUF(cur) : kbuf;  // staged V (hd256 !k_eq_v)
+    // V page coords for V_GMEM (this tile is one paged block: BLOCK_N<=page_size).
+    const int64_t v_phys = V_GMEM ? (int64_t)block_table[kv0 / page_size] : 0;
+    const int v_slot0 = V_GMEM ? (kv0 % page_size) : 0;
 
     // QK: S[16, BLOCK_N] = sQ @ kbuf^T (col-major K), full-head contraction.
+    // (Split-K across warps was tried to balance this single-warp phase but was
+    // net-negative: the partial-reduction scratch dropped 3->2 CTA/SM and the
+    // occupancy loss outweighed the removed barrier. Occupancy wins here.)
     if (warp < MT * NT) {
       const int mt = warp / NT, nt = warp % NT;
       wmma::fragment<wmma::accumulator, 16, 16, 16, float> s;
@@ -862,7 +879,7 @@ gemma_decode_stream_kernel(
 
     // online softmax (parallel, one warp per row). Mask: token-valid + sliding
     // lower bound only (decode query is the last position -> no causal).
-    constexpr int CPL = BLOCK_N / 32;
+    constexpr int CPL = (BLOCK_N + 31) / 32;  // cols/lane (1 for BLOCK_N<=32)
     for (int r = warp; r < BLOCK_M; r += NUM_WARPS) {
       float sv[CPL];
       float rmax = -FLT_MAX;
@@ -870,7 +887,7 @@ gemma_decode_stream_kernel(
       for (int cc = 0; cc < CPL; ++cc) {
         const int c = lane + cc * 32;
         const int k_abs = kv0 + c;
-        bool valid = (c < n_tok);
+        bool valid = (c < BLOCK_N) && (c < n_tok);  // c<BLOCK_N masks BN<32
         if (USE_SLIDING_WINDOW && sliding_window > 0)
           valid = valid && (k_abs > q_abs - sliding_window);
         sv[cc] = valid ? sS[r * LDN + c] : -FLT_MAX;
@@ -889,8 +906,8 @@ gemma_decode_stream_kernel(
         const int c = lane + cc * 32;
         const float p =
             (m_new <= -FLT_MAX) ? 0.f : exp2f((sv[cc] - m_new) * scale_log2);
-        sP[r * LDN + c] = static_cast<cache_t>(p);
-        rsum += p;
+        if (c < BLOCK_N) sP[r * LDN + c] = static_cast<cache_t>(p);
+        rsum += p;  // invalid lanes contribute exp2(-inf)=0
       }
 #pragma unroll
       for (int o = 16; o >= 1; o >>= 1)
@@ -921,7 +938,16 @@ gemma_decode_stream_kernel(
           wmma::fragment<wmma::matrix_a, 16, 16, 16, cache_t, wmma::row_major> fp;
           wmma::fragment<wmma::matrix_b, 16, 16, 16, cache_t, wmma::row_major> fv;
           wmma::load_matrix_sync(fp, sP + m * 16 * LDN + kt * 16, LDN);
-          wmma::load_matrix_sync(fv, vbuf + kt * 16 * LDH + ht * 16, LDH);
+          if constexpr (V_GMEM) {
+            // V straight from global: tokens [kt*16..] of this paged block are
+            // rows (stride kv_stride_slot), head dims [ht*16..] are cols.
+            const cache_t* gv = v_cache + v_phys * kv_stride_block
+                + (int64_t)(v_slot0 + kt * 16) * kv_stride_slot
+                + kv_head * kv_stride_head + ht * 16;
+            wmma::load_matrix_sync(fv, gv, kv_stride_slot);
+          } else {  // k_eq_v (V==K) or V_SMEM (staged V): both in smem
+            wmma::load_matrix_sync(fv, vbuf + kt * 16 * LDH + ht * 16, LDH);
+          }
           wmma::mma_sync(Ofrag[m][j], fp, fv, Ofrag[m][j]);
         }
       }

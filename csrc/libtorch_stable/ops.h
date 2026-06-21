@@ -492,7 +492,8 @@ void gemma_prefill_attention(
     torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
     int64_t num_kv_heads, double scale, torch::stable::Tensor& block_tables,
     torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
-    int64_t max_q_len, int64_t block_size, bool k_eq_v, int64_t sliding_window);
+    int64_t max_q_len, int64_t block_size, bool k_eq_v, int64_t sliding_window,
+    torch::stable::Tensor& mm_prefix_ranges);
 
 // Cache ops (shared CUDA/ROCm)
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
