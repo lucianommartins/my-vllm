@@ -191,10 +191,12 @@ __global__ void gemma_topk_select_kernel(
 // only the TOUCHED blocks (passed as uniq_blocks/ntoks) from the cache after a
 // KV write -> correct, race-free, and recycling-safe (freed/reused blocks are
 // recomputed from offset 0 on their first new write). Layout
-// block_bounds[num_blocks, 2(min,max), num_kv_heads, HEAD_SIZE].
+// block_bounds[num_blocks, 2(min,max), num_kv_heads, HEAD_SIZE], stored in the
+// cache dtype (bf16) — lossless (min/max of bf16 keys are bf16) and halves the
+// scoring read vs fp32.
 template <typename cache_t, int HEAD_SIZE>
 __global__ void gemma_update_kv_bounds_kernel(
-    float* __restrict__ block_bounds,
+    cache_t* __restrict__ block_bounds,
     const cache_t* __restrict__ k_cache,
     const int* __restrict__ uniq_blocks,   // [M] physical block ids touched
     const int* __restrict__ ntoks,         // [M] valid tokens in each block
@@ -219,9 +221,9 @@ __global__ void gemma_update_kv_bounds_kernel(
       vmin = fminf(vmin, v);
       vmax = fmaxf(vmax, v);
     }
-    float* bb = block_bounds + (int64_t)phys * bb_block + c;
-    bb[0] = vmin;          // min plane
-    bb[plane] = vmax;      // max plane
+    cache_t* bb = block_bounds + (int64_t)phys * bb_block + c;
+    bb[0] = static_cast<cache_t>(vmin);          // min plane
+    bb[plane] = static_cast<cache_t>(vmax);      // max plane
   }
 }
 
@@ -234,7 +236,7 @@ template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int GROUP,
 __global__ void gemma_topk_select_bounds_kernel(
     int* __restrict__ selected_tiles,
     const scalar_t* __restrict__ q,
-    const float* __restrict__ block_bounds,    // [num_blocks,2,nkv,HEAD_SIZE]
+    const scalar_t* __restrict__ block_bounds,  // [num_blocks,2,nkv,HEAD_SIZE]
     const float scale,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
@@ -269,12 +271,15 @@ __global__ void gemma_topk_select_bounds_kernel(
   const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
   for (int blk = warp_idx; blk < n_blocks; blk += NUM_WARPS) {
     const int64_t phys = block_table[blk];
-    const float* bmin = block_bounds + phys * bb_block
-                      + (int64_t)kv_head * HEAD_SIZE + dim_start;
-    const float* bmax = bmin + plane;
+    const scalar_t* bmin = block_bounds + phys * bb_block
+                         + (int64_t)kv_head * HEAD_SIZE + dim_start;
+    const scalar_t* bmax = bmin + plane;
     float bmn[EPT], bmx[EPT];
 #pragma unroll
-    for (int e = 0; e < EPT; e++) { bmn[e] = bmin[e]; bmx[e] = bmax[e]; }
+    for (int e = 0; e < EPT; e++) {
+      bmn[e] = static_cast<float>(bmin[e]);
+      bmx[e] = static_cast<float>(bmax[e]);
+    }
     float best = -FLT_MAX;
 #pragma unroll
     for (int g = 0; g < GROUP; g++) {
@@ -295,6 +300,9 @@ __global__ void gemma_topk_select_bounds_kernel(
     if (t < sink_tiles || t >= n_blocks - win_tiles) s_scores[t] = FLT_MAX;
   __syncthreads();
 
+  // Phase 2: top-`num_sel` selection (warp 0; the smem scan is cheap relative
+  // to the bounds read, so parallelizing it across warps doesn't pay for the
+  // extra per-round barriers).
   if (warp_idx == 0) {
     int* outp = selected_tiles
               + ((int64_t)seq_idx * num_kv_heads + kv_head) * num_sel;

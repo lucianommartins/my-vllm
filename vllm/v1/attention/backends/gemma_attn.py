@@ -752,9 +752,11 @@ class GemmaAttentionImpl(AttentionImpl):
             return
         if self.block_bounds is None:
             num_blocks = key_cache.shape[0]
+            # bf16 bounds (== cache dtype): lossless (min/max of bf16 keys) and
+            # halves the scoring read vs fp32.
             self.block_bounds = torch.zeros(
                 num_blocks, 2, self.num_kv_heads, self.actual_head_size,
-                dtype=torch.float32, device=key_cache.device,
+                dtype=key_cache.dtype, device=key_cache.device,
             )
         blocks = (slot // block_size).to(torch.int32)
         offs = (slot % block_size)

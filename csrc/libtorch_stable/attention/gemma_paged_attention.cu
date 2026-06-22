@@ -557,8 +557,8 @@ void gemma_topk_select_launcher(
   int* bt_ptr = block_tables.mutable_data_ptr<int>();
   int* sl_ptr = seq_lens.mutable_data_ptr<int>();
   const bool use_bounds = (block_bounds.numel() > 0);
-  const float* bb_ptr = use_bounds
-      ? reinterpret_cast<const float*>(block_bounds.data_ptr()) : nullptr;
+  const T* bb_ptr = use_bounds
+      ? reinterpret_cast<const T*>(block_bounds.data_ptr()) : nullptr;
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       query.get_device_index());
@@ -656,7 +656,7 @@ void gemma_update_kv_bounds_launcher(
   const int64_t kv_stride_slot = key_cache.stride(1);
   const int64_t kv_stride_head = key_cache.stride(2);
 
-  float* bb_ptr = reinterpret_cast<float*>(block_bounds.data_ptr());
+  CACHE_T* bb_ptr = reinterpret_cast<CACHE_T*>(block_bounds.data_ptr());
   CACHE_T* k_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
   int* ub_ptr = uniq_blocks.mutable_data_ptr<int>();
   int* nt_ptr = ntoks.mutable_data_ptr<int>();
