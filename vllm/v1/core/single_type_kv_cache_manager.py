@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
+    EvictableFullAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheSpec,
@@ -1320,6 +1321,43 @@ class SinkFullAttentionManager(FullAttentionManager):
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
 
 
+class EvictableFullAttentionManager(FullAttentionManager):
+    """Full-attention manager that evicts the KV middle to a bounded footprint
+    (Phase 3 / 3C): keep the first ``evict_sink`` tokens (sinks) and the last
+    ``evict_budget`` tokens; free the contiguous middle each step. The decode
+    kernel must not read the freed middle (paired with GEMMA_ATTN sink+window or
+    top-k). Mirrors SlidingWindowManager's free mechanism, offset by the sink."""
+
+    def __init__(self, kv_cache_spec: EvictableFullAttentionSpec, **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        bs = self.block_size
+        # Round to whole blocks; never under-keep the sink/recent regions.
+        self.sink_blocks = (kv_cache_spec.evict_sink + bs - 1) // bs
+        self.budget_blocks = (kv_cache_spec.evict_budget + bs - 1) // bs
+
+    def remove_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int
+    ) -> None:
+        blocks = self.req_to_blocks[request_id]
+        free_end = len(blocks) - self.budget_blocks  # exclusive
+        if free_end <= self.sink_blocks:
+            return  # middle not yet larger than sink+budget -> nothing to free
+        removed: list[KVCacheBlock] = []
+        for i in range(self.sink_blocks, free_end):
+            if blocks[i] == self._null_block:
+                continue  # already freed by a prior step
+            removed.append(blocks[i])
+            blocks[i] = self._null_block
+        if removed:
+            self.block_pool.free_blocks(removed)
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        # Disable cascade for evictable layers (the middle is null; sharing the
+        # sink prefix with cascade is an unvalidated interaction). Mirror
+        # SlidingWindowManager's conservative 0.
+        return 0
+
+
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_num_batched_tokens: int,
@@ -1411,6 +1449,11 @@ def register_all_kvcache_specs(vllm_config):
     KVCacheSpecRegistry.register(
         SinkFullAttentionSpec,
         SinkFullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        EvictableFullAttentionSpec,
+        EvictableFullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )
 

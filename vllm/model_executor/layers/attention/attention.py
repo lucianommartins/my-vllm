@@ -615,6 +615,27 @@ class Attention(nn.Module, AttentionLayerBase):
                 tq_slot_size=tq_config.slot_size_aligned,
             )
         else:
+            # GEMMA_ATTN Phase 3 (3C) KV eviction: when GEMMA_EVICT_BUDGET is set,
+            # full (non-sliding) layers keep only sink + recent tokens and free
+            # the middle at runtime -> bounded KV footprint. Opt-in (env), off by
+            # default. Pair with the GEMMA_ATTN sink+window/top-k decode path so
+            # the kernel never reads the freed middle.
+            import os
+
+            evict_budget = int(os.environ.get("GEMMA_EVICT_BUDGET", "0"))
+            if evict_budget > 0:
+                from vllm.v1.kv_cache_interface import EvictableFullAttentionSpec
+
+                return EvictableFullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=quant_mode,
+                    evict_sink=int(os.environ.get("GEMMA_EVICT_SINK", "0")),
+                    evict_budget=evict_budget,
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

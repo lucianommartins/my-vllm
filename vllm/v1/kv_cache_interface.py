@@ -678,6 +678,37 @@ class CrossAttentionSpec(AttentionSpec):
 
 
 @dataclass(frozen=True)
+class EvictableFullAttentionSpec(FullAttentionSpec):
+    """Full attention whose KV is evicted to a bounded footprint at runtime:
+    keep the first ``evict_sink`` tokens (attention sinks) and the most recent
+    ``evict_budget`` tokens; free the contiguous middle (Phase 3 / 3C). Memory
+    drops from O(L) to ~(evict_sink + evict_budget). The decode kernel must
+    avoid the freed middle (GEMMA_ATTN sink+window or top-k path). Token-valued,
+    like ``sliding_window``."""
+
+    evict_sink: int = 0
+    evict_budget: int = 0
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = FullAttentionSpec.merge(specs)
+        return cls(
+            block_size=merged.block_size,
+            num_kv_heads=merged.num_kv_heads,
+            head_size=merged.head_size,
+            head_size_v=merged.head_size_v,
+            dtype=merged.dtype,
+            kv_quant_mode=merged.kv_quant_mode,
+            page_size_padded=merged.page_size_padded,
+            sliding_window=merged.sliding_window,
+            attention_chunk_size=merged.attention_chunk_size,
+            non_causal=merged.non_causal,
+            evict_sink=specs[0].evict_sink,
+            evict_budget=specs[0].evict_budget,
+        )
+
+
+@dataclass(frozen=True)
 class SinkFullAttentionSpec(FullAttentionSpec):
     sink_len: int | None = None
 
