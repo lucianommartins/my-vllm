@@ -114,6 +114,9 @@ class GemmaAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    # Shortest sequence in the batch, computed CPU-side once per step (avoids a
+    # per-layer GPU->CPU sync in the top-k gate). 0 when unset.
+    min_seq_len: int = 0
     # Multimodal bidirectional ("mm-prefix") image-token spans. Field names match
     # what Gemma4ForConditionalGeneration._clear_mm_prefix_for_full_attn_layers
     # looks for (it nulls these on full-attention layers so only sliding layers
@@ -224,6 +227,9 @@ class GemmaAttentionMetadataBuilder(
             ).to(torch.int32)
             num_common_kv_blocks = common_prefix_len // self.block_size
 
+        # Shortest sequence (CPU-side; no GPU sync) for the top-k gate.
+        min_seq_len = int(common_attn_metadata.seq_lens_cpu.min())
+
         return GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -232,6 +238,7 @@ class GemmaAttentionMetadataBuilder(
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            min_seq_len=min_seq_len,
             mm_prefix_range=mm_ranges,
             mm_prefix_range_tensor=mm_range_tensor,
             use_cascade=use_cascade,
@@ -601,7 +608,9 @@ class GemmaAttentionImpl(AttentionImpl):
         num_sel = self.topk_k + sink_tiles + win_tiles
         seq_lens = attn_metadata.seq_lens
         num_seqs = query.shape[0]
-        min_seq = int(seq_lens.min().item())
+        # min_seq_len is precomputed CPU-side in the metadata builder (once per
+        # step), avoiding a per-layer GPU->CPU sync in this decode hot path.
+        min_seq = attn_metadata.min_seq_len
         min_tiles = (min_seq + block_size - 1) // block_size
         if min_tiles <= num_sel:
             return None  # some seq too short -> full attention (lossless)
