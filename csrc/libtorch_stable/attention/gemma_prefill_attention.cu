@@ -12,7 +12,6 @@
 
 static constexpr int PF_BM = 32;
 static constexpr int PF_BN = 32;
-static constexpr int PF_NW = 4;
 static constexpr int PF_NW_V2 = 16;       // warps/CTA for hd=512
 static constexpr int PF_NW_V2_256 = 8;    // warps/CTA for hd=256 (sweep knob)
 // __launch_bounds__ min-CTA/SM target -> drives the register allocator to the
@@ -22,36 +21,6 @@ static constexpr int PF_NW_V2_256 = 8;    // warps/CTA for hd=256 (sweep knob)
 // Pushing further (hd512=3 / hd256=4) is smem-capped and only cuts ILP -> worse.
 static constexpr int PF_MINCTA_512 = 2;
 static constexpr int PF_MINCTA_256 = 3;
-
-#define LAUNCH_PREFILL(HEAD, GROUP, KEQV, USW)                                 \
-  do {                                                                         \
-    auto kern = vllm::gemma_prefill::gemma_prefill_kernel<                     \
-        T, CACHE_T, HEAD, PF_BM, PF_BN, PF_NW, GROUP, KEQV, USW>;             \
-    size_t smem = (size_t)(PF_BM * HEAD + PF_BN * HEAD + PF_BM * PF_BN)        \
-                      * sizeof(CACHE_T)                                        \
-                  + (size_t)(PF_BM * PF_BN + PF_BM * HEAD + 3 * PF_BM)         \
-                        * sizeof(float);                                       \
-    if (smem > 48 * 1024)                                                      \
-      cudaFuncSetAttribute(                                                    \
-          kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);           \
-    dim3 grid(PF_CDIV(max_q_len, PF_BM), num_q_heads, num_seqs);              \
-    kern<<<grid, PF_NW * 32, smem, stream>>>(                                  \
-        out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,            \
-        block_tables_ptr, seq_lens_ptr, cu_seqlens_q_ptr,                      \
-        max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
-        kv_stride_slot, kv_stride_head, sliding_window);                       \
-  } while (0)
-
-#define LAUNCH_PREFILL_GROUP(HEAD, KEQV, USW)                                  \
-  switch (gqa_group) {                                                         \
-    case 1: LAUNCH_PREFILL(HEAD, 1, KEQV, USW); break;                         \
-    case 2: LAUNCH_PREFILL(HEAD, 2, KEQV, USW); break;                         \
-    case 4: LAUNCH_PREFILL(HEAD, 4, KEQV, USW); break;                         \
-    case 8: LAUNCH_PREFILL(HEAD, 8, KEQV, USW); break;                         \
-    case 16: LAUNCH_PREFILL(HEAD, 16, KEQV, USW); break;                       \
-    default:                                                                   \
-      STD_TORCH_CHECK(false, "Unsupported prefill GQA group: ", gqa_group);    \
-  }
 
 // v2: register-resident O, head-split warps. NW = warps/CTA (per head size).
 // MINCTA = __launch_bounds__ min CTA/SM target (drives register allocation).
