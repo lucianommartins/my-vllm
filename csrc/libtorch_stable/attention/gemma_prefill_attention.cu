@@ -59,6 +59,20 @@ static constexpr int PF_MINCTA_256 = 3;
       STD_TORCH_CHECK(false, "Unsupported prefill GQA group: ", gqa_group);    \
   }
 
+// SM90 prefill launcher — defined in gemma_prefill_attention_sm90.cu.
+// Returns true if handled, false to fall through to SM80 v2 kernel.
+#if defined(ENABLE_GEMMA_ATTN_SM90) && ENABLE_GEMMA_ATTN_SM90
+template <typename T, typename CACHE_T>
+bool gemma_prefill_sm90_launcher(
+    torch::stable::Tensor& out, torch::stable::Tensor& query,
+    torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
+    int num_kv_heads, float scale, torch::stable::Tensor& block_tables,
+    torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
+    int max_q_len, int page_size, bool k_eq_v, int sliding_window,
+    torch::stable::Tensor& mm_prefix_ranges, bool non_causal,
+    torch::stable::Tensor& lse_out);
+#endif
+
 template <typename T, typename CACHE_T>
 void gemma_prefill_launcher(
     torch::stable::Tensor& out, torch::stable::Tensor& query,
@@ -106,6 +120,26 @@ void gemma_prefill_launcher(
   STD_TORCH_CHECK(head_size == 512 || head_size == 256,
                   "Gemma prefill kernel supports head_size 256 or 512, got ",
                   head_size);
+
+  // --- SM90 (Hopper) dispatch ---
+#if defined(ENABLE_GEMMA_ATTN_SM90) && ENABLE_GEMMA_ATTN_SM90
+  {
+    static const bool is_sm90 = []() {
+      int dev = 0;
+      cudaGetDevice(&dev);
+      int major = 0;
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+      return major >= 9;
+    }();
+    if (is_sm90) {
+      bool handled = gemma_prefill_sm90_launcher<T, CACHE_T>(
+          out, query, key_cache, value_cache, num_kv_heads, scale,
+          block_tables, seq_lens, cu_seqlens_q, max_q_len, page_size,
+          k_eq_v, sliding_window, mm_prefix_ranges, non_causal, lse_out);
+      if (handled) return;
+    }
+  }
+#endif  // ENABLE_GEMMA_ATTN_SM90
 
 #define PF_DISPATCH(HEAD, NW, MINCTA, MMPF)                          \
   do {                                                               \

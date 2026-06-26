@@ -86,10 +86,78 @@ of prefill GPU time). A100 blocker: the register wall forces v2's smem-S round-t
 
 ---
 
-## Payoff ranking (H100 / Blackwell)
+## H100 results (2026-06-25): FA4 k_eq_v prefill dispatch
 
-1. **2× decode** — TMA + `wgmma` + larger smem (A100-blocked, hardware-unlocked).
-2. **hd512 register-softmax prefill** — 18 % → 50–70 % MFU (A100 register-walled).
+### What shipped (GEMMA_FA4_KEQV=1)
+
+On H100, `k_eq_v` full-attention layers (hd=512) now dispatch to FA4 with
+`key_cache` passed as both K and V. FA4's wgmma + TMA + warp specialization
+gives significantly higher prefill throughput than the custom wmma kernel.
+The redundant V load is absorbed by L2 cache (98.8 % hit rate at ≤12 K context).
+
+**12B e2e results (GEMMA_ATTN vs FLASH_ATTN baseline, CUDA graphs):**
+
+| Regime | Baseline gap | **With FA4 k_eq_v** | Improvement |
+|---|---|---|---|
+| decode-vlong (8K) | -20.6 % | **-14.0 %** | +6.6 pp |
+| prefill-long (8K) | -29.2 % | **-18.7 %** | +10.5 pp |
+| prefill-med (4K) | -21.7 % | **-17.3 %** | +4.4 pp |
+| batch-128 | -19.2 % | **-17.1 %** | +2.1 pp |
+| context-12K | -25.7 % | **-15.3 %** | +10.4 pp |
+
+Benefit **grows with context**: +0.8 pp at 2 K → +10.4 pp at 12 K. Enabled by
+`GEMMA_FA4_KEQV=1` env var. A100 path is unchanged (env var is SM90-gated).
+
+### What was tried and ruled out (H100 kernel development)
+
+- **SIMT 3-stage pipeline (BN=16):** pipeline overhead > latency benefit. Regressed.
+- **SIMT wider tile (BN=32):** occupancy drop (80 regs, 3 CTAs) cancelled tile benefit. Flat.
+- **wgmma for decode:** wgmma M=64 minimum vs decode BDY=2 rows → 97 % wasted compute.
+- **Prefill 8w/MIN_CTA=3:** spills 200 B to stack. Occupancy gain cancelled by spill.
+- **Prefill native sm_90a codegen (16w/MIN_CTA=2):** identical codegen to sm_80. Flat.
+- **Prefill QK-load overlap:** double-buffered sKV, idle warps load during QK. STACK:80
+  (2× v2). Bottleneck is FMA/softmax (not load latency — KV fits L2). No benefit.
+
+Root cause: SM80 wmma kernels are already well-tuned for their compute pattern.
+The gap vs FA4 is from FA4's fundamentally different Hopper primitives (wgmma +
+TMA + CUTLASS pipeline + warp specialization), not from tuning parameters.
+
+### Follow-up: FA4 CuteDSL V-pipeline elimination (Option B)
+
+**Status: designed, not implemented. Parked due to deadlock risk.**
+
+Modifying FA4's CuteDSL kernel (`flash_fwd_sm90.py`) to skip the V TMA pipeline
+when `k_eq_v` would eliminate the redundant V load entirely. This matters when KV
+exceeds L2 cache (>16 K context on H100's 50 MB L2). Estimated +5–15 % additional
+prefill throughput at very long context.
+
+**Modification plan (14 change points, ~200–400 lines):**
+
+1. **SharedStorage (lines 145-163):** remove `mbar_ptr_V` and `sV` fields when k_eq_v
+2. **TMA descriptors (lines 308-323):** skip `tma_atom_V`, alias to `tma_atom_K`
+3. **Pipeline creation (lines 507-542):** set `pipeline_v = pipeline_k` (shared barriers)
+4. **Smem buffers (lines 550-559):** set `sV = sK`, `sVt = transpose_view(sK)`
+5. **Producer loop — non-overlap (lines 854-881):** remove V acquire/load/commit
+6. **Producer loop — overlap (lines 882-920):** remove K[n]/V[n-1] interleaving,
+   simplify to K-only sequential load
+7. **Producer tail (line 963):** `pipeline_v.producer_tail` → `pipeline_k.producer_tail`
+8. **Consumer `mma_one_n_block` (lines 1465-1505):** skip `pipeline_k.consumer_release`
+   after QK (K data still needed for PV), skip `pipeline_v.consumer_wait` before PV,
+   single `pipeline_k.consumer_release` after PV
+9. **Consumer `mma_one_n_block_intrawg_overlap` (lines 1526-1551):** skip
+   `pipeline_v.consumer_wait`, adjust release to `pipeline_k.consumer_release`
+10. **`first_half_block_overlap` (line 1387):** defer K release to PV phase
+11. **`last_half_block_overlap` (lines 1439-1442):** skip V wait, use K release
+
+**Risk:** mbarrier acquire/wait/release sequences — a single missed or extra
+barrier operation deadlocks the GPU silently. CuteDSL is JIT-compiled so errors
+only surface at runtime. Recommend standalone parity test before integration.
+
+## Payoff ranking (H100 / Blackwell, updated)
+
+0. **FA4 k_eq_v prefill dispatch** — SHIPPED, +3–10 pp e2e (Python-only, zero kernel risk).
+1. **FA4 V-pipeline elimination** — designed, +5–15 % additional at very long context.
+2. **TMA decode** — TMA descriptor-based KV loads for DRAM-bound decode (infra effort).
 3. **fp4/fp8 KV** — multiplicative bandwidth lever on TC-native datatypes.
 4. **TMEM / 2-SM cooperative hd512** (Blackwell) — dissolves the head-size wall.
 

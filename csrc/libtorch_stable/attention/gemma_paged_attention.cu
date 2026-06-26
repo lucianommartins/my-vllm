@@ -251,6 +251,23 @@ static constexpr int DS_MINCTA_256 = 3;
     default: STD_TORCH_CHECK(false, "mma decode bad group ", gqa_group);       \
   }
 
+// SM90 decode launcher — defined in gemma_paged_attention_sm90.cu, compiled
+// only for sm_90a.  Returns true if it handled the call, false to fall through.
+#if defined(ENABLE_GEMMA_ATTN_SM90) && ENABLE_GEMMA_ATTN_SM90
+template <typename T, typename CACHE_T, int BLOCK_SIZE,
+          vllm::Fp8KVCacheDataType KV_DTYPE>
+bool gemma_paged_attention_sm90_launcher(
+    torch::stable::Tensor& out, torch::stable::Tensor& exp_sums,
+    torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
+    torch::stable::Tensor& query, torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& value_cache, int num_kv_heads, float scale,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
+    int max_seq_len, torch::stable::Tensor& k_scale,
+    torch::stable::Tensor& v_scale, int actual_head_size, bool k_eq_v,
+    int sliding_window, torch::stable::Tensor& lse_out,
+    torch::stable::Tensor& selected_tiles);
+#endif
+
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE>
 void gemma_paged_attention_launcher(
@@ -416,6 +433,31 @@ void gemma_paged_attention_launcher(
         "(k_eq_v full layer, gqa_group<=2); got use_simt=", use_simt,
         " k_eq_v=", k_eq_v, " sliding_window=", sliding_window);
   }
+
+  // --- SM90 (Hopper) dispatch: wgmma + TMA kernels when available. ----------
+  // The SM90 launcher returns true if it handled the call, false to fall
+  // through to the SM80 path below.  Compile-time-guarded so the SM80
+  // build is unchanged.
+#if defined(ENABLE_GEMMA_ATTN_SM90) && ENABLE_GEMMA_ATTN_SM90
+  if constexpr (DS_DTYPE_OK) {
+    static const bool is_sm90 = []() {
+      int dev = 0;
+      cudaGetDevice(&dev);
+      int major = 0;
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+      return major >= 9;
+    }();
+    if (is_sm90) {
+      bool handled = gemma_paged_attention_sm90_launcher<
+          T, CACHE_T, BLOCK_SIZE, KV_DTYPE>(
+          out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,
+          num_kv_heads, scale, block_tables, seq_lens, max_seq_len,
+          k_scale, v_scale, actual_head_size, k_eq_v, sliding_window,
+          lse_out, selected_tiles);
+      if (handled) return;
+    }
+  }
+#endif  // ENABLE_GEMMA_ATTN_SM90
 
   // GQA-reuse dispatch (always on): A2 split-KV when the batch underfills the
   // SMs, else the A1 single-CTA GQA kernel. For cases where actual_head_size ==

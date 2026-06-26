@@ -690,6 +690,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   #
+  # Gemma4-optimized attention SM90 kernels (wgmma + TMA for Hopper)
+  #
+  cuda_archs_loose_intersection(GEMMA_ATTN_SM90_ARCHS "9.0a;" "${CUDA_ARCHS}")
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0
+     AND GEMMA_ATTN_SM90_ARCHS)
+    set(GEMMA_ATTN_SM90_SRCS
+       "csrc/libtorch_stable/attention/gemma_paged_attention_sm90.cu"
+       "csrc/libtorch_stable/attention/gemma_prefill_attention_sm90.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${GEMMA_ATTN_SM90_SRCS}"
+      CUDA_ARCHS "${GEMMA_ATTN_SM90_ARCHS}")
+    list(APPEND VLLM_STABLE_EXT_SRC "${GEMMA_ATTN_SM90_SRCS}")
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_GEMMA_ATTN_SM90=1")
+    message(STATUS "Building gemma_attn_sm90 for archs: ${GEMMA_ATTN_SM90_ARCHS}")
+  else()
+    message(STATUS "Not building gemma_attn_sm90 as no compatible archs found "
+                   "in CUDA target architectures")
+  endif()
+
+  #
   # CUTLASS scaled_mm kernels (moved from _C to _C_stable_libtorch)
   #
   set(SCALED_MM_3X_ARCHS)
