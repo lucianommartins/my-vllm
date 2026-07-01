@@ -127,6 +127,12 @@ struct FmhaMainloopTma {
     LayoutK dK;
     const Element* ptr_V;
     LayoutV dV;
+    float scale;
+    Element* ptr_O;
+    LayoutQ dO;
+    float* ptr_LSE;
+    const int* mm_prefix_ranges;
+    int max_mm_ranges;
   };
 
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -141,6 +147,13 @@ struct FmhaMainloopTma {
     float scale_softmax;
     float scale_softmax_log2;
     float rp_dropout;
+    Element* ptr_O;
+    LayoutQ dO;
+    float* ptr_LSE;
+    const int* mm_prefix_ranges;
+    int max_mm_ranges;
+    const Element* ptr_V;
+    LayoutV dV;
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
@@ -201,9 +214,16 @@ struct FmhaMainloopTma {
         params_qk.tma_load_a,
         params_qk.tma_load_b,
         params_pv.tma_load_b,
-        1.0f / (float) std::sqrt(get<4>(problem_size)),
-        (float) (std::log2(std::exp(1.0)) / std::sqrt(get<4>(problem_size))),
-        1.0f
+        args.scale,
+        args.scale * (float)std::log2(std::exp(1.0)),
+        1.0f,
+        args.ptr_O,
+        args.dO,
+        args.ptr_LSE,
+        args.mm_prefix_ranges,
+        args.max_mm_ranges,
+        args.ptr_V,
+        args.dV
     };
   }
 

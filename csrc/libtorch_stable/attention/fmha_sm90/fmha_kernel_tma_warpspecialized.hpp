@@ -53,6 +53,8 @@ struct FmhaKernelTmaWarpSpecialized {
   // Options
   static constexpr bool kIsEpilogueLocked = find_option_t<Tag::kIsEpilogueLocked, false_type, Options...>::value;
   static constexpr bool kLoadsQSeparately = find_option_t<Tag::kLoadsQSeparately, false_type, Options...>::value;
+  static constexpr bool kHeadChunkedPV = CollectiveMainloop::kHeadChunkedPV;
+  static constexpr bool kSplitDPV = CollectiveMainloop::kSplitDPV;
 
 
   static const int NumLoadWarpGroups = 1;
@@ -101,7 +103,7 @@ struct FmhaKernelTmaWarpSpecialized {
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-  using ProblemShape = cute::tuple<int, int, int, int, int>;
+  using ProblemShape = cute::tuple<int, int, int, int, int, int>;
 
   struct Arguments {
     ProblemShape problem_size;
@@ -130,7 +132,8 @@ struct FmhaKernelTmaWarpSpecialized {
 
   static constexpr uint32_t LoadRegisterRequirement = 40 - 2 * 8;
   static constexpr uint32_t TotalRegisterSupply = (64*1024 / MaxThreadsPerBlock / MinBlocksPerMultiprocessor / 8) * 8 * MaxThreadsPerBlock / cutlass::NumThreadsPerWarpGroup;
-  static constexpr uint32_t MmaRegisterRequirement = ((TotalRegisterSupply - LoadRegisterRequirement) / NumMmaWarpGroups / 8) * 8;
+  static constexpr uint32_t MmaRegisterRequirementRaw = ((TotalRegisterSupply - LoadRegisterRequirement) / NumMmaWarpGroups / 8) * 8;
+  static constexpr uint32_t MmaRegisterRequirement = MmaRegisterRequirementRaw > 256 ? 256 : MmaRegisterRequirementRaw;
 
   static size_t get_workspace_size(Arguments const& args) { return 0; }
   static cutlass::Status initialize_workspace(Arguments const&, void*, cudaStream_t) {
@@ -229,7 +232,7 @@ struct FmhaKernelTmaWarpSpecialized {
     if (warp_group_role == WarpGroupRole::Producer && producer_warp_role == ProducerWarpRole::Reducer) {
       pipeline_params_reducer.role = MainloopPipelineReducer::ThreadCategory::Consumer;
     }
-    if (warp_group_role == WarpGroupRole::Consumer0 || 
+    if (warp_group_role == WarpGroupRole::Consumer0 ||
         warp_group_role == WarpGroupRole::Consumer1 ||
         warp_group_role == WarpGroupRole::Consumer2 ||
         warp_group_role == WarpGroupRole::Consumer3
@@ -347,72 +350,129 @@ struct FmhaKernelTmaWarpSpecialized {
 
         constexpr int kOuterLoads = CollectiveMainloop::kOuterLoads;
 
-        if (warp_group_role == WarpGroupRole::Consumer0) {
-          smem_pipe_read_outer.advance(0 * kOuterLoads);
-        }
-        else if (warp_group_role == WarpGroupRole::Consumer1) {
-          smem_pipe_read_outer.advance(1 * kOuterLoads);
-        }
-        else if (warp_group_role == WarpGroupRole::Consumer2) {
-          smem_pipe_read_outer.advance(2 * kOuterLoads);
-        }
-        else if (warp_group_role == WarpGroupRole::Consumer3) {
-          smem_pipe_read_outer.advance(3 * kOuterLoads);
-        }
-
-        constexpr int wg_dim = is_constant<0, decltype(get<1>(wg_coord))>::value ? 0 : 1;
-        auto& wg_block = get<wg_dim>(wg_coord);
-        if (warp_group_role == WarpGroupRole::Consumer0) {
-          wg_block = NumMmaWarpGroups * wg_block + 0;
-        }
-        else if (warp_group_role == WarpGroupRole::Consumer1) {
-          wg_block = NumMmaWarpGroups * wg_block + 1;
-        }
-        else if (warp_group_role == WarpGroupRole::Consumer2) {
-          wg_block = NumMmaWarpGroups * wg_block + 2;
-        }
-        else if (warp_group_role == WarpGroupRole::Consumer3) {
-          wg_block = NumMmaWarpGroups * wg_block + 3;
+        if constexpr (!kSplitDPV) {
+          // M-cooperative: each WG reads a different Q tile from a different stage
+          if (warp_group_role == WarpGroupRole::Consumer0) {
+            smem_pipe_read_outer.advance(0 * kOuterLoads);
+          }
+          else if (warp_group_role == WarpGroupRole::Consumer1) {
+            smem_pipe_read_outer.advance(1 * kOuterLoads);
+          }
+          else if (warp_group_role == WarpGroupRole::Consumer2) {
+            smem_pipe_read_outer.advance(2 * kOuterLoads);
+          }
+          else if (warp_group_role == WarpGroupRole::Consumer3) {
+            smem_pipe_read_outer.advance(3 * kOuterLoads);
+          }
+        } else {
+          // Split-D: both WGs read Q from stage 0
+          smem_pipe_read_outer.advance(0);
         }
 
-        auto result = collective_mainloop.compute(
-          blk_coord, wg_coord,
-          params.mainloop, params.problem_size,
-          pipeline_inner, smem_pipe_read_inner,
-          pipeline_outer, smem_pipe_read_outer,
-          pipeline_reducer, smem_pipe_write_reducer,
-          storage.tensors.mainloop,
-          math_wg_order_barrier
-        );
-
-        if (warp_group_role == WarpGroupRole::Consumer0) {
-          smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 0));
-        }
-        if constexpr (NumMmaWarpGroups >= 2) {
-          if (warp_group_role == WarpGroupRole::Consumer1) {
-            smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 1));
+        if constexpr (!kSplitDPV) {
+          // M-cooperative mode: each WG handles a different M-block
+          constexpr int wg_dim = is_constant<0, decltype(get<1>(wg_coord))>::value ? 0 : 1;
+          auto& wg_block = get<wg_dim>(wg_coord);
+          if (warp_group_role == WarpGroupRole::Consumer0) {
+            wg_block = NumMmaWarpGroups * wg_block + 0;
+          }
+          else if (warp_group_role == WarpGroupRole::Consumer1) {
+            wg_block = NumMmaWarpGroups * wg_block + 1;
+          }
+          else if (warp_group_role == WarpGroupRole::Consumer2) {
+            wg_block = NumMmaWarpGroups * wg_block + 2;
+          }
+          else if (warp_group_role == WarpGroupRole::Consumer3) {
+            wg_block = NumMmaWarpGroups * wg_block + 3;
           }
         }
-        if constexpr (NumMmaWarpGroups >= 3) {
-          if (warp_group_role == WarpGroupRole::Consumer2) {
-            smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 2));
+        // For split-D: both WGs handle the same M block (no M-split)
+
+        if constexpr (kSplitDPV) {
+          // Split-D: both WGs do QK+softmax independently, each does PV on its V half
+          // Consumer0 → V N-tile 1 (cols HeadDimHalf..HeadDimFull-1)
+          // Consumer1 → V N-tile 0 (cols 0..HeadDimHalf-1)
+          constexpr int HD2 = CollectiveMainloop::HeadDimHalf;
+          if (warp_group_role == WarpGroupRole::Consumer0) {
+            collective_mainloop.template compute_splitd<1, HD2>(
+              blk_coord, wg_coord,
+              params.mainloop, params.problem_size,
+              pipeline_inner, smem_pipe_read_inner,
+              pipeline_outer, smem_pipe_read_outer,
+              pipeline_reducer, smem_pipe_write_reducer,
+              storage.tensors.mainloop,
+              math_wg_order_barrier);
+          } else {
+            collective_mainloop.template compute_splitd<0, 0>(
+              blk_coord, wg_coord,
+              params.mainloop, params.problem_size,
+              pipeline_inner, smem_pipe_read_inner,
+              pipeline_outer, smem_pipe_read_outer,
+              pipeline_reducer, smem_pipe_write_reducer,
+              storage.tensors.mainloop,
+              math_wg_order_barrier);
+          }
+        } else {
+          auto result = [&]() {
+            if constexpr (kHeadChunkedPV) {
+              return collective_mainloop.compute_chunked(
+                blk_coord, wg_coord,
+                params.mainloop, params.problem_size,
+                pipeline_inner, smem_pipe_read_inner,
+                pipeline_outer, smem_pipe_read_outer,
+                pipeline_reducer, smem_pipe_write_reducer,
+                storage.tensors.mainloop,
+                math_wg_order_barrier);
+            } else {
+              return collective_mainloop.compute(
+                blk_coord, wg_coord,
+                params.mainloop, params.problem_size,
+                pipeline_inner, smem_pipe_read_inner,
+                pipeline_outer, smem_pipe_read_outer,
+                pipeline_reducer, smem_pipe_write_reducer,
+                storage.tensors.mainloop,
+                math_wg_order_barrier);
+            }
+          }();
+
+          if constexpr (kIsEpilogueLocked) ; math_wg_order_barrier.wait();
+
+          if constexpr (!kHeadChunkedPV) {
+            CollectiveEpilogue epilogue;
+            epilogue(typename CollectiveMainloop::TileShapePV{}, wg_coord,
+              result, typename CollectiveMainloop::TiledMmaPV{},
+              params.problem_size, params.epilogue,
+              epi_load_pipeline, storage.tensors.epilogue[consumer_warp_group_idx]);
+          }
+
+          if constexpr (kIsEpilogueLocked) ; math_wg_order_barrier.arrive();
+        }
+
+        if constexpr (!kSplitDPV) {
+          if (warp_group_role == WarpGroupRole::Consumer0) {
+            smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 0));
+          }
+          if constexpr (NumMmaWarpGroups >= 2) {
+            if (warp_group_role == WarpGroupRole::Consumer1) {
+              smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 1));
+            }
+          }
+          if constexpr (NumMmaWarpGroups >= 3) {
+            if (warp_group_role == WarpGroupRole::Consumer2) {
+              smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 2));
+            }
+          }
+          if constexpr (NumMmaWarpGroups >= 4) {
+            if (warp_group_role == WarpGroupRole::Consumer3) {
+              smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 3));
+            }
+          }
+        } else {
+          // For split-D: only Consumer0 uses Q pipeline
+          if (warp_group_role == WarpGroupRole::Consumer0) {
+            smem_pipe_read_outer.advance(kOuterLoads);
           }
         }
-        if constexpr (NumMmaWarpGroups >= 4) {
-          if (warp_group_role == WarpGroupRole::Consumer3) {
-            smem_pipe_read_outer.advance(kOuterLoads * (NumMmaWarpGroups - 3));
-          }
-        }
-
-        if constexpr (kIsEpilogueLocked) ; math_wg_order_barrier.wait();
-
-        CollectiveEpilogue epilogue;
-        epilogue(typename CollectiveMainloop::TileShapePV{}, wg_coord,
-          result, typename CollectiveMainloop::TiledMmaPV{},
-          params.problem_size, params.epilogue,
-          epi_load_pipeline, storage.tensors.epilogue[consumer_warp_group_idx]);
-
-        if constexpr (kIsEpilogueLocked) ; math_wg_order_barrier.arrive();
       }
     }
 #endif

@@ -85,9 +85,33 @@ struct CollectiveSoftmax {
     return f;
   }
 
+  template<class AccQK, class CountQK>
+  CUTLASS_DEVICE void apply_mm_prefix_override(AccQK& acc_qk, CountQK const& count_qk) {
+    if (params.mm_prefix_ranges != nullptr && params.max_mm_ranges > 0) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(acc_qk); i++) {
+        if (acc_qk(i) == -INFINITY) {
+          auto pos = count_qk(i);
+          int q = get<0>(pos);
+          int k = get<1>(pos);
+          CUTLASS_PRAGMA_NO_UNROLL
+          for (int r = 0; r < params.max_mm_ranges; r++) {
+            int s = params.mm_prefix_ranges[r * 2];
+            int e = params.mm_prefix_ranges[r * 2 + 1];
+            if (s < e && q >= s && q <= e && k >= s && k <= e) {
+              acc_qk(i) = 0.0f;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
   template<class AccQK, class TiledMmaQK, class CountQK, class State, class ProblemShape>
   CUTLASS_DEVICE auto step(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, CountQK const& count_qk, State& state, ProblemShape const& problem_shape) {
     Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
+    apply_mm_prefix_override(acc_qk, count_qk);
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
     auto reduction_target_qk = reduction_target_n(tiled_mma_qk);
     constexpr int red_rank = decltype(rank(reduction_target_qk))::value;
@@ -139,6 +163,7 @@ struct CollectiveSoftmax {
 
     if constexpr (kUseFusion) {
       Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
+    apply_mm_prefix_override(acc_qk, count_qk);
     }
 
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
@@ -210,6 +235,7 @@ struct CollectiveSoftmax {
 
     if constexpr (kUseFusion) {
       Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
+    apply_mm_prefix_override(acc_qk, count_qk);
     }
 
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));

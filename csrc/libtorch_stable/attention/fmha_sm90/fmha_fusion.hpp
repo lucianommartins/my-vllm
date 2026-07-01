@@ -191,6 +191,66 @@ struct CausalFusion : DefaultFusion {
 
 };
 
+// Sliding window + causal: masks future positions AND positions outside the window.
+// sliding_window is read from get<5>(problem_size) at runtime.
+// All tiles use masked path (before_softmax always called) — no block-skipping yet.
+struct SlidingWindowCausalFusion : DefaultFusion {
+
+  using Base = DefaultFusion;
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_trip_count(
+    BlkCoord const& blk_coord,
+    TileShape const& tile_shape,
+    ProblemSize const& problem_size
+  ) {
+    int max_blocks_k = Base::get_trip_count(blk_coord, tile_shape, problem_size);
+    int max_blocks_q = ceil_div((get<0>(blk_coord) + 1) * get<0>(tile_shape), get<1>(tile_shape));
+    return std::min(max_blocks_k, max_blocks_q);
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_masked_trip_count(
+    BlkCoord const& blk_coord,
+    TileShape const& tile_shape,
+    ProblemSize const& problem_size
+  ) {
+    return get_trip_count(blk_coord, tile_shape, problem_size);
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_unmasked_trip_count(
+    BlkCoord const& blk_coord,
+    TileShape const& tile_shape,
+    ProblemSize const& problem_size
+  ) {
+    return 0;
+  }
+
+  template<class AccQK, class IndexQK, class ProblemSize>
+  CUTLASS_DEVICE
+  void before_softmax(
+    AccQK& acc_qk,
+    IndexQK const& index_qk,
+    ProblemSize const& problem_size
+  ) {
+    int sw = get<5>(problem_size);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(acc_qk); i++) {
+      auto pos = index_qk(i);
+      int q = get<0>(pos);
+      int k = get<1>(pos);
+      if (q < k || k >= get<3>(problem_size) ||
+          (sw > 0 && k < q - sw)) {
+        acc_qk(i) = -INFINITY;
+      }
+    }
+  }
+};
+
 template<class Base>
 struct FusionBwdAdapter {
   template<class BlkCoord, class TileShape, class ProblemSize>

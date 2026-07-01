@@ -84,7 +84,7 @@ struct FmhaKernelTma {
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-  using ProblemShape = cute::tuple<int, int, int, int, int>;
+  using ProblemShape = cute::tuple<int, int, int, int, int, int>;
 
   struct Arguments {
     ProblemShape problem_size;

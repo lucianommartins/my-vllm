@@ -71,7 +71,10 @@ enum class Tag {
   kBlocksPerSM,
   kClusterM,
 
-  kAccQK
+  kAccQK,
+
+  kHeadChunkedPV,
+  kSplitDPV
 };
 
 template<auto kTag, class Value>
