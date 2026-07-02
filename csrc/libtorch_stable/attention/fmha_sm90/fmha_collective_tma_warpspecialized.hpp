@@ -551,20 +551,20 @@ struct FmhaMainloopTmaWarpSpecialized {
         if constexpr (kIsMainloopLocked) math_wg_order_barrier.arrive();
 
         Tensor acc_qk_fixed = make_acc_into_op<Element>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
-  
+
         pipeline.consumer_wait(smem_pipe_read, tok);
 
         // MMA PV
         warpgroup_fence_operand(acc_pv);
         warpgroup_fence_operand(acc_qk_fixed);
         warpgroup_arrive();
-  
+
         cute::gemm(tiled_mma_pv, acc_qk_fixed, tOrV(_,_,_,smem_pipe_read.index()), acc_pv);
         warpgroup_commit_batch();
 
         pipeline.consumer_release(smem_pipe_release);
         ++smem_pipe_release;
-  
+
         pipeline.consumer_release(smem_pipe_release);
         ++smem_pipe_release;
 
@@ -581,7 +581,7 @@ struct FmhaMainloopTmaWarpSpecialized {
 
         // Allocate QK acc
         Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
-  
+
         pipeline.consumer_wait(smem_pipe_read);
 
         // MMA QK
@@ -593,7 +593,7 @@ struct FmhaMainloopTmaWarpSpecialized {
 
         ++smem_pipe_read;
         auto tok = pipeline.consumer_try_wait(smem_pipe_read);
-  
+
         // Wait for the pipeline MMAs to drain
         warpgroup_wait<0>();
         warpgroup_fence_operand(acc_qk);
@@ -935,15 +935,14 @@ struct FmhaMainloopTmaWarpSpecialized {
     return make_tuple(acc_lo, lse);
   }
 
-  // ===== Split-D PV: dual-QK RS mode, each WG computes QK+softmax+PV(half-V) =====
-  // NTile: 0 = V columns 0..HeadDimHalf-1, 1 = V columns HeadDimHalf..HeadDimFull-1
-  // ColOffset: 0 for NTile=0, HeadDimHalf for NTile=1
+  // ===== Split-D PV: FA3-style 2-WG architecture =====
+  // WG1 (Consumer0): QK GEMM + softmax + P write to smem + scale store + SS PV
+  // WG2 (Consumer1): wait P + load scale + rescale O + SS PV
 
-  template<int kVNTile, int kColOffset,
-           class BlkCoord, class ProblemShape, class MainloopPipelineReducer,
+  template<class BlkCoord, class ProblemShape, class MainloopPipelineReducer,
            class PipelineStateReducer, class MathWgOrderBarrier>
   CUTLASS_DEVICE void
-  compute_splitd(
+  compute_splitd_wg1(
       BlkCoord const& blk_coord, BlkCoord const& wg_coord,
       Params const& params, ProblemShape const& problem_size,
       MainloopPipeline& pipeline, PipelineState& smem_pipe_read,
@@ -958,7 +957,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     PipelineState smem_pipe_release = smem_pipe_read;
     PipelineStateQ smem_pipe_release_q = smem_pipe_read_q;
 
-    // QK setup (single WG, 128 threads — both WGs do QK independently)
+    // QK setup: RS mode (Q→regs, K→smem desc; GMMA handles per-K-block loading)
     TiledMmaQK tiled_mma_qk;
     auto thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
     Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
@@ -968,25 +967,55 @@ struct FmhaMainloopTmaWarpSpecialized {
     Tensor tSrQ = thr_mma_qk.make_fragment_A(tSsQ);
     Tensor tSrK = thr_mma_qk.make_fragment_B(tSsK);
 
-    // PV setup: RS mode, V N-tile kVNTile selected from full-D V partition
+    // PV setup: 2-WG SS mode — WG1 is PV-WG0 (first N partition)
     TiledMmaPV tiled_mma_pv;
-    auto thr_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
+    static constexpr int kPVWarpGroups = kHeadDim / 256;
+    Layout wg_pv_layout = make_layout(Int<kPVWarpGroups>{}, Int<128>{});
+    auto wg_mma_pv = tiled_mma_pv.get_slice(wg_pv_layout(_0{}));
+
     Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
-    Tensor tOsV = thr_mma_pv.partition_B(sV);
-    Tensor tOrV = thr_mma_pv.make_fragment_B(tOsV);
+    Tensor sP = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
+    Tensor tOsV = wg_mma_pv.partition_fragment_B(sV);
+    Tensor tOsP = wg_mma_pv.partition_fragment_A(sP);
 
     int k_tile_count = Fusion{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_size);
 
     pipeline_q.consumer_wait(smem_pipe_read_q);
 
+    // QK identity for masking (with m_block offset)
     Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{}));
     Tensor tPcP = thr_mma_qk.partition_C(cP);
+    int m_block = get<0>(wg_coord);
+    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{});
 
-    // PV accumulator — half head-dim (256 cols via N-tile selection)
-    Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV_Eff{}));
+    // Pre-compute M-row coords and col-0 flag for scale store (FA3 pattern)
+    // Uses identity tensor only during setup, not in the hot loop
+    auto mn_qk_layout = layout_acc_mn(tiled_mma_qk,
+        partition_fragment_C(tiled_mma_qk, take<0,2>(TileShapeQK{})).layout());
+    static constexpr int kMRows = decltype(size<0>(mn_qk_layout))::value;
+    int scale_m_coords[kMRows];
+    bool scale_is_col0;
+    {
+      Tensor cP_tmp = make_identity_tensor(take<0,2>(TileShapeQK{}));
+      Tensor tPcP_tmp = thr_mma_qk.partition_C(cP_tmp);
+      scale_is_col0 = (get<1>(tPcP_tmp(mn_qk_layout(_0{}, _0{}))) == 0);
+      CUTLASS_PRAGMA_UNROLL
+      for (int mi = 0; mi < kMRows; mi++) {
+        scale_m_coords[mi] = get<0>(tPcP_tmp(mn_qk_layout(mi, _0{})));
+      }
+    }
+
+    // PV accumulator — each WG gets 128 elements (64x256 / 128 threads)
+    Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
 
     cutlass::fmha::collective::CollectiveSoftmax<ElementAccumulatorQK, Fusion, decltype(params)> softmax{params};
     auto softmax_state = softmax.init(acc_pv, tiled_mma_pv);
+    auto& s_max = get<0>(softmax_state);
+    auto& a_sum = get<1>(softmax_state);
+
+    // P write identity (local coords, computed once)
+    Tensor cP_local = make_identity_tensor(take<0,2>(TileShapeQK{}));
+    Tensor tPcP_local = thr_mma_qk.partition_C(cP_local);
 
     // ===== First KV tile =====
     {
@@ -1009,17 +1038,21 @@ struct FmhaMainloopTmaWarpSpecialized {
 
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state, problem_size);
 
-      Tensor acc_qk_f = make_acc_into_op<Element>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
+      cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPEmpty);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(acc_qk); i++) {
+        sP(get<0>(tPcP_local(i)), get<1>(tPcP_local(i)), _0{}) = static_cast<Element>(acc_qk(i));
+      }
+      cutlass::arch::fence_view_async_shared();
+      __syncwarp();
+      cutlass::arch::NamedBarrier::arrive(kNumMmaThreads, kBarrierPFull);
 
-      // Release K stage
       pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
 
-      // PV GEMM: RS mode, select V N-tile kVNTile
       pipeline.consumer_wait(smem_pipe_read);
       warpgroup_fence_operand(acc_pv);
-      warpgroup_fence_operand(acc_qk_f);
       warpgroup_arrive();
-      gemm_zero_acc(tiled_mma_pv, acc_qk_f, tOrV(_,_,_,smem_pipe_read.index()), acc_pv);
+      gemm_zero_acc(tiled_mma_pv, tOsP(_,_,_,_0{}), tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
       warpgroup_commit_batch();
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc_pv);
@@ -1049,66 +1082,286 @@ struct FmhaMainloopTmaWarpSpecialized {
       warpgroup_fence_operand(acc_qk);
       warpgroup_fence_operand(acc_pv);
 
+      Tensor old_max = make_fragment_like(s_max);
+      cute::copy(s_max, old_max);
+
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
                    acc_pv, tiled_mma_pv, problem_size);
 
-      Tensor acc_qk_f = make_acc_into_op<Element>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
+      cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPEmpty);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(acc_qk); i++) {
+        sP(get<0>(tPcP_local(i)), get<1>(tPcP_local(i)), _0{}) = static_cast<Element>(acc_qk(i));
+      }
 
-      // PV GEMM: RS mode, accumulate
-      pipeline.consumer_wait(smem_pipe_read, tok);
-      warpgroup_fence_operand(acc_pv);
-      warpgroup_fence_operand(acc_qk_f);
-      warpgroup_arrive();
-      tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
-      cute::gemm(tiled_mma_pv, acc_qk_f, tOrV(_,_,_,smem_pipe_read.index()), acc_pv);
-      warpgroup_commit_batch();
+      if (scale_is_col0) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < kMRows; mi++) {
+          float sf = ::exp2f((old_max(mi) - s_max(mi)) * params.scale_softmax_log2);
+          storage.smem_scale[scale_m_coords[mi]] = sf;
+        }
+      }
+
+      cutlass::arch::fence_view_async_shared();
+      __syncwarp();
+      cutlass::arch::NamedBarrier::arrive(kNumMmaThreads, kBarrierPFull);
 
       pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+
+      pipeline.consumer_wait(smem_pipe_read, tok);
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_arrive();
+      tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
+      gemm_reset_zero_acc(tiled_mma_pv, tOsP(_,_,_,_0{}), tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
+      warpgroup_commit_batch();
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_pv);
+
       pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
       ++smem_pipe_read;
       tPcP.data() = tPcP.data() + E<1>{} * get<1>(TileShapeQK{});
     }
 
+    // ===== Tail: normalize O, compute LSE, store final scale =====
     if (kIsPersistent) pipeline_q.consumer_release(smem_pipe_release_q);
-    warpgroup_wait<0>();
-    warpgroup_fence_operand(acc_pv);
     if (kIsPersistent) pipeline.consumer_release(smem_pipe_release);
     ++smem_pipe_release;
 
-    Tensor lse = softmax.tail(softmax_state, acc_pv, tiled_mma_pv);
+    auto reduction_target_qk = reduction_target_n(tiled_mma_qk);
+    constexpr int red_rank_qk = decltype(rank(reduction_target_qk))::value;
+    for_each(make_seq<red_rank_qk>{}, [&](auto r) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 1; j < shape<r>(reduction_target_qk); j *= 2) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(a_sum); i++) {
+          a_sum(i) = a_sum(i) + __shfl_xor_sync(uint32_t(-1), a_sum(i), stride<r>(reduction_target_qk) * j);
+        }
+      }
+    });
 
-    // Direct gmem write for O (this WG's head-dim partition)
+    Tensor lse = make_fragment_like(a_sum);
+    auto pv_mn = layout_acc_mn(tiled_mma_pv, acc_pv.layout());
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(pv_mn); mi++) {
+      float sum = a_sum(mi);
+      float inv_sum = (sum == 0.f || sum != sum) ? 1.f : __frcp_rn(sum);
+      lse(mi) = (sum == 0.f || sum != sum) ? INFINITY : s_max(mi) * params.scale_softmax + __logf(sum);
+      float scale = params.rp_dropout * inv_sum;
+      CUTLASS_PRAGMA_UNROLL
+      for (int ni = 0; ni < size<1>(pv_mn); ni++) {
+        acc_pv(pv_mn(mi, ni)) *= scale;
+      }
+    }
+
+    cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPEmpty);
+
+    if (scale_is_col0) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int mi = 0; mi < kMRows; mi++) {
+        float sum = a_sum(mi);
+        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : __frcp_rn(sum);
+        storage.smem_scale[scale_m_coords[mi]] = params.rp_dropout * inv_sum;
+      }
+    }
+
+    cutlass::arch::fence_view_async_shared();
+    __syncwarp();
+    cutlass::arch::NamedBarrier::arrive(kNumMmaThreads, kBarrierPFull);
+
+    // Direct O write — PV identity gives correct column mapping per WG
     int batch_idx = get<0>(get<2>(wg_coord));
     int head_idx = get<1>(get<2>(wg_coord));
     int seq_stride_o = get<0>(params.dO);
     int batch_stride_o = get<0>(get<2>(params.dO));
     int head_stride_o = get<1>(get<2>(params.dO));
-    int o_base = batch_idx * batch_stride_o + head_idx * head_stride_o;
+    int o_base = batch_idx * batch_stride_o + head_idx * head_stride_o +
+                 m_block * MPerWG * seq_stride_o;
     int seqlen_q = get<2>(problem_size);
 
+    int pv_thread_idx = thread_idx - NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
+    auto thr_pv = tiled_mma_pv.get_thread_slice(pv_thread_idx);
     Tensor cO = make_identity_tensor(take<0, 2>(TileShapePV{}));
-    Tensor tOcO = thr_mma_pv.partition_C(cO);
+    Tensor tOcO = thr_pv.partition_C(cO);
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(acc_pv); i++) {
       int m = get<0>(tOcO(i));
       int n = get<1>(tOcO(i));
-      if (m < seqlen_q && n >= kColOffset && n < kColOffset + HeadDimHalf) {
+      if (m + m_block * MPerWG < seqlen_q) {
         params.ptr_O[o_base + m * seq_stride_o + n] =
             static_cast<Element>(acc_pv(i));
       }
     }
 
-    // Write LSE (only one WG needs to do this)
-    if (kVNTile == 0 && params.ptr_LSE != nullptr) {
-      auto acc_mn = make_tensor(tOcO.data(), layout_acc_mn(tiled_mma_pv, tOcO.layout()));
-      if (get<1>(acc_mn(_0{}, _0{})) == 0) {
+    if (params.ptr_LSE != nullptr) {
+      if (get<1>(tOcO(pv_mn(_0{}, _0{}))) == 0) {
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size<0>(acc_mn); i++) {
-          int m = get<0>(acc_mn(i, _0{}));
-          if (m < seqlen_q) {
-            params.ptr_LSE[batch_idx * seqlen_q + m] = lse(i);
+        for (int mi = 0; mi < size<0>(pv_mn); mi++) {
+          int m = get<0>(tOcO(pv_mn(mi, _0{})));
+          if (m + m_block * MPerWG < seqlen_q) {
+            params.ptr_LSE[batch_idx * seqlen_q + m + m_block * MPerWG] = lse(mi);
           }
         }
+      }
+    }
+  }
+
+  // ===== Split-D WG2: PV-only consumer (reads P from smem, loads scales) =====
+
+  template<class BlkCoord, class ProblemShape, class MainloopPipelineReducer,
+           class PipelineStateReducer, class MathWgOrderBarrier>
+  CUTLASS_DEVICE void
+  compute_splitd_wg2(
+      BlkCoord const& blk_coord, BlkCoord const& wg_coord,
+      Params const& params, ProblemShape const& problem_size,
+      MainloopPipeline& pipeline, PipelineState& smem_pipe_read,
+      MainloopPipelineReducer&, PipelineStateReducer&,
+      SharedStorage& storage,
+      MathWgOrderBarrier& math_wg_order_barrier)
+  {
+    static_assert(kSplitDPV);
+    int thread_idx = int(threadIdx.x);
+
+    PipelineState smem_pipe_release = smem_pipe_read;
+
+    // PV setup: 2-WG SS mode — WG2 is PV-WG1 (second N partition)
+    TiledMmaPV tiled_mma_pv;
+    static constexpr int kPVWarpGroups = kHeadDim / 256;
+    Layout wg_pv_layout = make_layout(Int<kPVWarpGroups>{}, Int<128>{});
+    auto wg_mma_pv = tiled_mma_pv.get_slice(wg_pv_layout(_1{}));
+
+    Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
+    Tensor sP = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
+    Tensor tOsV = wg_mma_pv.partition_fragment_B(sV);
+    Tensor tOsP = wg_mma_pv.partition_fragment_A(sP);
+
+    int k_tile_count = Fusion{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_size);
+
+    // PV accumulator
+    Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
+
+    // PV identity for scale load and O write
+    int pv_thread_idx = thread_idx - NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
+    auto thr_pv = tiled_mma_pv.get_thread_slice(pv_thread_idx);
+    Tensor cO = make_identity_tensor(take<0, 2>(TileShapePV{}));
+    Tensor tOcO = thr_pv.partition_C(cO);
+    auto pv_mn = layout_acc_mn(tiled_mma_pv, acc_pv.layout());
+
+    int m_block = get<0>(wg_coord);
+
+    // ===== First KV tile =====
+    {
+      --k_tile_count;
+
+      // K pipeline participation (WG2 doesn't use K)
+      pipeline.consumer_wait(smem_pipe_read);
+      math_wg_order_barrier.wait();
+      math_wg_order_barrier.arrive();
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      ++smem_pipe_read;
+
+      // Wait PFull (P₀ ready from WG1)
+      cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPFull);
+
+      // V pipeline wait + SS PV GEMM (zero_acc)
+      pipeline.consumer_wait(smem_pipe_read);
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_arrive();
+      gemm_zero_acc(tiled_mma_pv, tOsP(_,_,_,_0{}), tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
+      warpgroup_commit_batch();
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_pv);
+
+      // Signal P consumed
+      cutlass::arch::NamedBarrier::arrive(kNumMmaThreads, kBarrierPEmpty);
+
+      // Release V stage
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      ++smem_pipe_read;
+    }
+
+    // ===== Subsequent KV tiles =====
+    k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    CUTLASS_PRAGMA_NO_UNROLL
+    while (k_tile_count > 0) {
+      --k_tile_count;
+
+      // K pipeline participation (release K early)
+      pipeline.consumer_wait(smem_pipe_read);
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      ++smem_pipe_read;
+
+      // Wait PFull (P_n ready from WG1)
+      cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPFull);
+
+      // Load scale from smem, rescale O
+      CUTLASS_PRAGMA_UNROLL
+      for (int mi = 0; mi < size<0>(pv_mn); mi++) {
+        int m_coord = get<0>(tOcO(pv_mn(mi, _0{})));
+        float sf = storage.smem_scale[m_coord];
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(pv_mn); ni++) {
+          acc_pv(pv_mn(mi, ni)) *= sf;
+        }
+      }
+
+      // V pipeline wait + SS PV GEMM (accumulate)
+      pipeline.consumer_wait(smem_pipe_read);
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_arrive();
+      tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
+      gemm_reset_zero_acc(tiled_mma_pv, tOsP(_,_,_,_0{}), tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
+      warpgroup_commit_batch();
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_pv);
+
+      // Signal P consumed
+      cutlass::arch::NamedBarrier::arrive(kNumMmaThreads, kBarrierPEmpty);
+
+      // Release V stage
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      ++smem_pipe_read;
+    }
+
+    // ===== Tail: load final scale from WG1, normalize O =====
+    if (kIsPersistent) pipeline.consumer_release(smem_pipe_release);
+    ++smem_pipe_release;
+
+    // Wait PFull (final scale ready from WG1)
+    cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPFull);
+
+    // Load final scale, normalize WG2's O
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(pv_mn); mi++) {
+      int m_coord = get<0>(tOcO(pv_mn(mi, _0{})));
+      float sf = storage.smem_scale[m_coord];
+      CUTLASS_PRAGMA_UNROLL
+      for (int ni = 0; ni < size<1>(pv_mn); ni++) {
+        acc_pv(pv_mn(mi, ni)) *= sf;
+      }
+    }
+
+    // Signal final P consumed
+    cutlass::arch::NamedBarrier::arrive(kNumMmaThreads, kBarrierPEmpty);
+
+    // Direct O write
+    int batch_idx = get<0>(get<2>(wg_coord));
+    int head_idx = get<1>(get<2>(wg_coord));
+    int seq_stride_o = get<0>(params.dO);
+    int batch_stride_o = get<0>(get<2>(params.dO));
+    int head_stride_o = get<1>(get<2>(params.dO));
+    int o_base = batch_idx * batch_stride_o + head_idx * head_stride_o +
+                 m_block * MPerWG * seq_stride_o;
+    int seqlen_q = get<2>(problem_size);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(acc_pv); i++) {
+      int m = get<0>(tOcO(i));
+      int n = get<1>(tOcO(i));
+      if (m + m_block * MPerWG < seqlen_q) {
+        params.ptr_O[o_base + m * seq_stride_o + n] =
+            static_cast<Element>(acc_pv(i));
       }
     }
   }

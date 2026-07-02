@@ -27,8 +27,8 @@ struct GemmaFmhaTypes {
   using ElementAccumulatorQK = float;
   using ElementAccumulatorPV = float;
 
-  // hd=256: Shape<128, 64, 256> — 2 cooperative WGs
-  // hd=512: Shape<64, 64, 512> — 1 WG, head-chunked PV (O half in smem)
+  // hd=256: Shape<128, 64, 256> — 2 cooperative WGs, 5 KV stages
+  // hd=512: Shape<64, 64, 512> — split-D (FA3-style 2-WG)
   using TileShape = cute::conditional_t<
       HeadDim == 256,
       cute::Shape<cute::_128, cute::_64, cute::_256>,

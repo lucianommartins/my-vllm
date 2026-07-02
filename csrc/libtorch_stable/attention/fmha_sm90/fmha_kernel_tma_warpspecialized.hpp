@@ -238,9 +238,13 @@ struct FmhaKernelTmaWarpSpecialized {
         warp_group_role == WarpGroupRole::Consumer3
     ) {
       pipeline_params_inner.role = MainloopPipelineInner::ThreadCategory::Consumer;
-      pipeline_params_outer.role = MainloopPipelineOuter::ThreadCategory::Consumer;
       pipeline_params_reducer.role = MainloopPipelineReducer::ThreadCategory::Producer;
       epi_load_pipeline_params.role = EpiLoadPipeline::ThreadCategory::Consumer;
+      if constexpr (!kSplitDPV) {
+        pipeline_params_outer.role = MainloopPipelineOuter::ThreadCategory::Consumer;
+      } else if (warp_group_role == WarpGroupRole::Consumer0) {
+        pipeline_params_outer.role = MainloopPipelineOuter::ThreadCategory::Consumer;
+      }
     }
 
     MainloopPipelineOuter pipeline_outer(storage.pipeline_storage_outer, pipeline_params_outer, Shape<_1, _1, _1>{});
@@ -291,6 +295,15 @@ struct FmhaKernelTmaWarpSpecialized {
     }
 
     CollectiveMainloop collective_mainloop;
+
+    // Split-D: WG2 (Consumer1) signals P buffer is initially free
+    if constexpr (kSplitDPV) {
+      if (warp_group_role == WarpGroupRole::Consumer1) {
+        cutlass::arch::NamedBarrier::arrive(
+            CollectiveMainloop::kNumMmaThreads,
+            CollectiveMainloop::kBarrierPEmpty);
+      }
+    }
 
     if (warp_group_role == WarpGroupRole::Producer) {
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
@@ -389,12 +402,9 @@ struct FmhaKernelTmaWarpSpecialized {
         // For split-D: both WGs handle the same M block (no M-split)
 
         if constexpr (kSplitDPV) {
-          // Split-D: both WGs do QK+softmax independently, each does PV on its V half
-          // Consumer0 → V N-tile 1 (cols HeadDimHalf..HeadDimFull-1)
-          // Consumer1 → V N-tile 0 (cols 0..HeadDimHalf-1)
-          constexpr int HD2 = CollectiveMainloop::HeadDimHalf;
+          // FA3-style split-D: WG1 does QK+softmax+P→smem, both WGs do SS PV
           if (warp_group_role == WarpGroupRole::Consumer0) {
-            collective_mainloop.template compute_splitd<1, HD2>(
+            collective_mainloop.compute_splitd_wg1(
               blk_coord, wg_coord,
               params.mainloop, params.problem_size,
               pipeline_inner, smem_pipe_read_inner,
@@ -403,11 +413,10 @@ struct FmhaKernelTmaWarpSpecialized {
               storage.tensors.mainloop,
               math_wg_order_barrier);
           } else {
-            collective_mainloop.template compute_splitd<0, 0>(
+            collective_mainloop.compute_splitd_wg2(
               blk_coord, wg_coord,
               params.mainloop, params.problem_size,
               pipeline_inner, smem_pipe_read_inner,
-              pipeline_outer, smem_pipe_read_outer,
               pipeline_reducer, smem_pipe_write_reducer,
               storage.tensors.mainloop,
               math_wg_order_barrier);
