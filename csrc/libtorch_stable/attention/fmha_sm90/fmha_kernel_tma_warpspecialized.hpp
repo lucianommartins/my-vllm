@@ -206,7 +206,9 @@ struct FmhaKernelTmaWarpSpecialized {
     PipelineParamsOuter pipeline_params_outer;
     pipeline_params_outer.transaction_bytes = CollectiveMainloop::kOuterLoadBytes;
     pipeline_params_outer.is_leader = lane_predicate && (producer_warp_role == WarpRoleLoadQ);
-    pipeline_params_outer.num_consumers = cutlass::NumThreadsPerWarpGroup;
+    pipeline_params_outer.num_consumers = kSplitDPV
+        ? NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup
+        : cutlass::NumThreadsPerWarpGroup;
 
     PipelineParamsInner pipeline_params_inner;
     pipeline_params_inner.transaction_bytes = CollectiveMainloop::kInnerLoadBytes;
@@ -240,11 +242,7 @@ struct FmhaKernelTmaWarpSpecialized {
       pipeline_params_inner.role = MainloopPipelineInner::ThreadCategory::Consumer;
       pipeline_params_reducer.role = MainloopPipelineReducer::ThreadCategory::Producer;
       epi_load_pipeline_params.role = EpiLoadPipeline::ThreadCategory::Consumer;
-      if constexpr (!kSplitDPV) {
-        pipeline_params_outer.role = MainloopPipelineOuter::ThreadCategory::Consumer;
-      } else if (warp_group_role == WarpGroupRole::Consumer0) {
-        pipeline_params_outer.role = MainloopPipelineOuter::ThreadCategory::Consumer;
-      }
+      pipeline_params_outer.role = MainloopPipelineOuter::ThreadCategory::Consumer;
     }
 
     MainloopPipelineOuter pipeline_outer(storage.pipeline_storage_outer, pipeline_params_outer, Shape<_1, _1, _1>{});
@@ -295,15 +293,6 @@ struct FmhaKernelTmaWarpSpecialized {
     }
 
     CollectiveMainloop collective_mainloop;
-
-    // Split-D: WG2 (Consumer1) signals P buffer is initially free
-    if constexpr (kSplitDPV) {
-      if (warp_group_role == WarpGroupRole::Consumer1) {
-        cutlass::arch::NamedBarrier::arrive(
-            CollectiveMainloop::kNumMmaThreads,
-            CollectiveMainloop::kBarrierPEmpty);
-      }
-    }
 
     if (warp_group_role == WarpGroupRole::Producer) {
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
@@ -402,25 +391,15 @@ struct FmhaKernelTmaWarpSpecialized {
         // For split-D: both WGs handle the same M block (no M-split)
 
         if constexpr (kSplitDPV) {
-          // FA3-style split-D: WG1 does QK+softmax+P→smem, both WGs do SS PV
-          if (warp_group_role == WarpGroupRole::Consumer0) {
-            collective_mainloop.compute_splitd_wg1(
-              blk_coord, wg_coord,
-              params.mainloop, params.problem_size,
-              pipeline_inner, smem_pipe_read_inner,
-              pipeline_outer, smem_pipe_read_outer,
-              pipeline_reducer, smem_pipe_write_reducer,
-              storage.tensors.mainloop,
-              math_wg_order_barrier);
-          } else {
-            collective_mainloop.compute_splitd_wg2(
-              blk_coord, wg_coord,
-              params.mainloop, params.problem_size,
-              pipeline_inner, smem_pipe_read_inner,
-              pipeline_reducer, smem_pipe_write_reducer,
-              storage.tensors.mainloop,
-              math_wg_order_barrier);
-          }
+          // N-split cooperative: each WG does QK on its N-half + SS PV
+          collective_mainloop.compute_ncoop(
+            blk_coord, wg_coord,
+            params.mainloop, params.problem_size,
+            pipeline_inner, smem_pipe_read_inner,
+            pipeline_outer, smem_pipe_read_outer,
+            pipeline_reducer, smem_pipe_write_reducer,
+            storage.tensors.mainloop,
+            math_wg_order_barrier);
         } else {
           auto result = [&]() {
             if constexpr (kHeadChunkedPV) {
@@ -477,10 +456,8 @@ struct FmhaKernelTmaWarpSpecialized {
             }
           }
         } else {
-          // For split-D: only Consumer0 uses Q pipeline
-          if (warp_group_role == WarpGroupRole::Consumer0) {
-            smem_pipe_read_outer.advance(kOuterLoads);
-          }
+          // N-split: both WGs share Q stage
+          smem_pipe_read_outer.advance(kOuterLoads);
         }
       }
     }
