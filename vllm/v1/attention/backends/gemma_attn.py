@@ -405,15 +405,31 @@ class GemmaAttentionImpl(AttentionImpl):
         self.topk_bounds = os.environ.get("GEMMA_TOPK_EXACT", "0") != "1"
         self.block_bounds: torch.Tensor | None = None
 
+        # Pre-allocated empty tensors for the decode hot path (avoids
+        # per-layer tensor creation in gemma_paged_attention wrapper).
+        self._empty_lse: torch.Tensor | None = None
+        self._empty_sel: torch.Tensor | None = None
+        # Cached partition buffers (avoids dict lookup per layer).
+        self._cached_part: tuple[torch.Tensor, ...] | None = None
+        self._cached_part_ns: int = 0
+        self._cached_part_mp: int = 0
+
     def _ensure_partition_buffers(
         self, num_seqs: int, max_seq_len: int,
         dtype: torch.dtype, device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Shared across all attention layers (see _get_decode_partition_buffers).
-        return _get_decode_partition_buffers(
+        if (self._cached_part is not None
+                and self._cached_part_ns >= num_seqs
+                and self._cached_part_mp >= max_seq_len):
+            return self._cached_part  # type: ignore[return-value]
+        result = _get_decode_partition_buffers(
             num_seqs, self.num_heads, self.head_size,
             max_seq_len, dtype, device,
         )
+        self._cached_part = result
+        self._cached_part_ns = result[0].shape[0]
+        self._cached_part_mp = max_seq_len
+        return result
 
     def forward(
         self,
@@ -545,45 +561,46 @@ class GemmaAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: GemmaAttentionMetadata,
     ) -> torch.Tensor:
-        from vllm.v1.attention.ops.gemma_paged_attention import (
-            gemma_paged_attention,
-        )
-
         num_seqs = query.shape[0]
         exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
             num_seqs, attn_metadata.max_seq_len,
             query.dtype, query.device,
         )
 
-        # Lossy top-k: pick the most relevant KV tiles per (seq, kv_head) and
-        # have the decode kernel walk only those (sink + recent always kept).
-        # Gated to long-enough batches so every seq has >num_sel distinct tiles
-        # (else full attention, lossless). None -> full attention.
-        selected_tiles = self._maybe_select_tiles(
-            query, key_cache, attn_metadata,
-        )
+        # Inline topk check (avoid method call overhead on hot path).
+        # topk_enabled is False by default; when off, selected_tiles stays
+        # as the pre-allocated empty tensor.
+        if self._empty_lse is None:
+            self._empty_lse = output.new_empty(0, dtype=torch.float32)
+            self._empty_sel = output.new_empty(0, dtype=torch.int32)
+        selected_tiles = self._empty_sel
+        if self.topk_enabled:
+            sel = self._maybe_select_tiles(query, key_cache, attn_metadata)
+            if sel is not None:
+                selected_tiles = sel
 
-        gemma_paged_attention(
-            out=output,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            tmp_out=tmp_out,
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            num_kv_heads=self.num_kv_heads,
-            scale=self.scale,
-            block_tables=attn_metadata.block_table,
-            seq_lens=attn_metadata.seq_lens,
-            block_size=key_cache.shape[1],
-            max_seq_len=attn_metadata.max_seq_len,
-            kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=layer._k_scale,
-            v_scale=layer._v_scale,
-            actual_head_size=self.actual_head_size,
-            k_eq_v=self.k_eq_v,
-            sliding_window=self.sliding_window,
-            selected_tiles=selected_tiles,
+        torch.ops._C.gemma_paged_attention(
+            output,
+            exp_sums,
+            max_logits,
+            tmp_out,
+            query,
+            key_cache,
+            value_cache,
+            self.num_kv_heads,
+            self.scale,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            key_cache.shape[1],
+            attn_metadata.max_seq_len,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+            self.actual_head_size,
+            self.k_eq_v,
+            self.sliding_window,
+            self._empty_lse,
+            selected_tiles,
         )
         return output
 

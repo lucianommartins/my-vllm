@@ -238,6 +238,14 @@ struct FmhaMainloopTmaWarpSpecialized {
     int max_mm_ranges;
     const Element* ptr_V;
     LayoutV dV;
+
+    // Paged KV: TMA descriptors for paged K/V (same type as contiguous — raw
+    // CUtensorMap bytes overwritten in launcher for paged layout).
+    // page_table: device ptr to this sequence's block table (logical→physical).
+    TMA_K tma_load_k_paged;
+    TMA_V tma_load_v_paged;
+    const int* page_table;
+    int gqa_group;
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
@@ -258,6 +266,22 @@ struct FmhaMainloopTmaWarpSpecialized {
 
   using LoadV = cutlass::fmha::collective::CollectiveLoadTma<
     cutlass::fmha::collective::LoadKind::kV,
+    MainloopPipeline,
+    Element,
+    SmemLayoutV,
+    TMA_V
+  >;
+
+  using LoadPagedK = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPagedK,
+    MainloopPipeline,
+    Element,
+    SmemLayoutK,
+    TMA_K
+  >;
+
+  using LoadPagedV = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPagedV,
     MainloopPipeline,
     Element,
     SmemLayoutV,
@@ -319,15 +343,24 @@ struct FmhaMainloopTmaWarpSpecialized {
         args.mm_prefix_ranges,
         args.max_mm_ranges,
         args.ptr_V,
-        args.dV
+        args.dV,
+        params_qk.tma_load_b,   // tma_load_k_paged (placeholder, overwritten for paged)
+        params_pv.tma_load_b,   // tma_load_v_paged (placeholder, overwritten for paged)
+        nullptr,                 // page_table (null = contiguous mode)
+        1                        // gqa_group (set by paged launcher)
     };
   }
 
   CUTLASS_DEVICE
   static void prefetch_tma_descriptors(Params const& params) {
     cute::prefetch_tma_descriptor(params.tma_load_q.get_tma_descriptor());
-    cute::prefetch_tma_descriptor(params.tma_load_k.get_tma_descriptor());
-    cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
+    if (params.page_table != nullptr) {
+      cute::prefetch_tma_descriptor(params.tma_load_k_paged.get_tma_descriptor());
+      cute::prefetch_tma_descriptor(params.tma_load_v_paged.get_tma_descriptor());
+    } else {
+      cute::prefetch_tma_descriptor(params.tma_load_k.get_tma_descriptor());
+      cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
+    }
     if constexpr (kHeadChunkedPV) {
       cute::prefetch_tma_descriptor(params.tma_load_v_hi.get_tma_descriptor());
     }
@@ -372,6 +405,80 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     LoadV load_v{params.tma_load_v, pipeline, storage.smem_v};
     // split-D: load full 512-col V (both N-tiles), not TileShapePV_Eff (256 cols)
+    using TileShapePV_Load = cute::conditional_t<kSplitDPV, TileShapePV, TileShapePV_Eff>;
+    auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
+
+    if constexpr (kLoadQ) {
+      load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
+    }
+
+    load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+
+    if constexpr (kLoadQ) {
+      load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
+    }
+
+    if constexpr (! kLoadQ) {
+      if (do_barrier) {
+        load_warp_barrier.arrive();
+        load_warp_barrier.wait(/*phase=*/ 0);
+        do_barrier = false;
+      }
+    }
+
+    load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+
+    if constexpr (kLoadQ) {
+      while (q_tile_count > 0) {
+        load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
+      }
+    }
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    while (k_tile_count > 0) {
+      load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+      load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    }
+  }
+
+  // Paged KV load: same structure as load_kv_maybe_q but uses page_table indirection.
+  // TMA descriptors point to the KV cache pool; page_table maps logical→physical blocks.
+  template<bool kLoadQ, class BlkCoord, class ProblemShape, class LoadWarpBarrier>
+  CUTLASS_DEVICE void
+  load_kv_paged(
+      int block_rank_in_cluster,
+      BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_size,
+      MainloopPipeline& pipeline, PipelineState& smem_pipe_write,
+      MainloopPipelineQ& pipeline_q, PipelineStateQ& smem_pipe_write_q,
+      SharedStorage& storage,
+      LoadWarpBarrier& load_warp_barrier, bool do_barrier)
+  {
+    int fusion_tile_count = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size);
+    int lane_predicate = cute::elect_one_sync();
+
+    uint16_t mcast_mask_b = 0;
+    if (lane_predicate == 1) {
+      if constexpr (cute::is_same_v<typename CollectiveMmaQK::GmemTiledCopyB, SM90_TMA_LOAD_MULTICAST>) {
+        auto block_layout = Layout<ClusterShape>{};
+        for (int m = 0; m < size<0>(block_layout); ++m) {
+          mcast_mask_b |= (uint16_t(1) << block_layout(m,_0{},Int<0>{}));
+        }
+      }
+    }
+
+    auto q_tile_iter = cute::make_coord_iterator(Int<NumQKWarpGroups>{});
+    [[maybe_unused]] int q_tile_count = NumQKWarpGroups;
+
+    auto k_tile_iter = cute::make_coord_iterator(fusion_tile_count);
+    int k_tile_count = 2 * fusion_tile_count;
+
+    LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
+    auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
+
+    LoadPagedK load_k{params.tma_load_k_paged, pipeline, storage.smem_k, params.page_table, params.gqa_group};
+    auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
+
+    LoadPagedV load_v{params.tma_load_v_paged, pipeline, storage.smem_v, params.page_table, params.gqa_group};
     using TileShapePV_Load = cute::conditional_t<kSplitDPV, TileShapePV, TileShapePV_Eff>;
     auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
 
@@ -1379,9 +1486,9 @@ struct FmhaMainloopTmaWarpSpecialized {
 
       cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPEmpty);
       CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(acc_qk); i++) {
-        sP(get<0>(tPcP_local(i)), get<1>(tPcP_local(i)), _0{}) = static_cast<Element>(acc_qk(i));
-      }
+//       for (int i = 0; i < size(acc_qk); i++) {
+//         sP(get<0>(tPcP_local(i)), get<1>(tPcP_local(i)), _0{}) = static_cast<Element>(acc_qk(i));
+//       }
       cutlass::arch::fence_view_async_shared();
       __syncwarp();
       cutlass::arch::NamedBarrier::arrive(kNumMmaThreads, kBarrierPFull);

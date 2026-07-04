@@ -206,7 +206,9 @@ struct SlidingWindowCausalFusion : DefaultFusion {
     ProblemSize const& problem_size
   ) {
     int max_blocks_k = Base::get_trip_count(blk_coord, tile_shape, problem_size);
-    int max_blocks_q = ceil_div((get<0>(blk_coord) + 1) * get<0>(tile_shape), get<1>(tile_shape));
+    int q_offset = get<6>(problem_size);
+    int max_blocks_q = ceil_div((get<0>(blk_coord) + 1) * get<0>(tile_shape) + q_offset,
+                                get<1>(tile_shape));
     return std::min(max_blocks_k, max_blocks_q);
   }
 
@@ -238,10 +240,11 @@ struct SlidingWindowCausalFusion : DefaultFusion {
     ProblemSize const& problem_size
   ) {
     int sw = get<5>(problem_size);
+    int q_offset = get<6>(problem_size);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(acc_qk); i++) {
       auto pos = index_qk(i);
-      int q = get<0>(pos);
+      int q = get<0>(pos) + q_offset;
       int k = get<1>(pos);
       if (q < k || k >= get<3>(problem_size) ||
           (sw > 0 && k < q - sw)) {

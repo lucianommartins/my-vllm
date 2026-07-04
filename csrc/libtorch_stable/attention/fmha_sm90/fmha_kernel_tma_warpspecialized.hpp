@@ -50,6 +50,8 @@ template<
 >
 struct FmhaKernelTmaWarpSpecialized {
 
+  using Mainloop = CollectiveMainloop;
+
   // Options
   static constexpr bool kIsEpilogueLocked = find_option_t<Tag::kIsEpilogueLocked, false_type, Options...>::value;
   static constexpr bool kLoadsQSeparately = find_option_t<Tag::kLoadsQSeparately, false_type, Options...>::value;
@@ -103,7 +105,10 @@ struct FmhaKernelTmaWarpSpecialized {
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-  using ProblemShape = cute::tuple<int, int, int, int, int, int>;
+  // (num_heads, batch, seq_q, seq_k, head_dim, sliding_window, q_offset, num_kv_blocks)
+  // q_offset: global position of Q[0] in the sequence (for decode: seq_k - seq_q)
+  // num_kv_blocks: total blocks in KV cache pool (0 = contiguous mode, >0 = paged TMA mode)
+  using ProblemShape = cute::tuple<int, int, int, int, int, int, int, int>;
 
   struct Arguments {
     ProblemShape problem_size;
@@ -298,18 +303,30 @@ struct FmhaKernelTmaWarpSpecialized {
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
       if (producer_warp_role == ProducerWarpRole::LoadKV) {
         bool do_barrier = kLoadsQSeparately;
+        bool is_paged = (params.mainloop.page_table != nullptr);
 
         CUTLASS_PRAGMA_NO_UNROLL
         for (; tile_scheduler.is_valid(); ++tile_scheduler) {
           auto blk_coord = tile_scheduler.get_block_coord();
-          collective_mainloop.template load_kv_maybe_q<!kLoadsQSeparately>(
-            block_rank_in_cluster,
-            blk_coord, params.mainloop, params.problem_size,
-            pipeline_inner, smem_pipe_write_inner,
-            pipeline_outer, smem_pipe_write_outer,
-            storage.tensors.mainloop,
-            storage.load_warp_barrier, do_barrier
-          );
+          if (is_paged) {
+            collective_mainloop.template load_kv_paged<!kLoadsQSeparately>(
+              block_rank_in_cluster,
+              blk_coord, params.mainloop, params.problem_size,
+              pipeline_inner, smem_pipe_write_inner,
+              pipeline_outer, smem_pipe_write_outer,
+              storage.tensors.mainloop,
+              storage.load_warp_barrier, do_barrier
+            );
+          } else {
+            collective_mainloop.template load_kv_maybe_q<!kLoadsQSeparately>(
+              block_rank_in_cluster,
+              blk_coord, params.mainloop, params.problem_size,
+              pipeline_inner, smem_pipe_write_inner,
+              pipeline_outer, smem_pipe_write_outer,
+              storage.tensors.mainloop,
+              storage.load_warp_barrier, do_barrier
+            );
+          }
           do_barrier = false;
         }
       }

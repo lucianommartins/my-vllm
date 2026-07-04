@@ -89,7 +89,7 @@ struct FmhaCachedLauncher {
       auto stride_lse = cute::make_tuple(
           cute::_1{}, cute::make_tuple(seq_q, seq_q));
       auto problem = cute::make_tuple(
-          num_q_heads, 1, seq_q, seq_k, HeadDim, sliding_window);
+          num_q_heads, 1, seq_q, seq_k, HeadDim, sliding_window, 0, 0);
 
       cutlass::KernelHardwareInfo hw_info;
       hw_info.device_id = device_id;

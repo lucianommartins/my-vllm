@@ -43,10 +43,11 @@ static constexpr int DS_MINCTA_256 = 3;
     auto gqa_kernel = vllm::gemma::gemma_gqa_decode_kernel<                    \
         T, CACHE_T, HEAD_SIZE, ACTUAL_HEAD_SIZE, BLOCK_SIZE, GROUP,            \
         KV_DTYPE, K_EQ_V, USE_SW>;                                            \
-    if (gqa_smem > 48 * 1024) {                                                \
-      cudaFuncSetAttribute(gqa_kernel,                                         \
-          cudaFuncAttributeMaxDynamicSharedMemorySize, gqa_smem);             \
-    }                                                                          \
+    { static bool _a = false; if (!_a) {                                       \
+      if (gqa_smem > 48 * 1024)                                                \
+        cudaFuncSetAttribute(gqa_kernel,                                       \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, gqa_smem);           \
+      _a = true; } }                                                           \
     gqa_kernel<<<gqa_grid, (GROUP) * WARP_SIZE, gqa_smem, stream>>>(           \
         out_ptr, query_ptr, key_cache_ptr, value_cache_ptr,                   \
         num_kv_heads, scale, block_tables_ptr, seq_lens_ptr,                   \
@@ -80,10 +81,11 @@ static constexpr int DS_MINCTA_256 = 3;
     auto split_kernel = vllm::gemma::gemma_gqa_split_decode_kernel<            \
         T, CACHE_T, HEAD_SIZE, ACTUAL_HEAD_SIZE, BLOCK_SIZE, GROUP,            \
         KV_DTYPE, K_EQ_V, USE_SW>;                                            \
-    if (split_smem > 48 * 1024) {                                              \
-      cudaFuncSetAttribute(split_kernel,                                       \
-          cudaFuncAttributeMaxDynamicSharedMemorySize, split_smem);           \
-    }                                                                          \
+    { static bool _a = false; if (!_a) {                                       \
+      if (split_smem > 48 * 1024)                                              \
+        cudaFuncSetAttribute(split_kernel,                                     \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, split_smem);         \
+      _a = true; } }                                                           \
     split_kernel<<<split_grid, (GROUP) * WARP_SIZE, split_smem, stream>>>(     \
         tmp_out_ptr, exp_sums_ptr, max_logits_ptr, query_ptr,                 \
         key_cache_ptr, value_cache_ptr, num_kv_heads, scale,                  \
@@ -130,11 +132,17 @@ static constexpr int DS_MINCTA_256 = 3;
                    + (size_t)(16 * SLDN + 3 * 16) * sizeof(float);            \
     auto sk = vllm::gemma::gemma_decode_stream_kernel<                         \
         T, CACHE_T, HEAD, DS_BN, NW, GROUP, KEQV, USW, SPLITB, MINCTA>;       \
-    if (ssmem > 48 * 1024)                                                     \
-      cudaFuncSetAttribute(                                                    \
-          sk, cudaFuncAttributeMaxDynamicSharedMemorySize, ssmem);            \
-    cudaFuncSetAttribute(                                                      \
-        sk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);            \
+    {                                                                          \
+      static bool attr_set = false;                                            \
+      if (!attr_set) {                                                         \
+        if (ssmem > 48 * 1024)                                                 \
+          cudaFuncSetAttribute(                                                \
+              sk, cudaFuncAttributeMaxDynamicSharedMemorySize, ssmem);         \
+        cudaFuncSetAttribute(                                                  \
+            sk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);          \
+        attr_set = true;                                                       \
+      }                                                                        \
+    }                                                                          \
     T* sout = (SPLITB) ? tmp_out_ptr : out_ptr;                               \
     sk<<<sgrid, (NW) * WARP_SIZE, ssmem, stream>>>(                           \
         sout, exp_sums_ptr, max_logits_ptr, query_ptr, key_cache_ptr,        \
@@ -184,9 +192,11 @@ static constexpr int DS_MINCTA_256 = 3;
     size_t smem = ktile > comb ? ktile : comb;                                 \
     auto sk = vllm::gemma::gemma_decode_simt_kernel<                           \
         T, CACHE_T, HEAD, BN, BDY, BDZ, USW, SPLITB, MINCTA>;                  \
-    if (smem > 48 * 1024)                                                      \
-      cudaFuncSetAttribute(                                                    \
-          sk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);             \
+    { static bool _a = false; if (!_a) {                                       \
+      if (smem > 48 * 1024)                                                    \
+        cudaFuncSetAttribute(                                                  \
+            sk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);           \
+      _a = true; } }                                                           \
     T* sout = (SPLITB) ? tmp_out_ptr : out_ptr;                               \
     sk<<<sgrid, (BDY) * (BDZ) * WARP_SIZE, smem, stream>>>(                   \
         sout, exp_sums_ptr, max_logits_ptr, query_ptr, key_cache_ptr,        \
@@ -233,9 +243,11 @@ static constexpr int DS_MINCTA_256 = 3;
         + (size_t)(8 * 256 + 48) * sizeof(float) + (size_t)256 * sizeof(CACHE_T); \
     auto mk = vllm::gemma::gemma_decode_mma_kernel<                            \
         T, CACHE_T, HEAD, BN, GROUP, MINCTA>;                                  \
-    if (msmem > 48 * 1024)                                                     \
-      cudaFuncSetAttribute(                                                    \
-          mk, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem);            \
+    { static bool _a = false; if (!_a) {                                       \
+      if (msmem > 48 * 1024)                                                   \
+        cudaFuncSetAttribute(                                                  \
+            mk, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem);          \
+      _a = true; } }                                                           \
     mk<<<mg, 256, msmem, stream>>>(                                            \
         out_ptr, query_ptr, key_cache_ptr, num_kv_heads, scale,               \
         block_tables_ptr, seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE,    \
@@ -615,9 +627,11 @@ void gemma_topk_select_launcher(
     if (use_bounds) {                                                         \
       auto tk = vllm::gemma::gemma_topk_select_bounds_kernel<T, HS,           \
                                                     BLOCK_SIZE, GRP, NW>;     \
-      if (smem > 48 * 1024)                                                   \
-        cudaFuncSetAttribute(                                                 \
-            tk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);          \
+      { static bool _a = false; if (!_a) {                                    \
+        if (smem > 48 * 1024)                                                 \
+          cudaFuncSetAttribute(                                               \
+              tk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);        \
+        _a = true; } }                                                        \
       tk<<<grid, NW * WARP_SIZE, smem, stream>>>(                            \
           sel_ptr, q_ptr, bb_ptr, scale, bt_ptr, sl_ptr,                     \
           max_num_blocks_per_seq, q_stride, num_kv_heads, num_sel,            \
@@ -625,9 +639,11 @@ void gemma_topk_select_launcher(
     } else {                                                                  \
       auto tk = vllm::gemma::gemma_topk_select_kernel<T, CACHE_T, HS,         \
                                                     BLOCK_SIZE, GRP, NW>;     \
-      if (smem > 48 * 1024)                                                   \
-        cudaFuncSetAttribute(                                                 \
-            tk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);          \
+      { static bool _a = false; if (!_a) {                                    \
+        if (smem > 48 * 1024)                                                 \
+          cudaFuncSetAttribute(                                               \
+              tk, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);        \
+        _a = true; } }                                                        \
       tk<<<grid, NW * WARP_SIZE, smem, stream>>>(                            \
           sel_ptr, q_ptr, k_ptr, scale, bt_ptr, sl_ptr,                      \
           max_num_blocks_per_seq, q_stride, kv_stride_block, kv_stride_slot,  \

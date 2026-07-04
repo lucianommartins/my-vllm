@@ -38,6 +38,7 @@ namespace cutlass::fmha::collective {
 
 enum class LoadKind {
   kQ, kK, kV,
+  kPagedK, kPagedV,
   kBwdN, kBwdM, kBwdScalar
 };
 
@@ -57,10 +58,14 @@ struct CollectiveLoadTma {
   Params const& params;
   Pipeline& pipeline;
   SharedStorage& storage;
+  const int* page_table;  // device ptr, only used for kPagedK/kPagedV
+  int gqa_group;           // Q heads per KV head, for kPagedK/kPagedV
 
   CUTLASS_DEVICE
-  CollectiveLoadTma(Params const& params, Pipeline& pipeline, SharedStorage& storage)
-    : params(params), pipeline(pipeline), storage(storage) {}
+  CollectiveLoadTma(Params const& params, Pipeline& pipeline, SharedStorage& storage,
+                    const int* page_table = nullptr, int gqa_group = 1)
+    : params(params), pipeline(pipeline), storage(storage),
+      page_table(page_table), gqa_group(gqa_group) {}
 
   template<class ProblemSize, class TileShape, class BlockCoord>
   CUTLASS_DEVICE auto init_g(ProblemSize const& problem_size, TileShape const& tile_shape,
@@ -82,6 +87,26 @@ struct CollectiveLoadTma {
       Tensor gV_full = local_tile(mV_full, tile_shape, make_coord(_, _, _), Step<X, _1, _1>{});
       Tensor gV = gV_full(_, _, _0{}, _, get<2>(blk_coord));
       return gV;
+    } else if constexpr (kKind == LoadKind::kPagedK) {
+      // Paged K: TMA covers (block_size, head_dim, (num_blocks, num_kv_heads)).
+      // 4D flat rank matches contiguous K's TMA type. The batch tuple encodes
+      // (num_blocks, num_kv_heads) instead of contiguous's (num_q_heads, 1).
+      // kv_head is derived from the batch coord via GQA mapping.
+      int num_blocks = get<7>(problem_size);
+      int num_kv_heads = get<0>(problem_size) / gqa_group;
+      int kv_head = int(get<0>(get<2>(blk_coord))) / gqa_group;
+      Tensor mK = params.get_tma_tensor(
+          make_shape(int(get<0>(tile_shape)), get<4>(problem_size),
+                     make_shape(num_blocks, num_kv_heads)));
+      return mK(_, _, make_coord(_, kv_head));
+    } else if constexpr (kKind == LoadKind::kPagedV) {
+      int num_blocks = get<7>(problem_size);
+      int num_kv_heads = get<0>(problem_size) / gqa_group;
+      int kv_head = int(get<0>(get<2>(blk_coord))) / gqa_group;
+      Tensor mV = params.get_tma_tensor(
+          make_shape(get<4>(problem_size), int(get<0>(tile_shape)),
+                     make_shape(num_blocks, num_kv_heads)));
+      return mV(_, _, make_coord(_, kv_head));
     } else if constexpr (kKind == LoadKind::kBwdN) {
       Tensor m_full = params.get_tma_tensor(make_shape(get<3>(problem_size), get<4>(problem_size), select<0,1>(problem_size)));
       Tensor g_full = local_tile(m_full, tile_shape, make_coord(_, _, _), Step<_1, X, _1>{});
@@ -127,6 +152,9 @@ struct CollectiveLoadTma {
 
       if constexpr (kKind == LoadKind::kBwdScalar) {
         copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,*tile_iter), get<1>(state)(_,_,smem_pipe_write.index()));
+      } else if constexpr (kKind == LoadKind::kPagedK || kKind == LoadKind::kPagedV) {
+        int phys_block = page_table[*tile_iter];
+        copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,_,phys_block), get<1>(state)(_,_,_,smem_pipe_write.index()));
       } else {
         copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,_,*tile_iter), get<1>(state)(_,_,_,smem_pipe_write.index()));
       }
