@@ -172,6 +172,14 @@ struct FmhaKernelTmaWarpSpecialized {
     CUTE_INVALID_CONTROL_PATH("ERROR : Arch conditional MMA instruction used without targeting appropriate compute capability. Aborting.\n");
 #else
 
+    ProblemShape problem_size_local = params.problem_size;
+    if (params.mainloop.d_seq_lens != nullptr) {
+      int seq_k = params.mainloop.d_seq_lens[blockIdx.z];
+      get<3>(problem_size_local) = seq_k;
+      get<6>(problem_size_local) = seq_k;
+    }
+    const auto& problem_size = problem_size_local;
+
     enum class WarpGroupRole {
       Producer = 0,
       Consumer0 = 1,
@@ -311,7 +319,7 @@ struct FmhaKernelTmaWarpSpecialized {
           if (is_paged) {
             collective_mainloop.template load_kv_paged<!kLoadsQSeparately>(
               block_rank_in_cluster,
-              blk_coord, params.mainloop, params.problem_size,
+              blk_coord, params.mainloop, problem_size,
               pipeline_inner, smem_pipe_write_inner,
               pipeline_outer, smem_pipe_write_outer,
               storage.tensors.mainloop,
@@ -320,7 +328,7 @@ struct FmhaKernelTmaWarpSpecialized {
           } else {
             collective_mainloop.template load_kv_maybe_q<!kLoadsQSeparately>(
               block_rank_in_cluster,
-              blk_coord, params.mainloop, params.problem_size,
+              blk_coord, params.mainloop, problem_size,
               pipeline_inner, smem_pipe_write_inner,
               pipeline_outer, smem_pipe_write_outer,
               storage.tensors.mainloop,
@@ -337,7 +345,7 @@ struct FmhaKernelTmaWarpSpecialized {
         for (; tile_scheduler.is_valid(); ++tile_scheduler) {
           auto blk_coord = tile_scheduler.get_block_coord();
           collective_mainloop.load_maybe_q(
-            blk_coord, params.mainloop, params.problem_size,
+            blk_coord, params.mainloop, problem_size,
             pipeline_outer, smem_pipe_write_outer,
             storage.tensors.mainloop,
             storage.load_warp_barrier, do_barrier
@@ -348,7 +356,7 @@ struct FmhaKernelTmaWarpSpecialized {
         for (; tile_scheduler.is_valid(); ++tile_scheduler) {
           auto blk_coord = tile_scheduler.get_block_coord();
           collective_mainloop.reduce(
-            blk_coord, params.mainloop, params.problem_size,
+            blk_coord, params.mainloop, problem_size,
             pipeline_reducer, smem_pipe_read_reducer,
             storage.tensors.mainloop
           );
@@ -411,7 +419,7 @@ struct FmhaKernelTmaWarpSpecialized {
           // N-split cooperative: each WG does QK on its N-half + SS PV
           collective_mainloop.compute_ncoop(
             blk_coord, wg_coord,
-            params.mainloop, params.problem_size,
+            params.mainloop, problem_size,
             pipeline_inner, smem_pipe_read_inner,
             pipeline_outer, smem_pipe_read_outer,
             pipeline_reducer, smem_pipe_write_reducer,
@@ -422,7 +430,7 @@ struct FmhaKernelTmaWarpSpecialized {
             if constexpr (kHeadChunkedPV) {
               return collective_mainloop.compute_chunked(
                 blk_coord, wg_coord,
-                params.mainloop, params.problem_size,
+                params.mainloop, problem_size,
                 pipeline_inner, smem_pipe_read_inner,
                 pipeline_outer, smem_pipe_read_outer,
                 pipeline_reducer, smem_pipe_write_reducer,
@@ -431,7 +439,7 @@ struct FmhaKernelTmaWarpSpecialized {
             } else {
               return collective_mainloop.compute(
                 blk_coord, wg_coord,
-                params.mainloop, params.problem_size,
+                params.mainloop, problem_size,
                 pipeline_inner, smem_pipe_read_inner,
                 pipeline_outer, smem_pipe_read_outer,
                 pipeline_reducer, smem_pipe_write_reducer,
@@ -446,7 +454,7 @@ struct FmhaKernelTmaWarpSpecialized {
             CollectiveEpilogue epilogue;
             epilogue(typename CollectiveMainloop::TileShapePV{}, wg_coord,
               result, typename CollectiveMainloop::TiledMmaPV{},
-              params.problem_size, params.epilogue,
+              problem_size, params.epilogue,
               epi_load_pipeline, storage.tensors.epilogue[consumer_warp_group_idx]);
           }
 

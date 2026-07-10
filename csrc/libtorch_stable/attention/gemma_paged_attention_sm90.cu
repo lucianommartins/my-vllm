@@ -1,17 +1,15 @@
 /*
- * SM90 decode launcher — dispatches decode through the SM90 prefill FMHA kernel.
- *
- * Two paths:
- *   1. Direct paged TMA (block_size=64): TMA loads KV tiles directly from
- *      the paged cache using page_table[tile_idx]. No gather kernel.
- *   2. Gather fallback (other block_sizes): gather paged KV → contiguous
- *      buffer → CUTLASS FMHA.
+ * SM90 decode launcher — two paths:
+ *   1. SIMT+paged decode (BLOCK_N=64): register-resident Q/O with paged
+ *      cp.async KV loads. Graph-safe. Supports k_eq_v and non-k_eq_v.
+ *   2. CUTLASS FMHA fallback: for non-64 block sizes via gather.
  *
  * Opt-in via GEMMA_SM90_DECODE=1.
  */
 #include "../torch_utils.h"
 #include "gemma_paged_attention_sm90.cuh"
 #include "gemma_prefill_attention_sm90.cuh"
+#include "gemma_decode_tma_kernel.cuh"
 #include "../../attention/attention_dtypes.h"
 #include "../../cuda_compat.h"
 
@@ -135,26 +133,34 @@ struct PagedDecodeFmhaLauncher {
   FmhaOp fmha_op;
   bool initialized = false;
 
+  int cached_q_batch_stride = 0;
+
   bool init(
       Element* q_ptr, Element* o_ptr, float* lse_ptr,
-      Element* k_cache_ptr,
+      Element* k_cache_ptr, Element* v_cache_ptr,
       int num_q_heads, int gqa_group, int seq_q, int max_kv_len,
       int q_stride, float scale, int sliding_window,
       int num_total_blocks, int block_size,
       int64_t stride_block, int64_t stride_slot,
+      int64_t v_stride_block, int64_t v_stride_slot,
+      int max_num_seqs, int max_blocks_per_seq,
       int device_id, int sm_count, cudaStream_t stream) {
 
+    int q_batch_stride = seq_q * q_stride;
+    cached_q_batch_stride = q_batch_stride;
     auto stride_qo = cute::make_tuple(
-        q_stride, cute::_1{}, cute::make_tuple(HeadDim, HeadDim));
+        q_stride, cute::_1{},
+        cute::make_tuple(HeadDim, q_batch_stride));
     const int kv_bs = max_kv_len * HeadDim;
     auto stride_kv = cute::make_tuple(
         HeadDim, cute::_1{}, cute::make_tuple(kv_bs, HeadDim));
     auto stride_lse = cute::make_tuple(
-        cute::_1{}, cute::make_tuple(seq_q, seq_q));
+        cute::_1{},
+        cute::make_tuple(seq_q, num_q_heads * seq_q));
     int q_offset = max_kv_len;
     auto problem = cute::make_tuple(
-        num_q_heads, 1, seq_q, max_kv_len, HeadDim, sliding_window, q_offset,
-        num_total_blocks);
+        num_q_heads, max_num_seqs, seq_q, max_kv_len, HeadDim,
+        sliding_window, q_offset, num_total_blocks);
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = device_id;
@@ -162,7 +168,7 @@ struct PagedDecodeFmhaLauncher {
 
     typename Kernel::Arguments args{
         problem,
-        {q_ptr, stride_qo, k_cache_ptr, stride_kv, k_cache_ptr, stride_kv,
+        {q_ptr, stride_qo, k_cache_ptr, stride_kv, v_cache_ptr, stride_kv,
          scale, o_ptr, stride_qo, lse_ptr, nullptr, 0},
         {o_ptr, stride_qo, lse_ptr, stride_lse},
         hw_info};
@@ -172,15 +178,10 @@ struct PagedDecodeFmhaLauncher {
     auto status = fmha_op.initialize(args, nullptr, stream);
     if (status != cutlass::Status::kSuccess) return false;
 
-    // Create paged K/V TMA descriptors via make_tma_copy
     auto& p = const_cast<typename Kernel::Params&>(fmha_op.params());
 
-    // Create 4D paged TMA descriptors covering ALL KV heads.
-    // Shape: (block_size, head_dim, (num_blocks, num_kv_heads)).
-    // The batch tuple encodes (num_blocks, num_kv_heads).
-    // Kernel computes kv_head from q_head / gqa_group and selects the right slice.
     int num_kv_heads = num_q_heads / gqa_group;
-    int64_t stride_head = int64_t(HeadDim);  // head_size stride within cache
+    int64_t stride_head = int64_t(HeadDim);
 
     auto gmem_k = cute::make_tensor(
         cute::make_gmem_ptr(k_cache_ptr),
@@ -194,26 +195,27 @@ struct PagedDecodeFmhaLauncher {
     auto tma_k = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, gmem_k, smem_k);
 
     auto gmem_v = cute::make_tensor(
-        cute::make_gmem_ptr(k_cache_ptr),
+        cute::make_gmem_ptr(v_cache_ptr),
         cute::make_layout(
             cute::make_shape(HeadDim, block_size,
                              cute::make_shape(num_total_blocks, num_kv_heads)),
-            cute::make_stride(cute::_1{}, int(stride_slot),
-                              cute::make_stride(int(stride_block),
+            cute::make_stride(cute::_1{}, int(v_stride_slot),
+                              cute::make_stride(int(v_stride_block),
                                                 int(stride_head)))));
     auto smem_v = SmemLayoutV{}(cute::_, cute::_, cute::Int<0>{});
     auto tma_v = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, gmem_v, smem_v);
 
-    auto const& desc_k = tma_k.get_tma_descriptor();
-    auto const& desc_v = tma_v.get_tma_descriptor();
     memcpy(const_cast<CUtensorMap*>(
                p.mainloop.tma_load_k_paged.get_tma_descriptor()),
-           &desc_k, sizeof(CUtensorMap));
+           tma_k.get_tma_descriptor(),
+           sizeof(CUtensorMap));
     memcpy(const_cast<CUtensorMap*>(
                p.mainloop.tma_load_v_paged.get_tma_descriptor()),
-           &desc_v, sizeof(CUtensorMap));
+           tma_v.get_tma_descriptor(),
+           sizeof(CUtensorMap));
 
     p.mainloop.gqa_group = gqa_group;
+    p.mainloop.max_blocks_per_seq = max_blocks_per_seq;
 
     initialized = true;
     return true;
@@ -241,7 +243,52 @@ struct PagedDecodeFmhaLauncher {
 
     return FmhaOp::run(p, stream) == cutlass::Status::kSuccess;
   }
+
+  bool launch_batched(
+      int num_seqs, int max_seq_k,
+      const int* page_table_2d, int max_blocks_per_seq,
+      const int* d_seq_lens,
+      Element* q_buf, Element* o_buf, float* lse_buf,
+      cudaStream_t stream) {
+    auto& p = const_cast<typename Kernel::Params&>(fmha_op.params());
+    get<3>(p.problem_size) = max_seq_k;
+    get<6>(p.problem_size) = max_seq_k;
+    p.mainloop.page_table = page_table_2d;
+    p.mainloop.max_blocks_per_seq = max_blocks_per_seq;
+    p.mainloop.d_seq_lens = d_seq_lens;
+    p.mainloop.ptr_O = o_buf;
+    p.mainloop.ptr_LSE = lse_buf;
+    p.epilogue.ptr_LSE = lse_buf;
+    p.tile_scheduler.grid.z = num_seqs;
+    return FmhaOp::run(p, stream) == cutlass::Status::kSuccess;
+  }
 };
+
+// Batch Q padding: zero-fill + copy each sequence's Q row into padded scratch.
+template <typename Element>
+__global__ void batch_pad_q_kernel(
+    Element* __restrict__ dst, const Element* __restrict__ src,
+    int num_seqs, int src_stride, int dst_seq_stride, int row_elems) {
+  int s = blockIdx.x;
+  if (s >= num_seqs) return;
+  Element* d = dst + s * dst_seq_stride;
+  const Element* q = src + s * src_stride;
+  for (int i = threadIdx.x; i < dst_seq_stride; i += blockDim.x)
+    d[i] = (i < row_elems) ? q[i] : Element(0);
+}
+
+// Batch O copy: extract each sequence's output row from padded scratch.
+template <typename Element>
+__global__ void batch_copy_o_kernel(
+    Element* __restrict__ dst, const Element* __restrict__ src,
+    int num_seqs, int dst_stride, int src_seq_stride, int row_elems) {
+  int s = blockIdx.x;
+  if (s >= num_seqs) return;
+  Element* d = dst + s * dst_stride;
+  const Element* o = src + s * src_seq_stride;
+  for (int i = threadIdx.x; i < row_elems; i += blockDim.x)
+    d[i] = o[i];
+}
 
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE>
@@ -278,7 +325,6 @@ bool gemma_paged_attention_sm90_launcher(
       (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto);
   if constexpr (!DTYPE_OK) return false;
 
-  if (!k_eq_v) return false;
   if (selected_tiles.numel() > 0) return false;
   if (actual_head_size != 256 && actual_head_size != 512) return false;
 
@@ -296,13 +342,7 @@ bool gemma_paged_attention_sm90_launcher(
       query.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
 
-  // Skip SM90 decode during CUDA graph capture — fall through to SM80.
-  // The SM90 path uses host-side APIs (cudaMalloc, cuTensorMapEncode) that
-  // are incompatible with stream capture. After warmup initializes the
-  // launchers, subsequent non-capture calls use graph-safe operations only.
-  cudaStreamCaptureStatus capture_status;
-  cudaStreamIsCapturing(stream, &capture_status);
-  if (capture_status != cudaStreamCaptureStatusNone) return false;
+  const int* seq_lens_ptr = seq_lens.mutable_data_ptr<int>();
 
   static int s_device_id = -1;
   static int s_sm_count = 0;
@@ -315,8 +355,11 @@ bool gemma_paged_attention_sm90_launcher(
   using Element = cutlass::bfloat16_t;
   Element* query_ptr = reinterpret_cast<Element*>(query.data_ptr());
   CACHE_T* k_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
+  CACHE_T* v_cache_ptr = reinterpret_cast<CACHE_T*>(value_cache.data_ptr());
   Element* out_ptr = reinterpret_cast<Element*>(out.data_ptr());
   int* block_tables_ptr = block_tables.mutable_data_ptr<int>();
+  const int64_t v_stride_block = value_cache.stride(0);
+  const int64_t v_stride_slot = value_cache.stride(1);
 
   if (max_seq_len <= 0) return false;
 
@@ -333,95 +376,98 @@ bool gemma_paged_attention_sm90_launcher(
   static Element* o_scratch = nullptr;
   static size_t s_kv_cap = 0, s_lse_cap = 0, s_qo_cap = 0;
   static bool s_launchers_init = false;
+  static int s_max_num_seqs = 0;
 
+  const int q_seq_stride = padded_q * fmha_q_stride;
   const size_t kv_bytes = (size_t)padded_kv * num_q_heads * head_size * sizeof(CACHE_T);
-  const size_t lse_bytes = (size_t)padded_kv * num_q_heads * sizeof(float);
-  const size_t qo_bytes = (size_t)padded_q * num_q_heads * head_size * sizeof(Element);
+  const size_t lse_bytes = (size_t)num_seqs * padded_q * num_q_heads * sizeof(float);
+  const size_t qo_bytes = (size_t)num_seqs * q_seq_stride * sizeof(Element);
+  const int row_elems = num_q_heads * head_size;
 
-  // Allocate/grow buffers (non-graph-safe, but only happens on first/resize calls
-  // during warmup before CUDA graph capture)
-  if (kv_bytes > s_kv_cap) {
-    if (k_expanded) cudaFree(k_expanded);
-    cudaMalloc(&k_expanded, kv_bytes);
-    s_kv_cap = kv_bytes;
-    s_launchers_init = false;
-  }
-  if (lse_bytes > s_lse_cap) {
-    if (lse_scratch) cudaFree(lse_scratch);
-    cudaMalloc(&lse_scratch, lse_bytes);
-    s_lse_cap = lse_bytes;
-  }
-  if (qo_bytes > s_qo_cap) {
-    if (q_scratch) cudaFree(q_scratch);
-    if (o_scratch) cudaFree(o_scratch);
-    cudaMalloc(&q_scratch, qo_bytes);
-    cudaMalloc(&o_scratch, qo_bytes);
-    s_qo_cap = qo_bytes;
-    s_launchers_init = false;
+  // The SIMT+paged path (block_size=64) is fully graph-safe.
+  // The gather fallback path (other block sizes) needs scratch buffers.
+  if constexpr (BLOCK_SIZE != 64) {
+    if (kv_bytes > s_kv_cap) {
+      if (k_expanded) cudaFree(k_expanded);
+      cudaMalloc(&k_expanded, kv_bytes);
+      s_kv_cap = kv_bytes;
+      s_launchers_init = false;
+    }
+    if (lse_bytes > s_lse_cap) {
+      if (lse_scratch) cudaFree(lse_scratch);
+      cudaMalloc(&lse_scratch, lse_bytes);
+      s_lse_cap = lse_bytes;
+    }
   }
 
-  // ---- Try direct paged TMA path (block_size=64 required) ----
+  // ---- Direct paged TMA path (block_size=64 required) ----
   if constexpr (BLOCK_SIZE == 64) {
     const int num_total_blocks = key_cache.size(0);
 
-    static PagedDecodeFmhaLauncher<256> paged_256;
-    static PagedDecodeFmhaLauncher<512> paged_512;
-    static bool s_paged_init = false;
+    // SIMT+paged decode kernel — entirely graph-safe (no host APIs at launch).
+    // Grid: (num_kv_heads, num_seqs). Each CTA handles one (kv_head, seq) pair.
+    // BDY warps share the same K tile (GQA reuse).
+    const dim3 grid(num_kv_heads, num_seqs);
+    constexpr int SIMT_BN = 32;
+    const size_t smem = (size_t)2 * SIMT_BN * head_size * sizeof(Element);
+    float* lse_ptr = (lse_out.numel() > 0)
+        ? reinterpret_cast<float*>(lse_out.data_ptr()) : nullptr;
 
-    if (!s_paged_init) {
-      if (head_size == 256) {
-        if (!paged_256.init(
-                q_scratch, o_scratch, lse_scratch,
-                reinterpret_cast<Element*>(k_cache_ptr),
-                num_q_heads, gqa_group, padded_q, padded_kv,
-                fmha_q_stride, scale, sliding_window,
-                num_total_blocks, BLOCK_SIZE,
-                kv_stride_block, kv_stride_slot,
-                s_device_id, s_sm_count, stream))
-          return false;
-      }
-      if (head_size == 512) {
-        if (!paged_512.init(
-                q_scratch, o_scratch, lse_scratch,
-                reinterpret_cast<Element*>(k_cache_ptr),
-                num_q_heads, gqa_group, padded_q, padded_kv,
-                fmha_q_stride, scale, sliding_window,
-                num_total_blocks, BLOCK_SIZE,
-                kv_stride_block, kv_stride_slot,
-                s_device_id, s_sm_count, stream))
-          return false;
-      }
-      s_paged_init = true;
-    }
+    __nv_bfloat16* out_bf = reinterpret_cast<__nv_bfloat16*>(out_ptr);
+    const __nv_bfloat16* q_bf = reinterpret_cast<const __nv_bfloat16*>(query_ptr);
+    const __nv_bfloat16* k_bf = reinterpret_cast<const __nv_bfloat16*>(k_cache_ptr);
+    const __nv_bfloat16* v_bf = reinterpret_cast<const __nv_bfloat16*>(v_cache_ptr);
 
-    bool ok = true;
-    for (int s = 0; s < num_seqs && ok; s++) {
-      const int* seq_block_table = block_tables_ptr + s * max_num_blocks_per_seq;
+#define LAUNCH_TMA_SIMT(HD, BDY_, BDZ_, KEV, SW)                              \
+    do {                                                                       \
+      auto kernel = gemma_decode_tma_simt_kernel<HD, SIMT_BN, BDY_, BDZ_, KEV, SW>; \
+      { static bool _a = false; if (!_a) {                                     \
+        if (smem > 48*1024)                                                    \
+          cudaFuncSetAttribute(kernel,                                         \
+              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);               \
+        _a = true;                                                             \
+      }}                                                                       \
+      kernel<<<grid, BDY_*BDZ_*32, smem, stream>>>(                            \
+          out_bf, q_bf, k_bf, v_bf,                                \
+          block_tables_ptr, seq_lens_ptr,                                       \
+          num_kv_heads, scale, q_stride, max_num_blocks_per_seq,               \
+          kv_stride_block, kv_stride_slot, kv_stride_head,                     \
+          v_stride_block, v_stride_slot, kv_stride_head,                       \
+          BLOCK_SIZE, sliding_window, lse_ptr);                                \
+    } while (0)
 
-      // Pad Q (1 token → padded_q)
-      cudaMemsetAsync(q_scratch, 0,
-                      padded_q * fmha_q_stride * sizeof(Element), stream);
-      cudaMemcpyAsync(q_scratch, query_ptr + s * q_stride,
-                      q_row_bytes, cudaMemcpyDeviceToDevice, stream);
-
-      int q_offset = max_seq_len;
-
-      // Single launch with all Q heads — kernel selects KV head via GQA mapping
-      if (head_size == 256) {
-        ok = paged_256.launch(max_seq_len, q_offset, seq_block_table,
-                              q_scratch, o_scratch, lse_scratch, stream);
+    if (head_size == 256) {
+      if (k_eq_v) {
+        if (sliding_window > 0)
+          LAUNCH_TMA_SIMT(256, 2, 4, true, true);
+        else
+          LAUNCH_TMA_SIMT(256, 2, 4, true, false);
       } else {
-        ok = paged_512.launch(max_seq_len, q_offset, seq_block_table,
-                              q_scratch, o_scratch, lse_scratch, stream);
+        if (sliding_window > 0)
+          LAUNCH_TMA_SIMT(256, 2, 4, false, true);
+        else
+          LAUNCH_TMA_SIMT(256, 2, 4, false, false);
       }
-
-      // Copy output row 0 → out[s]
-      if (ok) {
-        cudaMemcpyAsync(out_ptr + s * q_stride, o_scratch,
-                        q_row_bytes, cudaMemcpyDeviceToDevice, stream);
+    } else {
+      if (gqa_group <= 2) {
+        if (k_eq_v)
+          LAUNCH_TMA_SIMT(512, 2, 4, true, false);
+        else
+          LAUNCH_TMA_SIMT(512, 2, 4, false, false);
+      } else if (gqa_group <= 4) {
+        if (k_eq_v)
+          LAUNCH_TMA_SIMT(512, 4, 2, true, false);
+        else
+          LAUNCH_TMA_SIMT(512, 4, 2, false, false);
+      } else {
+        if (k_eq_v)
+          LAUNCH_TMA_SIMT(512, 16, 1, true, false);
+        else
+          LAUNCH_TMA_SIMT(512, 16, 1, false, false);
       }
     }
-    return ok;
+#undef LAUNCH_TMA_SIMT
+    return true;
   }
 
   // ---- Gather fallback (block_size != 64) ----

@@ -228,7 +228,7 @@ class GemmaAttentionMetadataBuilder(
             num_common_kv_blocks = common_prefix_len // self.block_size
 
         # Shortest sequence (CPU-side; no GPU sync) for the top-k gate.
-        min_seq_len = int(common_attn_metadata.seq_lens_cpu.min())
+        min_seq_len = 0  # only needed for topk (disabled by default)
 
         return GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -405,6 +405,19 @@ class GemmaAttentionImpl(AttentionImpl):
         self.topk_bounds = os.environ.get("GEMMA_TOPK_EXACT", "0") != "1"
         self.block_bounds: torch.Tensor | None = None
 
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+        fa_ver = get_flash_attn_version(
+            head_size=self.head_size,
+            head_size_v=self.actual_head_size,
+        )
+        if fa_ver == 3:
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                is_fa_version_supported,
+            )
+            if is_fa_version_supported(4):
+                fa_ver = 4
+        self._fa_version = fa_ver
+
         # Pre-allocated empty tensors for the decode hot path (avoids
         # per-layer tensor creation in gemma_paged_attention wrapper).
         self._empty_lse: torch.Tensor | None = None
@@ -492,40 +505,80 @@ class GemmaAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: GemmaAttentionMetadata,
     ) -> torch.Tensor:
-        # Gemma4-optimized tensor-core prefill for all bf16 / non-quantized-KV
-        # layers (hd=512 full and hd=256 sliding-window). fp8/fp16 fall back to
-        # Triton below.
-        if (
-            self.head_size in (256, 512)
-            and self.actual_head_size == self.head_size
-            and query.dtype == torch.bfloat16
-            and not is_quantized_kv_cache(self.kv_cache_dtype)
-        ):
-            mm_ranges = attn_metadata.mm_prefix_range_tensor
-            if mm_ranges is None:
-                mm_ranges = torch.empty(
-                    0, dtype=torch.int32, device=query.device
-                )
-            torch.ops._C.gemma_prefill_attention(
-                output,
-                query,
-                key_cache,
-                value_cache,
-                self.num_kv_heads,
-                self.scale,
-                attn_metadata.block_table,
-                attn_metadata.seq_lens,
-                attn_metadata.query_start_loc,
-                attn_metadata.max_query_len,
-                key_cache.shape[1],
-                self.k_eq_v,
-                self.sliding_window,
-                mm_ranges,
-                False,
-                torch.empty(0, dtype=torch.float32, device=query.device),
-            )
-            return output
+        if attn_metadata.mm_prefix_range_tensor is not None:
+            return self._forward_prefill_custom(
+                query, key_cache, value_cache, output, attn_metadata)
 
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            return self._forward_prefill_triton(
+                query, key_cache, value_cache, output, attn_metadata)
+
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+        )
+
+        n = attn_metadata.num_actual_tokens
+        flash_attn_varlen_func(
+            q=query[:n],
+            k=key_cache,
+            v=value_cache,
+            out=output[:n],
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=(self.sliding_window - 1, 0)
+            if self.sliding_window > 0
+            else (-1, -1),
+            block_table=attn_metadata.block_table,
+            softcap=0.0,
+            fa_version=self._fa_version,
+        )
+        return output
+
+    def _forward_prefill_custom(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+    ) -> torch.Tensor:
+        mm_ranges = attn_metadata.mm_prefix_range_tensor
+        if mm_ranges is None:
+            mm_ranges = torch.empty(
+                0, dtype=torch.int32, device=query.device
+            )
+        torch.ops._C.gemma_prefill_attention(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            self.num_kv_heads,
+            self.scale,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            attn_metadata.query_start_loc,
+            attn_metadata.max_query_len,
+            key_cache.shape[1],
+            self.k_eq_v,
+            self.sliding_window,
+            mm_ranges,
+            False,
+            torch.empty(0, dtype=torch.float32, device=query.device),
+        )
+        return output
+
+    def _forward_prefill_triton(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+    ) -> torch.Tensor:
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,
         )
@@ -672,33 +725,33 @@ class GemmaAttentionImpl(AttentionImpl):
             attn_metadata.common_prefix_len, num_seqs,
         )
 
-        prefix_out = torch.empty_like(query)
         suffix_out = torch.empty_like(query)
-        prefix_lse = torch.empty(nq, num_seqs, dtype=torch.float32, device=dev)
         suffix_lse = torch.empty(nq, num_seqs, dtype=torch.float32, device=dev)
-        empty_mm = torch.empty(0, dtype=torch.int32, device=dev)
 
         # Prefix pass: all decode queries (as one merged sequence) attend to the
-        # shared prefix blocks (block_table row 0), non-causal, via the prefill
-        # kernel. seq_lens=[common_prefix_len], cu_q=[0, num_seqs].
-        torch.ops._C.gemma_prefill_attention(
-            prefix_out,
-            query,
-            key_cache,
-            value_cache,
-            self.num_kv_heads,
-            self.scale,
-            attn_metadata.block_table[:1],
-            attn_metadata.prefix_kv_lens,
-            attn_metadata.cu_prefix_query_lens,
-            num_seqs,            # max_q_len: every decode token is in this seq
-            block_size,
-            self.k_eq_v,
-            0,                   # sliding_window (full layers only here)
-            empty_mm,
-            True,                # non_causal
-            prefix_lse,
+        # shared prefix blocks (block_table row 0), non-causal, via FA4.
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
         )
+
+        prefix_out, prefix_lse_raw = flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=attn_metadata.cu_prefix_query_lens,
+            max_seqlen_q=num_seqs,
+            seqused_k=attn_metadata.prefix_kv_lens,
+            max_seqlen_k=attn_metadata.common_prefix_len,
+            softmax_scale=self.scale,
+            causal=False,
+            window_size=(-1, -1),
+            block_table=attn_metadata.block_table[:1],
+            softcap=0.0,
+            fa_version=self._fa_version,
+            return_softmax_lse=True,
+        )
+        # FA4 LSE shape: (1, nq, num_seqs) -> need (nq, num_seqs)
+        prefix_lse = prefix_lse_raw.squeeze(0)
 
         # Suffix pass: per-request causal decode over the post-prefix KV.
         suffix_bt = attn_metadata.block_table[:, ncb:].contiguous()

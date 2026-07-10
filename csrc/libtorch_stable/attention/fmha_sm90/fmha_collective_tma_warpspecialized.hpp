@@ -246,6 +246,8 @@ struct FmhaMainloopTmaWarpSpecialized {
     TMA_V tma_load_v_paged;
     const int* page_table;
     int gqa_group;
+    int max_blocks_per_seq;
+    const int* d_seq_lens;
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
@@ -347,7 +349,9 @@ struct FmhaMainloopTmaWarpSpecialized {
         params_qk.tma_load_b,   // tma_load_k_paged (placeholder, overwritten for paged)
         params_pv.tma_load_b,   // tma_load_v_paged (placeholder, overwritten for paged)
         nullptr,                 // page_table (null = contiguous mode)
-        1                        // gqa_group (set by paged launcher)
+        1,                       // gqa_group (set by paged launcher)
+        0,                       // max_blocks_per_seq
+        nullptr                  // d_seq_lens (null = use problem_size scalar)
     };
   }
 
@@ -475,10 +479,10 @@ struct FmhaMainloopTmaWarpSpecialized {
     LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
     auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
 
-    LoadPagedK load_k{params.tma_load_k_paged, pipeline, storage.smem_k, params.page_table, params.gqa_group};
+    LoadPagedK load_k{params.tma_load_k_paged, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
     auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
 
-    LoadPagedV load_v{params.tma_load_v_paged, pipeline, storage.smem_v, params.page_table, params.gqa_group};
+    LoadPagedV load_v{params.tma_load_v_paged, pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
     using TileShapePV_Load = cute::conditional_t<kSplitDPV, TileShapePV, TileShapePV_Eff>;
     auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
 

@@ -58,14 +58,18 @@ struct CollectiveLoadTma {
   Params const& params;
   Pipeline& pipeline;
   SharedStorage& storage;
-  const int* page_table;  // device ptr, only used for kPagedK/kPagedV
-  int gqa_group;           // Q heads per KV head, for kPagedK/kPagedV
+  const int* page_table;
+  int gqa_group;
+  int max_blocks_per_seq;
+  int batch_idx;
 
   CUTLASS_DEVICE
   CollectiveLoadTma(Params const& params, Pipeline& pipeline, SharedStorage& storage,
-                    const int* page_table = nullptr, int gqa_group = 1)
+                    const int* page_table = nullptr, int gqa_group = 1,
+                    int max_blocks_per_seq = 0)
     : params(params), pipeline(pipeline), storage(storage),
-      page_table(page_table), gqa_group(gqa_group) {}
+      page_table(page_table), gqa_group(gqa_group),
+      max_blocks_per_seq(max_blocks_per_seq), batch_idx(0) {}
 
   template<class ProblemSize, class TileShape, class BlockCoord>
   CUTLASS_DEVICE auto init_g(ProblemSize const& problem_size, TileShape const& tile_shape,
@@ -130,9 +134,12 @@ struct CollectiveLoadTma {
       ProblemSize const& problem_size, TileShape const& tile_shape,
       BlockCoord const& block_coord, int loop_count
   ) {
+    if constexpr (kKind == LoadKind::kPagedK || kKind == LoadKind::kPagedV) {
+      batch_idx = int(get<1>(get<2>(block_coord)));
+    }
     Tensor g = init_g(problem_size, tile_shape, block_coord, loop_count);
     Tensor s = make_tensor(make_smem_ptr(storage.data()), SmemLayout{});
-  
+
     auto block_tma = params.get_slice(block_rank_in_cluster);
     Tensor ts = block_tma.partition_D(s);
     Tensor tg = block_tma.partition_S(g);
@@ -153,7 +160,7 @@ struct CollectiveLoadTma {
       if constexpr (kKind == LoadKind::kBwdScalar) {
         copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,*tile_iter), get<1>(state)(_,_,smem_pipe_write.index()));
       } else if constexpr (kKind == LoadKind::kPagedK || kKind == LoadKind::kPagedV) {
-        int phys_block = page_table[*tile_iter];
+        int phys_block = page_table[batch_idx * max_blocks_per_seq + *tile_iter];
         copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,_,phys_block), get<1>(state)(_,_,_,smem_pipe_write.index()));
       } else {
         copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,_,*tile_iter), get<1>(state)(_,_,_,smem_pipe_write.index()));
