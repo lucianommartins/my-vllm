@@ -1025,7 +1025,7 @@ __device__ __forceinline__ void ds_mbar_wait(uint64_t* bar, uint32_t parity) {
 
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_N,
           int NUM_WARPS, int GQA_GROUP, bool K_EQ_V, bool USE_SLIDING_WINDOW,
-          bool SPLIT, int MIN_CTA = 1, bool USE_BULK = false>
+          bool SPLIT, int MIN_CTA = 1, bool USE_BULK = false, int STAGES = 2>
 __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
 gemma_decode_stream_kernel(
     scalar_t* __restrict__ out_or_tmp,   // SPLIT ? tmp_out partials : final out
@@ -1109,15 +1109,29 @@ gemma_decode_stream_kernel(
   constexpr bool V_SMEM = (!K_EQ_V) && !V_GMEM;
   constexpr int VBUF = V_SMEM ? KTILE : 0;
   constexpr int STAGE = KTILE + VBUF;
+  static_assert(STAGES == 2 || STAGES == 3, "ring supports 2 or 3 stages");
+  static_assert(!(USE_BULK && STAGES != 2), "bulk path is 2-stage only");
+
+  // QK k-split (bigtile only): with BLOCK_N>=32 the S n-tiles occupy only
+  // NT of the NUM_WARPS warps during QK while the rest idle. Split the
+  // head-dim contraction QK_KS ways across the idle warps; each extra way
+  // stores a partial S to sSk and softmax sums them during its read (no
+  // extra barrier). BLOCK_N==16 keeps QK_KS=1 -> legacy path bit-identical.
+  constexpr int QK_KS =
+      (BLOCK_N >= 32 && (NUM_WARPS % (MT * NT)) == 0 &&
+       (NUM_WARPS / (MT * NT)) > 1 && (DT % (NUM_WARPS / (MT * NT))) == 0)
+          ? (NUM_WARPS / (MT * NT))
+          : 1;
 
   extern __shared__ char ds_smem[];
   cache_t* sQ = reinterpret_cast<cache_t*>(ds_smem);   // [16, LDH]
-  cache_t* sKV = sQ + BLOCK_M * LDH;                    // 2 pipeline stages of K(+V)
-  cache_t* sP = sKV + 2 * STAGE;                        // [16, LDN]
+  cache_t* sKV = sQ + BLOCK_M * LDH;                    // STAGES-deep K(+V) ring
+  cache_t* sP = sKV + STAGES * STAGE;                   // [16, LDN]
   float* sS = reinterpret_cast<float*>(sP + BLOCK_M * LDN);  // [16, LDN]
   float* sM = sS + BLOCK_M * LDN;
   float* sL = sM + BLOCK_M;
   float* sA = sL + BLOCK_M;
+  float* sSk = sA + BLOCK_M;  // [(QK_KS-1) x 16, LDN] k-split S partials
 #define DS_KBUF(s) (sKV + (s) * STAGE)
 #define DS_VBUF(s) (DS_KBUF(s) + KTILE)
 
@@ -1134,7 +1148,8 @@ gemma_decode_stream_kernel(
 
   for (int r = tid; r < BLOCK_M; r += nthreads) { sM[r] = -FLT_MAX; sL[r] = 0.f; }
   // Zero KV stages once so partial-tile tails (n >= n_tok) never feed NaN to QK.
-  for (int i = tid; i < 2 * STAGE; i += nthreads) sKV[i] = static_cast<cache_t>(0);
+  for (int i = tid; i < STAGES * STAGE; i += nthreads)
+    sKV[i] = static_cast<cache_t>(0);
 
   // Stage Q: G group heads at the last position into rows 0..G-1, pad rest 0.
   for (int iv = tid; iv < BLOCK_M * hvps; iv += nthreads) {
@@ -1215,19 +1230,42 @@ gemma_decode_stream_kernel(
   (void)bulk_phase;
 
   __syncthreads();              // Q + zeroed KV + mbarrier init visible
-  DS_STAGE(tile_lo, 0);         // prefetch first tile
+  // Prologue: fill STAGES-1 ring slots (1 for the classic double buffer,
+  // 2 for the 3-stage ring).
+  DS_STAGE(tile_lo, 0);
+  if constexpr (STAGES >= 3) {
+    if (ntiles_local > 1) DS_STAGE(tile_lo + 1, 1);
+  }
 
   for (int t = 0; t < ntiles_local; t++) {
-    const int cur = t & 1;
-    if (t + 1 < ntiles_local) {
-      DS_STAGE(tile_lo + t + 1, (t + 1) & 1);
-      if constexpr (!USE_BULK) __pipeline_wait_prior(1);  // next load in flight
-    } else if constexpr (!USE_BULK) {
-      __pipeline_wait_prior(0);
-    }
-    if constexpr (USE_BULK) {
-      ds_mbar_wait(&ds_mbar[cur], (bulk_phase >> cur) & 1u);
-      bulk_phase ^= (1u << cur);
+    const int cur = (STAGES == 2) ? (t & 1) : (t % STAGES);
+    if constexpr (STAGES == 2) {
+      // Classic depth-1 schedule: issue t+1 BEFORE waiting on t (the issue
+      // overlaps the wait); the end-of-loop barrier protects stage reuse.
+      if (t + 1 < ntiles_local) {
+        DS_STAGE(tile_lo + t + 1, (t + 1) & 1);
+        if constexpr (!USE_BULK) __pipeline_wait_prior(1);
+      } else if constexpr (!USE_BULK) {
+        __pipeline_wait_prior(0);
+      }
+      if constexpr (USE_BULK) {
+        ds_mbar_wait(&ds_mbar[cur], (bulk_phase >> cur) & 1u);
+        bulk_phase ^= (1u << cur);
+      }
+    } else {
+      // 3-stage ring, depth-2, issue-at-top: issue t+2 into stage
+      // (t+2)%3 == (t-1)%3 BEFORE waiting on t, so the issue cost overlaps
+      // the wait (the first 3-stage variant issued post-barrier and
+      // regressed ~4%: the issue landed on the critical path). Safe: the
+      // end-of-loop barrier of iteration t-1 was passed by ALL threads
+      // before any thread entered iteration t, so t-1's stage reads are
+      // complete before this overwrite is issued.
+      if (t + STAGES - 1 < ntiles_local)
+        DS_STAGE(tile_lo + t + STAGES - 1, (t + STAGES - 1) % STAGES);
+      {
+        const int rem = ntiles_local - 1 - t;  // tiles still outstanding
+        __pipeline_wait_prior(rem >= STAGES - 1 ? STAGES - 1 : rem);
+      }
     }
     __syncthreads();
 
@@ -1243,20 +1281,27 @@ gemma_decode_stream_kernel(
     // (Split-K across warps was tried to balance this single-warp phase but was
     // net-negative: the partial-reduction scratch dropped 3->2 CTA/SM and the
     // occupancy loss outweighed the removed barrier. Occupancy wins here.)
-    if (warp < MT * NT) {
-      const int mt = warp / NT, nt = warp % NT;
+    if (warp < MT * NT * QK_KS) {
+      const int kh = warp / (MT * NT);   // k-split slice owned by this warp
+      const int wnt = warp % (MT * NT);
+      const int mt = wnt / NT, nt = wnt % NT;
+      constexpr int KCH = DT / QK_KS;
       wmma::fragment<wmma::accumulator, 16, 16, 16, float> s;
       wmma::fill_fragment(s, 0.0f);
 #pragma unroll
-      for (int kt = 0; kt < DT; kt++) {
+      for (int kk = 0; kk < KCH; kk++) {
+        const int kt = kh * KCH + kk;
         wmma::fragment<wmma::matrix_a, 16, 16, 16, cache_t, wmma::row_major> fa;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, cache_t, wmma::col_major> fb;
         wmma::load_matrix_sync(fa, sQ + mt * 16 * LDH + kt * 16, LDH);
         wmma::load_matrix_sync(fb, kbuf + nt * 16 * LDH + kt * 16, LDH);
         wmma::mma_sync(s, fa, fb, s);
       }
-      wmma::store_matrix_sync(sS + mt * 16 * LDN + nt * 16, s, LDN,
-                              wmma::mem_row_major);
+      float* dst = (kh == 0)
+                       ? (sS + mt * 16 * LDN + nt * 16)
+                       : (sSk + (kh - 1) * BLOCK_M * LDN + mt * 16 * LDN +
+                          nt * 16);
+      wmma::store_matrix_sync(dst, s, LDN, wmma::mem_row_major);
     }
     __syncthreads();
 
@@ -1273,7 +1318,13 @@ gemma_decode_stream_kernel(
         bool valid = (c < BLOCK_N) && (c < n_tok);  // c<BLOCK_N masks BN<32
         if (USE_SLIDING_WINDOW && sliding_window > 0)
           valid = valid && (k_abs > q_abs - sliding_window);
-        sv[cc] = valid ? sS[r * LDN + c] : -FLT_MAX;
+        float sval = sS[r * LDN + c];
+        if constexpr (QK_KS > 1) {
+#pragma unroll
+          for (int j = 0; j < QK_KS - 1; j++)
+            sval += sSk[j * BLOCK_M * LDN + r * LDN + c];
+        }
+        sv[cc] = valid ? sval : -FLT_MAX;
         rmax = fmaxf(rmax, sv[cc]);
       }
 #pragma unroll
@@ -1335,7 +1386,7 @@ gemma_decode_stream_kernel(
         }
       }
     }
-    __syncthreads();
+    __syncthreads();  // stage-reuse guard (issue-at-top relies on it)
   }
 
   // epilogue: store O frags to reused smem (sQ as f32, stride LDH), /L.
@@ -1948,6 +1999,95 @@ __global__ void gemma_split_reduce_kernel(
   scalar_t* out_ptr = out + base * HEAD_SIZE + dim_start;
 #pragma unroll
   for (int e = 0; e < ELEMS; e++) from_float(out_ptr[e], acc[e]);
+}
+
+// ---------------------------------------------------------------------------
+// Split-KV combine v2 (Session 9). The v1 kernel runs ONE WARP per
+// (q_head, seq) — 64 warps total at b=4 — with 32B-strided lane loads:
+// hopelessly under-parallelized and 2x sector over-fetch (measured 16.9us
+// hd512 @33 splits vs FA4's 4.7us). v2: grid (q_heads, seqs, HEAD/128) so
+// every SM gets work at low batch, 64 threads per CTA, each thread owning
+// one dim-PAIR (uint32 loads, consecutive threads -> consecutive dims =
+// fully coalesced), m/l staged once through smem. The per-dim float
+// sequence (M_g fmax order, denom order, per-split FMA order) is IDENTICAL
+// to v1 -> bitwise-identical output. Requires num_splits <= 256 (host
+// falls back to v1 otherwise).
+// ---------------------------------------------------------------------------
+template <typename scalar_t, int HEAD_SIZE>
+__global__ void gemma_split_reduce_v2_kernel(
+    scalar_t* __restrict__ out,            // [num_seqs, num_q_heads, HEAD_SIZE]
+    const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_q_heads, max_parts, HEAD_SIZE]
+    const float* __restrict__ exp_sums,    // [num_seqs, num_q_heads, max_parts] (L)
+    const float* __restrict__ max_logits,  // [num_seqs, num_q_heads, max_parts] (M)
+    const int num_splits,
+    const int max_parts,
+    float* __restrict__ lse_out = nullptr) {  // [num_q_heads,num_seqs] natural-log
+  const int q_head = blockIdx.x;
+  const int seq = blockIdx.y;
+  const int num_q_heads = gridDim.x;
+  const int tid = threadIdx.x;  // 0..63
+  constexpr int NTHREADS = 64;          // one dim-pair each: 128 dims per CTA
+  constexpr int MAX_SPLITS_V2 = 256;
+  static_assert(HEAD_SIZE % 128 == 0);
+  // This CTA's dim-pair: blockIdx.z selects the 128-dim chunk.
+  const int pair = blockIdx.z * NTHREADS + tid;
+
+  const int64_t base = static_cast<int64_t>(seq) * num_q_heads + q_head;
+  const float* m_ptr = max_logits + base * max_parts;
+  const float* l_ptr = exp_sums + base * max_parts;
+
+  __shared__ float s_m[MAX_SPLITS_V2];
+  __shared__ float s_l[MAX_SPLITS_V2];
+  for (int s = tid; s < num_splits; s += NTHREADS) {
+    s_m[s] = m_ptr[s];
+    s_l[s] = l_ptr[s];
+  }
+  __syncthreads();
+
+  // Every thread derives M_g/denom redundantly from smem — same float order
+  // as v1 (s = 0..num_splits-1), so weights are bit-identical.
+  float M_g = -FLT_MAX;
+  for (int s = 0; s < num_splits; s++) M_g = fmaxf(M_g, s_m[s]);
+  float denom = 0.f;
+  for (int s = 0; s < num_splits; s++) {
+    if (s_m[s] > -FLT_MAX) denom += s_l[s] * exp2f(s_m[s] - M_g);
+  }
+  const float inv = (denom > 0.f) ? (1.f / denom) : 0.f;
+
+  if (lse_out != nullptr && tid == 0 && blockIdx.z == 0) {
+    const int num_seqs = gridDim.y;
+    lse_out[(int64_t)q_head * num_seqs + seq] =
+        M_g * 0.69314718055994531f + logf(denom > 0.f ? denom : 1e-30f);
+  }
+
+  // Stage the weights once (reuses s_l), then run the O accumulation
+  // BRANCHLESS + unrolled: with the conditional loads of the naive form the
+  // compiler cannot issue iterations ahead and the loop degenerates into a
+  // serialized dependent-load chain (~11us for 33 splits). Unconditional
+  // loads are safe (tmp_out is fully allocated and empty splits wrote O=0,
+  // w=0) and w=0 contributions add +0.0f — v1-bitwise output preserved.
+  __syncthreads();
+  for (int s = tid; s < num_splits; s += NTHREADS) {
+    s_l[s] = (s_m[s] > -FLT_MAX) ? s_l[s] * exp2f(s_m[s] - M_g) * inv : 0.f;
+  }
+  __syncthreads();
+
+  float acc0 = 0.f, acc1 = 0.f;
+  const scalar_t* o_base = tmp_out + base * max_parts * HEAD_SIZE + 2 * pair;
+#pragma unroll 4
+  for (int s = 0; s < num_splits; s++) {
+    scalar_t o2[2];
+    *reinterpret_cast<uint32_t*>(o2) = *reinterpret_cast<const uint32_t*>(
+        o_base + static_cast<int64_t>(s) * HEAD_SIZE);
+    const float w = s_l[s];
+    acc0 += w * static_cast<float>(o2[0]);
+    acc1 += w * static_cast<float>(o2[1]);
+  }
+  scalar_t r2[2];
+  from_float(r2[0], acc0);
+  from_float(r2[1], acc1);
+  *reinterpret_cast<uint32_t*>(out + base * HEAD_SIZE + 2 * pair) =
+      *reinterpret_cast<uint32_t*>(r2);
 }
 
 }  // namespace gemma

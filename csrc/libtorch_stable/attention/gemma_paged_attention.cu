@@ -72,6 +72,25 @@ static constexpr int DS_MINCTA_256 = 3;
   }
 
 // GQA-reuse + cross-CTA split-KV: phase-1 split kernel + phase-2 combine.
+// Split-KV combine dispatch: v2 (256-thread, coalesced, bitwise-equal math)
+// unless GEMMA_COMBINE=1 or num_splits exceeds v2's smem stage (256).
+// `combine_v2` is a local in the launcher; all macros expand there.
+#define LAUNCH_GEMMA_COMBINE(HEAD, CG, LSE)                                    \
+  do {                                                                         \
+    if (combine_v2 && num_splits <= 256) {                                     \
+      const dim3 cg3((CG).x, (CG).y, (HEAD) / 128);                            \
+      vllm::gemma::gemma_split_reduce_v2_kernel<T, HEAD>                       \
+          <<<cg3, 64, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr,        \
+                                   max_logits_ptr, num_splits, max_parts,     \
+                                   LSE);                                       \
+    } else {                                                                   \
+      vllm::gemma::gemma_split_reduce_kernel<T, HEAD>                          \
+          <<<CG, WARP_SIZE, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr,  \
+                                         max_logits_ptr, num_splits,          \
+                                         max_parts, LSE);                     \
+    }                                                                          \
+  } while (0)
+
 #define LAUNCH_GEMMA_GQA_SPLIT(HEAD_SIZE, ACTUAL_HEAD_SIZE, GROUP, K_EQ_V,     \
                                USE_SW)                                         \
   do {                                                                         \
@@ -93,10 +112,7 @@ static constexpr int DS_MINCTA_256 = 3;
         kv_stride_block, kv_stride_slot, kv_stride_head,                      \
         k_scale_ptr, v_scale_ptr, sliding_window, num_splits, max_parts);     \
     const dim3 combine_grid(num_kv_heads * (GROUP), num_seqs);                 \
-    vllm::gemma::gemma_split_reduce_kernel<T, HEAD_SIZE>                       \
-        <<<combine_grid, WARP_SIZE, 0, stream>>>(                             \
-            out_ptr, tmp_out_ptr, exp_sums_ptr, max_logits_ptr,              \
-            num_splits, max_parts, nullptr);                                 \
+    LAUNCH_GEMMA_COMBINE(HEAD_SIZE, combine_grid, nullptr);                    \
   } while (0)
 
 #define LAUNCH_GEMMA_GQA_SPLIT_GROUP(HEAD_SIZE, ACTUAL_HEAD_SIZE, K_EQ_V,      \
@@ -117,7 +133,8 @@ static constexpr int DS_MINCTA_256 = 3;
 // Phase 1 stream-decode launch. SPLITB selects grid + epilogue (false: final
 // out; true: partials + combine). smem = sQ[16,LDH] + 2 pipeline stages of
 // K(+V if !keqv) + sP[16,LDN] + sS[16,LDN] + sM/sL/sA.
-#define LAUNCH_GEMMA_STREAM(HEAD, BN, NW, MINCTA, GROUP, KEQV, USW, SPLITB)    \
+#define LAUNCH_GEMMA_STREAM(HEAD, BN, NW, MINCTA, GROUP, KEQV, USW, SPLITB,    \
+                            NSTAGE)                                            \
   do {                                                                         \
     const dim3 sgrid = (SPLITB) ? dim3(num_kv_heads, num_seqs, num_splits)     \
                                 : dim3(num_kv_heads, num_seqs);                 \
@@ -127,16 +144,24 @@ static constexpr int DS_MINCTA_256 = 3;
         hd256 !k_eq_v (hd512 !k_eq_v reads V from gmem; k_eq_v reuses K) */      \
     constexpr int SSTAGE =                                                     \
         SKTILE + (((!(KEQV)) && ((HEAD) < 512)) ? SKTILE : 0);                 \
-    size_t ssmem = (size_t)(16 * SLDH + 2 * SSTAGE + 16 * SLDN)                \
+    size_t ssmem = (size_t)(16 * SLDH + (NSTAGE) * SSTAGE + 16 * SLDN)         \
                        * sizeof(CACHE_T)                                       \
                    + (size_t)(16 * SLDN + 3 * 16) * sizeof(float);            \
+    /* QK k-split partial-S buffers — MUST mirror the kernel's QK_KS. */       \
+    constexpr int SKNT = (BN) / 16;                                            \
+    constexpr int SKS =                                                        \
+        ((BN) >= 32 && ((NW) % SKNT) == 0 && ((NW) / SKNT) > 1 &&              \
+         ((((HEAD) / 16)) % ((NW) / SKNT)) == 0)                               \
+            ? ((NW) / SKNT)                                                    \
+            : 1;                                                               \
+    ssmem += (size_t)(SKS - 1) * 16 * SLDN * sizeof(float);                    \
     auto sk = use_bulk                                                         \
         ? vllm::gemma::gemma_decode_stream_kernel<                             \
               T, CACHE_T, HEAD, BN, NW, GROUP, KEQV, USW, SPLITB, MINCTA,     \
-              true>                                                            \
+              true, 2>                                                         \
         : vllm::gemma::gemma_decode_stream_kernel<                             \
               T, CACHE_T, HEAD, BN, NW, GROUP, KEQV, USW, SPLITB, MINCTA,     \
-              false>;                                                          \
+              false, NSTAGE>;                                                  \
     {                                                                          \
       static bool attr_set = false;                                            \
       if (!attr_set) {                                                         \
@@ -157,29 +182,26 @@ static constexpr int DS_MINCTA_256 = 3;
         num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr);           \
     if (SPLITB) {                                                            \
       const dim3 cg(num_kv_heads * (GROUP), num_seqs);                       \
-      vllm::gemma::gemma_split_reduce_kernel<T, HEAD>                        \
-          <<<cg, WARP_SIZE, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr, \
-                                         max_logits_ptr, num_splits,         \
-                                         max_parts, lse_out_ptr);            \
+      LAUNCH_GEMMA_COMBINE(HEAD, cg, lse_out_ptr);                           \
     }                                                                        \
   } while (0)
 
 #define LAUNCH_GEMMA_STREAM_GROUP(HEAD, NW, MINCTA, KEQV, USW, SPLITB)         \
   switch (gqa_group) {                                                         \
     case 1:                                                                    \
-      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 1, KEQV, USW, SPLITB);      \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 1, KEQV, USW, SPLITB, 2);      \
       break;                                                                   \
     case 2:                                                                    \
-      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 2, KEQV, USW, SPLITB);      \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 2, KEQV, USW, SPLITB, 2);      \
       break;                                                                   \
     case 4:                                                                    \
-      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 4, KEQV, USW, SPLITB);      \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 4, KEQV, USW, SPLITB, 2);      \
       break;                                                                   \
     case 8:                                                                    \
-      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 8, KEQV, USW, SPLITB);      \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 8, KEQV, USW, SPLITB, 2);      \
       break;                                                                   \
     case 16:                                                                   \
-      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 16, KEQV, USW, SPLITB);     \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 16, KEQV, USW, SPLITB, 2);     \
       break;                                                                   \
     default: STD_TORCH_CHECK(false, "stream decode bad group ", gqa_group);    \
   }
@@ -198,14 +220,14 @@ static constexpr int DS_MINCTA_256 = 3;
 // or 2 CTA/SM (BN=32). Covers the two gemma-4 decode configs: hd512 k_eq_v
 // full (GROUP 16) and hd256 sliding (GROUP 2). Opt-in via GEMMA_DECODE_BN
 // for A/B against the BLOCK_N=16 default.
-#define LAUNCH_GEMMA_STREAM_BIGTILE(HEAD, BN, MINCTA, GROUP, KEQV, USW)        \
+#define LAUNCH_GEMMA_STREAM_BIGTILE(HEAD, BN, MINCTA, GROUP, KEQV, USW, NST)   \
   do {                                                                         \
     STD_TORCH_CHECK(gqa_group == (GROUP), "bigtile decode expects group ",     \
                     GROUP, ", got ", gqa_group);                               \
     if (num_splits > 1) {                                                      \
-      LAUNCH_GEMMA_STREAM(HEAD, BN, 8, MINCTA, GROUP, KEQV, USW, true);        \
+      LAUNCH_GEMMA_STREAM(HEAD, BN, 8, MINCTA, GROUP, KEQV, USW, true, NST);   \
     } else {                                                                   \
-      LAUNCH_GEMMA_STREAM(HEAD, BN, 8, MINCTA, GROUP, KEQV, USW, false);       \
+      LAUNCH_GEMMA_STREAM(HEAD, BN, 8, MINCTA, GROUP, KEQV, USW, false, NST);  \
     }                                                                          \
   } while (0)
 
@@ -237,10 +259,7 @@ static constexpr int DS_MINCTA_256 = 3;
         selected_tiles_ptr, num_sel);                                        \
     if (SPLITB) {                                                             \
       const dim3 cg(num_kv_heads * (BDY), num_seqs);                          \
-      vllm::gemma::gemma_split_reduce_kernel<T, HEAD>                         \
-          <<<cg, WARP_SIZE, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr,  \
-                                         max_logits_ptr, num_splits,          \
-                                         max_parts, lse_out_ptr);             \
+      LAUNCH_GEMMA_COMBINE(HEAD, cg, lse_out_ptr);                            \
     }                                                                         \
   } while (0)
 
@@ -413,7 +432,7 @@ void gemma_paged_attention_launcher(
   static const int decode_bn = []() {
     const char* e = getenv("GEMMA_DECODE_BN");
     const int v = (e != nullptr) ? atoi(e) : 64;
-    return (v == 32 || v == 64) ? v : 0;
+    return (v == 32 || v == 64 || v == 96) ? v : 0;
   }();
   int num_splits = 1;
   {
@@ -464,7 +483,7 @@ void gemma_paged_attention_launcher(
         ((actual_head_size == 512 && k_eq_v && sliding_window <= 0) ||
          (actual_head_size == 256 && !k_eq_v && sliding_window > 0))) {
       const int n_tiles_bt = (eff_seq + decode_bn - 1) / decode_bn;
-      const int per_sm = (decode_bn == 64) ? 1 : 2;  // CTAs resident per SM
+      const int per_sm = (decode_bn >= 64) ? 1 : 2;  // CTAs resident per SM
       int target = (per_sm * num_sms) / (total_ctas > 0 ? total_ctas : 1);
       if (target > n_tiles_bt) target = n_tiles_bt;
       if (target > max_parts) target = max_parts;
@@ -524,6 +543,12 @@ void gemma_paged_attention_launcher(
     return major >= 9;
   }();
   const bool use_bulk = bulk_env && bulk_sm90;
+  // Split-KV combine version: 2 (default, 256-thread coalesced) | 1 (legacy
+  // one-warp kernel, GEMMA_COMBINE=1). Same float sequence -> bitwise equal.
+  static const bool combine_v2 = []() {
+    const char* e = getenv("GEMMA_COMBINE");
+    return !(e != nullptr && e[0] == '1');
+  }();
   // Opt-in bandwidth-first SIMT decode (k_eq_v only) for A/B vs the wmma stream
   // kernel. Read once. The wmma path is occupancy-limited (~37% -> ~40% DRAM);
   // SIMT trades tensor cores for occupancy to saturate HBM.
@@ -601,12 +626,15 @@ void gemma_paged_attention_launcher(
       if constexpr ((KEQV) && !(USW) && (HS) == 512) {             \
         if (!did_stream && use_stream && decode_bn != 0 &&         \
             gqa_group == 16) {                                     \
-          if (decode_bn == 64) {                                   \
+          if (decode_bn == 96) {                                   \
+            LAUNCH_GEMMA_STREAM_BIGTILE(512, 96, 1, 16, true,      \
+                                        false, 2);                    \
+          } else if (decode_bn == 64) {                            \
             LAUNCH_GEMMA_STREAM_BIGTILE(512, 64, 1, 16, true,      \
-                                        false);                    \
+                                        false, 2);                    \
           } else {                                                 \
             LAUNCH_GEMMA_STREAM_BIGTILE(512, 32, 2, 16, true,      \
-                                        false);                    \
+                                        false, 2);                    \
           }                                                        \
           did_stream = true;                                       \
         }                                                          \
@@ -614,12 +642,12 @@ void gemma_paged_attention_launcher(
       if constexpr (!(KEQV) && (USW) && (HS) == 256) {             \
         if (!did_stream && use_stream && decode_bn != 0 &&         \
             gqa_group == 2) {                                      \
-          if (decode_bn == 64) {                                   \
+          if (decode_bn >= 64) {                                   \
             LAUNCH_GEMMA_STREAM_BIGTILE(256, 64, 1, 2, false,      \
-                                        true);                     \
+                                        true, 2);                     \
           } else {                                                 \
             LAUNCH_GEMMA_STREAM_BIGTILE(256, 32, 2, 2, false,      \
-                                        true);                     \
+                                        true, 2);                     \
           }                                                        \
           did_stream = true;                                       \
         }                                                          \
