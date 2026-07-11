@@ -74,7 +74,8 @@ enum class Tag {
   kAccQK,
 
   kHeadChunkedPV,
-  kSplitDPV
+  kSplitDPV,
+  kKEqV
 };
 
 template<auto kTag, class Value>

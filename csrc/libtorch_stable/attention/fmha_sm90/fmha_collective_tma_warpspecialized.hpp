@@ -71,6 +71,11 @@ struct FmhaMainloopTmaWarpSpecialized {
   static constexpr bool kIsMainloopLocked = find_option_t<Tag::kIsMainloopLocked, false_type, Options...>::value;
   static constexpr bool kHeadChunkedPV = find_option_t<Tag::kHeadChunkedPV, false_type, Options...>::value;
   static constexpr bool kSplitDPV = find_option_t<Tag::kSplitDPV, false_type, Options...>::value;
+  // k_eq_v (Gemma global layers, V == K): PV reads V from the K smem stage
+  // (smem_k/smem_v are a union with physically-identical transposed layouts),
+  // the producer skips V loads, and the pipeline uses ONE slot per k-tile
+  // (2x tile depth at the same smem). Split-D consumer (compute_ncoop) only.
+  static constexpr bool kKEqV = find_option_t<Tag::kKEqV, false_type, Options...>::value;
 
   static constexpr int NumLoadWarpGroups = 1;
   static constexpr int NumMmaWarpGroups = find_option_t<Tag::kNumMmaWarpGroups, Int<2>, Options...>::value;
@@ -85,6 +90,7 @@ struct FmhaMainloopTmaWarpSpecialized {
   static_assert(kSplitDPV || StagesQ::value >= NumMmaWarpGroups);
   static_assert(!kSplitDPV || StagesQ::value >= 1);
   static_assert(Stages::value >= 2);
+  static_assert(!kKEqV || kSplitDPV, "kKEqV implemented for the split-D path only");
 
   // 16B alignment lets us use TMA
   static constexpr int Alignment = 16 / sizeof(Element);
@@ -248,6 +254,9 @@ struct FmhaMainloopTmaWarpSpecialized {
     int gqa_group;
     int max_blocks_per_seq;
     const int* d_seq_lens;
+    // GQA-dense CONTIGUOUS KV buffers (prefill de-GQA): q-head -> kv-head
+    // divisor for the kK/kV loaders. 1 = legacy expanded buffers.
+    int contig_gqa_group;
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
@@ -351,7 +360,8 @@ struct FmhaMainloopTmaWarpSpecialized {
         nullptr,                 // page_table (null = contiguous mode)
         1,                       // gqa_group (set by paged launcher)
         0,                       // max_blocks_per_seq
-        nullptr                  // d_seq_lens (null = use problem_size scalar)
+        nullptr,                 // d_seq_lens (null = use problem_size scalar)
+        1                        // contig_gqa_group (set by prefill launcher)
     };
   }
 
@@ -360,10 +370,10 @@ struct FmhaMainloopTmaWarpSpecialized {
     cute::prefetch_tma_descriptor(params.tma_load_q.get_tma_descriptor());
     if (params.page_table != nullptr) {
       cute::prefetch_tma_descriptor(params.tma_load_k_paged.get_tma_descriptor());
-      cute::prefetch_tma_descriptor(params.tma_load_v_paged.get_tma_descriptor());
+      if constexpr (!kKEqV) cute::prefetch_tma_descriptor(params.tma_load_v_paged.get_tma_descriptor());
     } else {
       cute::prefetch_tma_descriptor(params.tma_load_k.get_tma_descriptor());
-      cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
+      if constexpr (!kKEqV) cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
     }
     if constexpr (kHeadChunkedPV) {
       cute::prefetch_tma_descriptor(params.tma_load_v_hi.get_tma_descriptor());
@@ -401,15 +411,18 @@ struct FmhaMainloopTmaWarpSpecialized {
     int fusion_tile_start = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
     auto k_tile_iter = cute::make_coord_iterator(fusion_tile_count);
     for (int i = 0; i < fusion_tile_start; ++i) { ++k_tile_iter; }
-    int k_tile_count = 2 * (fusion_tile_count - fusion_tile_start);
+    // kKEqV: one pipeline slot per k-tile (K only); else two (K then V).
+    int k_tile_count = (kKEqV ? 1 : 2) * (fusion_tile_count - fusion_tile_start);
 
     LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
     auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
 
-    LoadK load_k{params.tma_load_k, pipeline, storage.smem_k};
+    LoadK load_k{params.tma_load_k, pipeline, storage.smem_k, nullptr,
+                 params.contig_gqa_group};
     auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
 
-    LoadV load_v{params.tma_load_v, pipeline, storage.smem_v};
+    LoadV load_v{params.tma_load_v, pipeline, storage.smem_v, nullptr,
+                 params.contig_gqa_group};
     // split-D: load full 512-col V (both N-tiles), not TileShapePV_Eff (256 cols)
     using TileShapePV_Load = cute::conditional_t<kSplitDPV, TileShapePV, TileShapePV_Eff>;
     auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
@@ -418,7 +431,11 @@ struct FmhaMainloopTmaWarpSpecialized {
       load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
     }
 
-    load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    if constexpr (kKEqV) {
+      load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    } else {
+      load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    }
 
     if constexpr (kLoadQ) {
       load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
@@ -432,7 +449,8 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     }
 
-    load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    if constexpr (!kKEqV)
+      load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
 
     if constexpr (kLoadQ) {
       while (q_tile_count > 0) {
@@ -442,8 +460,12 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
-      load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
-      load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+      if constexpr (kKEqV) {
+        load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+      } else {
+        load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+        load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+      }
     }
   }
 
@@ -478,7 +500,8 @@ struct FmhaMainloopTmaWarpSpecialized {
     int fusion_tile_start = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
     auto k_tile_iter = cute::make_coord_iterator(fusion_tile_count);
     for (int i = 0; i < fusion_tile_start; ++i) { ++k_tile_iter; }
-    int k_tile_count = 2 * (fusion_tile_count - fusion_tile_start);
+    // kKEqV: one pipeline slot per k-tile (K only); else two (K then V).
+    int k_tile_count = (kKEqV ? 1 : 2) * (fusion_tile_count - fusion_tile_start);
 
     LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
     auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
@@ -494,7 +517,11 @@ struct FmhaMainloopTmaWarpSpecialized {
       load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
     }
 
-    load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    if constexpr (kKEqV) {
+      load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    } else {
+      load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    }
 
     if constexpr (kLoadQ) {
       load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
@@ -508,7 +535,8 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     }
 
-    load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+    if constexpr (!kKEqV)
+      load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
 
     if constexpr (kLoadQ) {
       while (q_tile_count > 0) {
@@ -518,8 +546,12 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
-      load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
-      load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+      if constexpr (kKEqV) {
+        load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+      } else {
+        load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+        load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+      }
     }
   }
 
@@ -873,7 +905,7 @@ struct FmhaMainloopTmaWarpSpecialized {
                     tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
       warpgroup_commit_batch();
       math_wg_order_barrier.arrive();
-      ++smem_pipe_read;
+      if constexpr (!kKEqV) ++smem_pipe_read;  // kKEqV: V = same slot as K
 
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc_qk);
@@ -1229,7 +1261,7 @@ struct FmhaMainloopTmaWarpSpecialized {
                     tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
       warpgroup_commit_batch();
       math_wg_order_barrier.arrive();
-      ++smem_pipe_read;
+      if constexpr (!kKEqV) ++smem_pipe_read;  // kKEqV: V = same slot as K
 
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc_qk);
@@ -1255,8 +1287,10 @@ struct FmhaMainloopTmaWarpSpecialized {
       gemm_zero_acc(tiled_mma_pv, tOsP(_,_,_,_0{}), tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
       warpgroup_commit_batch();
 
-      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
-      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      if constexpr (!kKEqV) {
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      }
       ++smem_pipe_read;
       tPcP.data() = tPcP.data() + E<1>{} * int(get<1>(TileShapeQK{}));
     }
@@ -1274,12 +1308,18 @@ struct FmhaMainloopTmaWarpSpecialized {
       gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
                     tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
       warpgroup_commit_batch();
-      ++smem_pipe_read;
+      if constexpr (!kKEqV) ++smem_pipe_read;  // kKEqV: V = same slot as K
       auto tok = pipeline.consumer_try_wait(smem_pipe_read);
 
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc_qk);
       warpgroup_fence_operand(acc_pv);
+      if constexpr (kKEqV) {
+        // Deferred stage release: wait<0> above drained PV(t-1), which read
+        // this slot as V. Releasing at PV-commit time lets the producer
+        // TMA-overwrite a stage the async MMA is still reading.
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      }
 
       pre_step_max_exchange(acc_qk);
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
@@ -1300,8 +1340,10 @@ struct FmhaMainloopTmaWarpSpecialized {
       gemm_reset_zero_acc(tiled_mma_pv, tOsP(_,_,_,_0{}), tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
       warpgroup_commit_batch();
 
-      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
-      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      if constexpr (!kKEqV) {
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      }
       ++smem_pipe_read;
       tPcP.data() = tPcP.data() + E<1>{} * int(get<1>(TileShapeQK{}));
     }
@@ -1489,7 +1531,7 @@ struct FmhaMainloopTmaWarpSpecialized {
                     tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
       warpgroup_commit_batch();
       math_wg_order_barrier.arrive();
-      ++smem_pipe_read;
+      if constexpr (!kKEqV) ++smem_pipe_read;  // kKEqV: V = same slot as K
 
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc_qk);
@@ -1533,12 +1575,18 @@ struct FmhaMainloopTmaWarpSpecialized {
       gemm_zero_acc(tiled_mma_qk, tSrQ(_,_,_,smem_pipe_read_q.index()),
                     tSrK(_,_,_,smem_pipe_read.index()), acc_qk);
       warpgroup_commit_batch();
-      ++smem_pipe_read;
+      if constexpr (!kKEqV) ++smem_pipe_read;  // kKEqV: V = same slot as K
       auto tok = pipeline.consumer_try_wait(smem_pipe_read);
 
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc_qk);
       warpgroup_fence_operand(acc_pv);
+      if constexpr (kKEqV) {
+        // Deferred stage release: wait<0> above drained PV(t-1), which read
+        // this slot as V. Releasing at PV-commit time lets the producer
+        // TMA-overwrite a stage the async MMA is still reading.
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      }
 
       Tensor old_max = make_fragment_like(s_max);
       cute::copy(s_max, old_max);

@@ -21,7 +21,7 @@ namespace sm90 {
 
 using GemmaCausalFusion = cutlass::fmha::collective::SlidingWindowCausalFusion;
 
-template <int HeadDim>
+template <int HeadDim, bool KEqV = false>
 struct GemmaFmhaTypes {
   using Element = cutlass::bfloat16_t;
   using ElementAccumulatorQK = float;
@@ -60,7 +60,10 @@ struct GemmaFmhaTypes {
           cute::Int<kStagesKV>>,
       cutlass::fmha::kernel::Option<
           cutlass::fmha::kernel::Tag::kSplitDPV,
-          cute::bool_constant<kSplitDPV>>>::Kernel;
+          cute::bool_constant<kSplitDPV>>,
+      cutlass::fmha::kernel::Option<
+          cutlass::fmha::kernel::Tag::kKEqV,
+          cute::bool_constant<KEqV>>>::Kernel;
 };
 
 }  // namespace sm90

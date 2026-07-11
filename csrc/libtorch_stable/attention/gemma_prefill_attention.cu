@@ -70,7 +70,8 @@ bool gemma_prefill_sm90_launcher(
     torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
     int max_q_len, int page_size, bool k_eq_v, int sliding_window,
     torch::stable::Tensor& mm_prefix_ranges, bool non_causal,
-    torch::stable::Tensor& lse_out);
+    torch::stable::Tensor& lse_out, torch::stable::Tensor& seq_lens_cpu,
+    torch::stable::Tensor& cu_seqlens_q_cpu);
 #endif
 
 template <typename T, typename CACHE_T>
@@ -81,7 +82,8 @@ void gemma_prefill_launcher(
     torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
     int max_q_len, int page_size, bool k_eq_v, int sliding_window,
     torch::stable::Tensor& mm_prefix_ranges, bool non_causal,
-    torch::stable::Tensor& lse_out) {
+    torch::stable::Tensor& lse_out, torch::stable::Tensor& seq_lens_cpu,
+    torch::stable::Tensor& cu_seqlens_q_cpu) {
   const int num_q_heads = query.size(1);
   const int head_size = query.size(2);
   const int num_seqs = seq_lens.size(0);
@@ -135,7 +137,8 @@ void gemma_prefill_launcher(
       bool handled = gemma_prefill_sm90_launcher<T, CACHE_T>(
           out, query, key_cache, value_cache, num_kv_heads, scale,
           block_tables, seq_lens, cu_seqlens_q, max_q_len, page_size,
-          k_eq_v, sliding_window, mm_prefix_ranges, non_causal, lse_out);
+          k_eq_v, sliding_window, mm_prefix_ranges, non_causal, lse_out,
+          seq_lens_cpu, cu_seqlens_q_cpu);
       if (handled) return;
     }
   }
@@ -175,12 +178,15 @@ void gemma_prefill_attention(
     torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
     int64_t max_q_len, int64_t block_size, bool k_eq_v,
     int64_t sliding_window, torch::stable::Tensor& mm_prefix_ranges,
-    bool non_causal, torch::stable::Tensor& lse_out) {
+    bool non_causal, torch::stable::Tensor& lse_out,
+    torch::stable::Tensor& seq_lens_cpu,
+    torch::stable::Tensor& cu_seqlens_q_cpu) {
   STD_TORCH_CHECK(
       query.scalar_type() == torch::headeronly::ScalarType::BFloat16,
       "Gemma prefill kernel currently supports bfloat16 only");
   gemma_prefill_launcher<__nv_bfloat16, __nv_bfloat16>(
       out, query, key_cache, value_cache, num_kv_heads, (float)scale,
       block_tables, seq_lens, cu_seqlens_q, max_q_len, block_size, k_eq_v,
-      sliding_window, mm_prefix_ranges, non_causal, lse_out);
+      sliding_window, mm_prefix_ranges, non_causal, lse_out, seq_lens_cpu,
+      cu_seqlens_q_cpu);
 }

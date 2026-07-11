@@ -79,7 +79,13 @@ struct CollectiveLoadTma {
     if constexpr (kKind == LoadKind::kK) {
       Tensor mK_full = params.get_tma_tensor(make_shape(get<3>(problem_size), get<4>(problem_size), select<0,1>(problem_size)));
       Tensor gK_full = local_tile(mK_full, tile_shape, make_coord(_, _, _), Step<X, _1, _1>{});
-      Tensor gK = gK_full(_, _, _, _0{}, get<2>(blk_coord));
+      // GQA-dense contiguous KV (prefill de-GQA): batch stride is per KV
+      // head; map the q-head coord down. gqa_group==1 (default) keeps the
+      // legacy expanded-buffer behavior.
+      auto kv_coord_k = make_coord(
+          int(get<0>(get<2>(blk_coord))) / (gqa_group > 0 ? gqa_group : 1),
+          get<1>(get<2>(blk_coord)));
+      Tensor gK = gK_full(_, _, _, _0{}, kv_coord_k);
       return gK;
     } else if constexpr (kKind == LoadKind::kQ) {
       Tensor mQ_full = params.get_tma_tensor(make_shape(get<2>(problem_size), get<4>(problem_size), select<0,1>(problem_size)));
@@ -89,7 +95,10 @@ struct CollectiveLoadTma {
     } else if constexpr (kKind == LoadKind::kV) {
       Tensor mV_full = params.get_tma_tensor(make_shape(get<4>(problem_size), get<3>(problem_size), select<0,1>(problem_size)));
       Tensor gV_full = local_tile(mV_full, tile_shape, make_coord(_, _, _), Step<X, _1, _1>{});
-      Tensor gV = gV_full(_, _, _0{}, _, get<2>(blk_coord));
+      auto kv_coord_v = make_coord(
+          int(get<0>(get<2>(blk_coord))) / (gqa_group > 0 ? gqa_group : 1),
+          get<1>(get<2>(blk_coord)));
+      Tensor gV = gV_full(_, _, _0{}, _, kv_coord_v);
       return gV;
     } else if constexpr (kKind == LoadKind::kPagedK) {
       // Paged K: TMA covers (block_size, head_dim, (num_blocks, num_kv_heads)).

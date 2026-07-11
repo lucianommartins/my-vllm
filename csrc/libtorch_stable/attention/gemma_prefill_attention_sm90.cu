@@ -50,9 +50,9 @@ __global__ void gather_kv_expanded_kernel(
                h_kv * stride_head + d];
 }
 
-template <int HeadDim>
+template <int HeadDim, bool KEqV = false>
 struct FmhaCachedLauncher {
-  using FmhaTypes = vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim>;
+  using FmhaTypes = vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV>;
   using Kernel = typename FmhaTypes::Kernel;
   using FmhaOp = cutlass::device::Universal<Kernel>;
 
@@ -70,6 +70,7 @@ struct FmhaCachedLauncher {
       cutlass::bfloat16_t* o_ptr,
       float* lse_ptr,
       int num_q_heads,
+      int gqa_group,
       int seq_q,
       int seq_k,
       int q_offset,
@@ -153,13 +154,18 @@ struct FmhaCachedLauncher {
       p.mainloop.ptr_LSE = lse_ptr;
     }
 
+    {
+      // GQA-dense KV buffers: loaders divide the q-head coord by this.
+      auto& p = const_cast<typename Kernel::Params&>(fmha_op.params());
+      p.mainloop.contig_gqa_group = gqa_group;
+    }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
                == cutlass::Status::kSuccess;
   }
 };
 
-template <int HeadDim>
+template <int HeadDim, bool KEqV = false>
 static bool launch_fmha_batched(
     cutlass::bfloat16_t* q_ptr,
     cutlass::bfloat16_t* k_ptr,
@@ -167,6 +173,7 @@ static bool launch_fmha_batched(
     cutlass::bfloat16_t* o_ptr,
     float* lse_ptr,
     int num_q_heads,
+    int gqa_group,
     int seq_q,
     int seq_k,
     int q_offset,
@@ -178,9 +185,9 @@ static bool launch_fmha_batched(
     int device_id,
     int sm_count,
     cudaStream_t stream) {
-  static FmhaCachedLauncher<HeadDim> launcher;
+  static FmhaCachedLauncher<HeadDim, KEqV> launcher;
   return launcher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, num_q_heads,
-                         seq_q, seq_k, q_offset, q_stride, scale,
+                         gqa_group, seq_q, seq_k, q_offset, q_stride, scale,
                          sliding_window, mm_ranges_ptr, max_mm_ranges,
                          device_id, sm_count, stream);
 }
@@ -193,7 +200,8 @@ bool gemma_prefill_sm90_launcher(
     torch::stable::Tensor& seq_lens, torch::stable::Tensor& cu_seqlens_q,
     int max_q_len, int page_size, bool k_eq_v, int sliding_window,
     torch::stable::Tensor& mm_prefix_ranges, bool non_causal,
-    torch::stable::Tensor& lse_out) {
+    torch::stable::Tensor& lse_out, torch::stable::Tensor& seq_lens_cpu,
+    torch::stable::Tensor& cu_seqlens_q_cpu) {
 
   static const bool forced = []() {
     const char* e = getenv("GEMMA_SM90_PREFILL");
@@ -245,7 +253,7 @@ bool gemma_prefill_sm90_launcher(
 
   const int max_padded = (seq_len + kAlignment - 1) / kAlignment * kAlignment;
   const size_t kv_expanded_bytes =
-      (size_t)max_padded * num_q_heads * head_size * sizeof(CACHE_T);
+      (size_t)max_padded * num_kv_heads * head_size * sizeof(CACHE_T);
   const size_t lse_bytes = (size_t)max_padded * num_q_heads * sizeof(float);
   const size_t qo_scratch_bytes =
       (size_t)max_padded * num_q_heads * head_size * sizeof(T);
@@ -281,28 +289,45 @@ bool gemma_prefill_sm90_launcher(
     s_qo_cap = qo_scratch_bytes;
   }
 
-  // For variable-length sequences: sync cu_seqlens_q to host (rare path)
+  // For variable-length sequences: cu_seqlens_q on host. Prefer the CPU
+  // metadata twin (zero sync); D2H fallback otherwise.
+  const bool have_cpu_sl = seq_lens_cpu.numel() >= num_seqs;
+  const bool have_cpu_cu = cu_seqlens_q_cpu.numel() >= num_seqs + 1;
   std::vector<int> h_cu_seqlens_q;
   if (!equal_lens) {
     h_cu_seqlens_q.resize(num_seqs + 1);
-    cudaMemcpyAsync(h_cu_seqlens_q.data(),
-                    cu_seqlens_q.mutable_data_ptr<int>(),
-                    (num_seqs + 1) * sizeof(int),
-                    cudaMemcpyDeviceToHost, stream);
+    if (have_cpu_cu) {
+      const int* p_cu = cu_seqlens_q_cpu.mutable_data_ptr<int>();
+      std::copy(p_cu, p_cu + num_seqs + 1, h_cu_seqlens_q.begin());
+    } else {
+      cudaMemcpyAsync(h_cu_seqlens_q.data(),
+                      cu_seqlens_q.mutable_data_ptr<int>(),
+                      (num_seqs + 1) * sizeof(int),
+                      cudaMemcpyDeviceToHost, stream);
+    }
   }
   // Total (context + new) length per sequence: extends (chunked prefill,
   // prefix-cache hits) have kv_len > q_len; the kernel needs the real KV
-  // extent and q_offset = kv_len - q_len. One small D2H per prefill call.
+  // extent and q_offset = kv_len - q_len. Prefer the CPU metadata twins
+  // (zero sync); the D2H+sync fallback drains the stream PER LAYER CALL
+  // (~11ms/step measured) and only runs when CPU tensors are absent.
   std::vector<int> h_seq_lens(num_seqs);
-  cudaMemcpyAsync(h_seq_lens.data(), seq_lens.mutable_data_ptr<int>(),
-                  num_seqs * sizeof(int), cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);
+  if (have_cpu_sl) {
+    const int* p_sl = seq_lens_cpu.mutable_data_ptr<int>();
+    std::copy(p_sl, p_sl + num_seqs, h_seq_lens.begin());
+    if (!equal_lens && !have_cpu_cu)
+      cudaStreamSynchronize(stream);  // cu D2H fallback issued above
+  } else {
+    cudaMemcpyAsync(h_seq_lens.data(), seq_lens.mutable_data_ptr<int>(),
+                    num_seqs * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+  }
   int max_kv_len = 0;
   for (int s2 = 0; s2 < num_seqs; s2++)
     max_kv_len = std::max(max_kv_len, h_seq_lens[s2]);
   // Re-grow the expanded-KV scratch for the KV extent (sized for q above).
   const size_t kv_needed =
-      (size_t)max_kv_len * num_q_heads * head_size * sizeof(CACHE_T);
+      (size_t)max_kv_len * num_kv_heads * head_size * sizeof(CACHE_T);
   if (kv_needed > s_kv_cap) {
     if (k_expanded) cudaFree(k_expanded);
     cudaMalloc(&k_expanded, kv_needed);
@@ -328,9 +353,10 @@ bool gemma_prefill_sm90_launcher(
     const int padded_sl_s = (seq_len_s + kAlignment - 1) / kAlignment * kAlignment;
     const bool needs_pad_s = (padded_sl_s != seq_len_s);
 
-    // Gather the FULL kv range [0, kv_len) densely ([kv_len, hd] per
-    // expanded head): extends need the context, not just the new tokens.
-    const int total_elems = num_q_heads * kv_len_s * head_size;
+    // Gather the FULL kv range [0, kv_len) DENSE PER KV HEAD ([kv_len, hd]
+    // x num_kv_heads — no GQA expansion; the kernel-side loaders map q-head
+    // -> kv-head via contig_gqa_group). Extends need the whole context.
+    const int total_elems = num_kv_heads * kv_len_s * head_size;
     constexpr int kThreads = 256;
     const int gather_blocks = (total_elems + kThreads - 1) / kThreads;
     const int* seq_block_table =
@@ -338,15 +364,16 @@ bool gemma_prefill_sm90_launcher(
 
     gather_kv_expanded_kernel<CACHE_T><<<gather_blocks, kThreads, 0, stream>>>(
         k_expanded, key_cache_ptr, seq_block_table, kv_len_s, kv_len_s,
-        num_q_heads, num_kv_heads, head_size, gqa_group, page_size,
+        num_kv_heads, num_kv_heads, head_size, /*gqa_group=*/1, page_size,
         kv_stride_block, kv_stride_slot, kv_stride_head);
 
     if (!k_eq_v) {
       gather_kv_expanded_kernel<CACHE_T>
           <<<gather_blocks, kThreads, 0, stream>>>(
               v_expanded, value_cache_ptr, seq_block_table, kv_len_s,
-              kv_len_s, num_q_heads, num_kv_heads, head_size, gqa_group,
-              page_size, kv_stride_block, kv_stride_slot, kv_stride_head);
+              kv_len_s, num_kv_heads, num_kv_heads, head_size,
+              /*gqa_group=*/1, page_size,
+              kv_stride_block, kv_stride_slot, kv_stride_head);
     }
 
     Element* q_src = query_ptr + token_offset * q_stride;
@@ -380,14 +407,21 @@ bool gemma_prefill_sm90_launcher(
 
     if (head_size == 256) {
       ok = launch_fmha_batched<256>(q_fmha, k, v, o_fmha, lse_scratch,
-                                    num_q_heads, padded_sl_s, kv_len_s,
-                                    q_off_s, fmha_q_stride, scale,
+                                    num_q_heads, gqa_group, padded_sl_s,
+                                    kv_len_s, q_off_s, fmha_q_stride, scale,
+                                    sliding_window, seq_mm_ranges, seq_max_mm,
+                                    s_device_id, s_sm_count, stream);
+    } else if (k_eq_v) {
+      // Gemma global layers: V == K -> single-slot pipeline, no V TMA loads.
+      ok = launch_fmha_batched<512, true>(q_fmha, k, v, o_fmha, lse_scratch,
+                                    num_q_heads, gqa_group, padded_sl_s,
+                                    kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
                                     s_device_id, s_sm_count, stream);
     } else {
       ok = launch_fmha_batched<512>(q_fmha, k, v, o_fmha, lse_scratch,
-                                    num_q_heads, padded_sl_s, kv_len_s,
-                                    q_off_s, fmha_q_stride, scale,
+                                    num_q_heads, gqa_group, padded_sl_s,
+                                    kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
                                     s_device_id, s_sm_count, stream);
     }
@@ -406,4 +440,4 @@ template bool gemma_prefill_sm90_launcher<__nv_bfloat16, __nv_bfloat16>(
     torch::stable::Tensor&, torch::stable::Tensor&, torch::stable::Tensor&,
     torch::stable::Tensor&, int, float, torch::stable::Tensor&,
     torch::stable::Tensor&, torch::stable::Tensor&, int, int, bool, int,
-    torch::stable::Tensor&, bool, torch::stable::Tensor&);
+    torch::stable::Tensor&, bool, torch::stable::Tensor&, torch::stable::Tensor&, torch::stable::Tensor&);

@@ -117,6 +117,11 @@ class GemmaAttentionMetadata:
     # Shortest sequence in the batch, computed CPU-side once per step (avoids a
     # per-layer GPU->CPU sync in the top-k gate). 0 when unset.
     min_seq_len: int = 0
+    # Host-side twins of seq_lens / query_start_loc: the custom prefill op
+    # reads per-seq lengths on the CPU; passing these avoids a per-layer
+    # D2H + stream sync in the SM90 launcher.
+    seq_lens_cpu: torch.Tensor | None = None
+    query_start_loc_cpu: torch.Tensor | None = None
     # Multimodal bidirectional ("mm-prefix") image-token spans. Field names match
     # what Gemma4ForConditionalGeneration._clear_mm_prefix_for_full_attn_layers
     # looks for (it nulls these on full-attention layers so only sliding layers
@@ -239,6 +244,8 @@ class GemmaAttentionMetadataBuilder(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             min_seq_len=min_seq_len,
+            seq_lens_cpu=common_attn_metadata.seq_lens_cpu,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             mm_prefix_range=mm_ranges,
             mm_prefix_range_tensor=mm_range_tensor,
             use_cascade=use_cascade,
@@ -558,6 +565,9 @@ class GemmaAttentionImpl(AttentionImpl):
             mm_ranges = torch.empty(
                 0, dtype=torch.int32, device=query.device
             )
+        empty_i32 = torch.empty(0, dtype=torch.int32)
+        seq_lens_cpu = attn_metadata.seq_lens_cpu
+        q_start_cpu = attn_metadata.query_start_loc_cpu
         torch.ops._C.gemma_prefill_attention(
             output,
             query,
@@ -575,6 +585,8 @@ class GemmaAttentionImpl(AttentionImpl):
             mm_ranges,
             False,
             torch.empty(0, dtype=torch.float32, device=query.device),
+            seq_lens_cpu if seq_lens_cpu is not None else empty_i32,
+            q_start_cpu if q_start_cpu is not None else empty_i32,
         )
         return output
 
