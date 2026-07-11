@@ -58,7 +58,10 @@ struct FmhaCachedLauncher {
 
   FmhaOp fmha_op;
   int cached_seq_len = 0;
+  int cached_seq_k = 0;
+  int cached_q_offset = -1;
   int cached_num_q_heads = 0;
+  int cached_sliding_window = -1;
 
   bool launch(
       cutlass::bfloat16_t* q_ptr,
@@ -69,6 +72,7 @@ struct FmhaCachedLauncher {
       int num_q_heads,
       int seq_q,
       int seq_k,
+      int q_offset,
       int q_stride,
       float scale,
       int sliding_window,
@@ -77,19 +81,31 @@ struct FmhaCachedLauncher {
       int device_id,
       int sm_count,
       cudaStream_t stream) {
+    // Key must cover everything baked into Params: seq_q, seq_k (drives the
+    // KV extents AND q_offset = seq_k - seq_q for extends/chunked prefill),
+    // heads, and the sliding window. Keying on seq_q alone served stale
+    // Params to every extend that followed a full prefill of the same len.
     bool shape_changed =
-        (seq_q != cached_seq_len || num_q_heads != cached_num_q_heads);
+        (seq_q != cached_seq_len || seq_k != cached_seq_k ||
+         q_offset != cached_q_offset ||
+         num_q_heads != cached_num_q_heads ||
+         sliding_window != cached_sliding_window);
 
     if (shape_changed) {
       auto stride_qo = cute::make_tuple(
           q_stride, cute::_1{}, cute::make_tuple(HeadDim, HeadDim));
-      const int kv_bs = seq_q * HeadDim;
+      const int kv_bs = seq_k * HeadDim;  // gathered KV is [seq_k, hd]/head
       auto stride_kv = cute::make_tuple(
           HeadDim, cute::_1{}, cute::make_tuple(kv_bs, HeadDim));
       auto stride_lse = cute::make_tuple(
           cute::_1{}, cute::make_tuple(seq_q, seq_q));
+      // q_offset = context length (kv_len - UNPADDED q_len): query rows map
+      // to absolute positions [q_offset, q_offset + q_len). Hardcoded 0 broke
+      // every extend; deriving it from the PADDED seq_q broke non-multiple-
+      // of-8 lengths, so the caller passes it explicitly.
       auto problem = cute::make_tuple(
-          num_q_heads, 1, seq_q, seq_k, HeadDim, sliding_window, 0, 0);
+          num_q_heads, 1, seq_q, seq_k, HeadDim, sliding_window,
+          q_offset, 0);
 
       cutlass::KernelHardwareInfo hw_info;
       hw_info.device_id = device_id;
@@ -109,7 +125,10 @@ struct FmhaCachedLauncher {
       if (status != cutlass::Status::kSuccess) return false;
 
       cached_seq_len = seq_q;
+      cached_seq_k = seq_k;
+      cached_q_offset = q_offset;
       cached_num_q_heads = num_q_heads;
+      cached_sliding_window = sliding_window;
     } else {
       // Shape unchanged — update only base pointers in TMA descriptors
       auto& p = const_cast<typename Kernel::Params&>(fmha_op.params());
@@ -150,6 +169,7 @@ static bool launch_fmha_batched(
     int num_q_heads,
     int seq_q,
     int seq_k,
+    int q_offset,
     int q_stride,
     float scale,
     int sliding_window,
@@ -160,8 +180,8 @@ static bool launch_fmha_batched(
     cudaStream_t stream) {
   static FmhaCachedLauncher<HeadDim> launcher;
   return launcher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, num_q_heads,
-                         seq_q, seq_k, q_stride, scale, sliding_window,
-                         mm_ranges_ptr, max_mm_ranges,
+                         seq_q, seq_k, q_offset, q_stride, scale,
+                         sliding_window, mm_ranges_ptr, max_mm_ranges,
                          device_id, sm_count, stream);
 }
 
@@ -269,7 +289,29 @@ bool gemma_prefill_sm90_launcher(
                     cu_seqlens_q.mutable_data_ptr<int>(),
                     (num_seqs + 1) * sizeof(int),
                     cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+  }
+  // Total (context + new) length per sequence: extends (chunked prefill,
+  // prefix-cache hits) have kv_len > q_len; the kernel needs the real KV
+  // extent and q_offset = kv_len - q_len. One small D2H per prefill call.
+  std::vector<int> h_seq_lens(num_seqs);
+  cudaMemcpyAsync(h_seq_lens.data(), seq_lens.mutable_data_ptr<int>(),
+                  num_seqs * sizeof(int), cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+  int max_kv_len = 0;
+  for (int s2 = 0; s2 < num_seqs; s2++)
+    max_kv_len = std::max(max_kv_len, h_seq_lens[s2]);
+  // Re-grow the expanded-KV scratch for the KV extent (sized for q above).
+  const size_t kv_needed =
+      (size_t)max_kv_len * num_q_heads * head_size * sizeof(CACHE_T);
+  if (kv_needed > s_kv_cap) {
+    if (k_expanded) cudaFree(k_expanded);
+    cudaMalloc(&k_expanded, kv_needed);
+    s_kv_cap = kv_needed;
+  }
+  if (!k_eq_v && kv_needed > s_v_cap) {
+    if (v_expanded) cudaFree(v_expanded);
+    cudaMalloc(&v_expanded, kv_needed);
+    s_v_cap = kv_needed;
   }
 
   bool ok = true;
@@ -281,25 +323,29 @@ bool gemma_prefill_sm90_launcher(
     const int seq_len_s = equal_lens ? seq_len
                                      : (h_cu_seqlens_q[s + 1] - h_cu_seqlens_q[s]);
     if (seq_len_s == 0) continue;
+    const int kv_len_s = h_seq_lens[s];
+    const int q_off_s = kv_len_s - seq_len_s;  // context length
     const int padded_sl_s = (seq_len_s + kAlignment - 1) / kAlignment * kAlignment;
     const bool needs_pad_s = (padded_sl_s != seq_len_s);
 
-    const int total_elems = num_q_heads * seq_len_s * head_size;
+    // Gather the FULL kv range [0, kv_len) densely ([kv_len, hd] per
+    // expanded head): extends need the context, not just the new tokens.
+    const int total_elems = num_q_heads * kv_len_s * head_size;
     constexpr int kThreads = 256;
     const int gather_blocks = (total_elems + kThreads - 1) / kThreads;
     const int* seq_block_table =
         block_tables_ptr + s * max_num_blocks_per_seq;
 
     gather_kv_expanded_kernel<CACHE_T><<<gather_blocks, kThreads, 0, stream>>>(
-        k_expanded, key_cache_ptr, seq_block_table, seq_len_s, padded_sl_s,
+        k_expanded, key_cache_ptr, seq_block_table, kv_len_s, kv_len_s,
         num_q_heads, num_kv_heads, head_size, gqa_group, page_size,
         kv_stride_block, kv_stride_slot, kv_stride_head);
 
     if (!k_eq_v) {
       gather_kv_expanded_kernel<CACHE_T>
           <<<gather_blocks, kThreads, 0, stream>>>(
-              v_expanded, value_cache_ptr, seq_block_table, seq_len_s,
-              padded_sl_s, num_q_heads, num_kv_heads, head_size, gqa_group,
+              v_expanded, value_cache_ptr, seq_block_table, kv_len_s,
+              kv_len_s, num_q_heads, num_kv_heads, head_size, gqa_group,
               page_size, kv_stride_block, kv_stride_slot, kv_stride_head);
     }
 
@@ -334,15 +380,15 @@ bool gemma_prefill_sm90_launcher(
 
     if (head_size == 256) {
       ok = launch_fmha_batched<256>(q_fmha, k, v, o_fmha, lse_scratch,
-                                    num_q_heads, padded_sl_s, seq_len_s,
-                                    fmha_q_stride, scale, sliding_window,
-                                    seq_mm_ranges, seq_max_mm,
+                                    num_q_heads, padded_sl_s, kv_len_s,
+                                    q_off_s, fmha_q_stride, scale,
+                                    sliding_window, seq_mm_ranges, seq_max_mm,
                                     s_device_id, s_sm_count, stream);
     } else {
       ok = launch_fmha_batched<512>(q_fmha, k, v, o_fmha, lse_scratch,
-                                    num_q_heads, padded_sl_s, seq_len_s,
-                                    fmha_q_stride, scale, sliding_window,
-                                    seq_mm_ranges, seq_max_mm,
+                                    num_q_heads, padded_sl_s, kv_len_s,
+                                    q_off_s, fmha_q_stride, scale,
+                                    sliding_window, seq_mm_ranges, seq_max_mm,
                                     s_device_id, s_sm_count, stream);
     }
 

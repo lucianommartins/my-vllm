@@ -513,6 +513,13 @@ class GemmaAttentionImpl(AttentionImpl):
             return self._forward_prefill_triton(
                 query, key_cache, value_cache, output, attn_metadata)
 
+        # P7: GEMMA_PREFILL=custom routes the default prefill through our own
+        # gemma_prefill_attention op (CUTLASS SM90 kernel when
+        # GEMMA_SM90_PREFILL=1, wmma fallback otherwise) instead of FA4.
+        if os.environ.get("GEMMA_PREFILL", "") == "custom":
+            return self._forward_prefill_custom(
+                query, key_cache, value_cache, output, attn_metadata)
+
         from vllm.v1.attention.backends.fa_utils import (
             flash_attn_varlen_func,
         )

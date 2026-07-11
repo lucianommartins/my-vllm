@@ -398,8 +398,10 @@ struct FmhaMainloopTmaWarpSpecialized {
     auto q_tile_iter = cute::make_coord_iterator(Int<NumQKWarpGroups>{});
     [[maybe_unused]] int q_tile_count = NumQKWarpGroups;
 
+    int fusion_tile_start = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
     auto k_tile_iter = cute::make_coord_iterator(fusion_tile_count);
-    int k_tile_count = 2 * fusion_tile_count;
+    for (int i = 0; i < fusion_tile_start; ++i) { ++k_tile_iter; }
+    int k_tile_count = 2 * (fusion_tile_count - fusion_tile_start);
 
     LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
     auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
@@ -473,8 +475,10 @@ struct FmhaMainloopTmaWarpSpecialized {
     auto q_tile_iter = cute::make_coord_iterator(Int<NumQKWarpGroups>{});
     [[maybe_unused]] int q_tile_count = NumQKWarpGroups;
 
+    int fusion_tile_start = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
     auto k_tile_iter = cute::make_coord_iterator(fusion_tile_count);
-    int k_tile_count = 2 * fusion_tile_count;
+    for (int i = 0; i < fusion_tile_start; ++i) { ++k_tile_iter; }
+    int k_tile_count = 2 * (fusion_tile_count - fusion_tile_start);
 
     LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
     auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
@@ -600,7 +604,8 @@ struct FmhaMainloopTmaWarpSpecialized {
     Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{}));
     Tensor tPcP = thr_mma_qk.partition_C(cP);
     int m_block = get<0>(wg_coord);
-    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{});
+    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{})
+                              + E<1>{} * (Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size) * get<1>(TileShapeQK{}));
 
     // Allocate PV acc
     Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
@@ -836,7 +841,8 @@ struct FmhaMainloopTmaWarpSpecialized {
     Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{}));
     Tensor tPcP = thr_mma_qk.partition_C(cP);
     int m_block = get<0>(wg_coord);
-    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{});
+    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{})
+                              + E<1>{} * (Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size) * get<1>(TileShapeQK{}));
 
     // Half-D accumulator: 128 regs (O_lo in regs, O_hi in smem)
     Tensor acc_lo = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV_Eff{}));
@@ -1139,7 +1145,8 @@ struct FmhaMainloopTmaWarpSpecialized {
     Tensor tPcP = thr_mma_qk.partition_C(cP);
     int m_block = get<0>(wg_coord);
     tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{})
-                               + E<1>{} * consumer_wg_idx * kNHalf;
+                               + E<1>{} * consumer_wg_idx * kNHalf
+                               + E<1>{} * (Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size) * get<1>(TileShapeQK{}));
 
     // PV accumulator
     Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
@@ -1437,7 +1444,8 @@ struct FmhaMainloopTmaWarpSpecialized {
     Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{}));
     Tensor tPcP = thr_mma_qk.partition_C(cP);
     int m_block = get<0>(wg_coord);
-    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{});
+    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{})
+                              + E<1>{} * (Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size) * get<1>(TileShapeQK{}));
 
     // P write identity (local coords for element-wise P→smem)
     Tensor cP_local = make_identity_tensor(take<0,2>(TileShapeQK{}));

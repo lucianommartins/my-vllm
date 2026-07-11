@@ -49,6 +49,17 @@ struct DefaultFusion {
     return ceil_div(get<3>(problem_size), get<1>(tile_shape));
   }
 
+  // First k-tile to visit (block-skipping lower bound). 0 = no skipping.
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_trip_start(
+    BlkCoord const& blk_coord,
+    TileShape const& tile_shape,
+    ProblemSize const& problem_size
+  ) {
+    return 0;
+  }
+
   template<class BlkCoord, class TileShape, class ProblemSize>
   CUTLASS_DEVICE
   int get_masked_trip_count(
@@ -212,6 +223,25 @@ struct SlidingWindowCausalFusion : DefaultFusion {
     return std::min(max_blocks_k, max_blocks_q);
   }
 
+  // Sliding-window block-skip: tiles entirely below the window's lower bound
+  // for this q-tile were fully masked before -> pure waste (~8x the banded
+  // work on sliding layers at seq=16k). Lowest valid k = q_min - sw + 1
+  // (mask keeps k > q - sw, matching the decode kernel and FA's
+  // window_size_left = sw-1).
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_trip_start(
+    BlkCoord const& blk_coord,
+    TileShape const& tile_shape,
+    ProblemSize const& problem_size
+  ) {
+    int sw = get<5>(problem_size);
+    if (sw <= 0) return 0;
+    int q_min = get<0>(blk_coord) * get<0>(tile_shape) + get<6>(problem_size);
+    int k_lo = q_min - sw + 1;
+    return k_lo > 0 ? k_lo / get<1>(tile_shape) : 0;
+  }
+
   template<class BlkCoord, class TileShape, class ProblemSize>
   CUTLASS_DEVICE
   int get_masked_trip_count(
@@ -219,7 +249,8 @@ struct SlidingWindowCausalFusion : DefaultFusion {
     TileShape const& tile_shape,
     ProblemSize const& problem_size
   ) {
-    return get_trip_count(blk_coord, tile_shape, problem_size);
+    return get_trip_count(blk_coord, tile_shape, problem_size) -
+           get_trip_start(blk_coord, tile_shape, problem_size);
   }
 
   template<class BlkCoord, class TileShape, class ProblemSize>
@@ -247,7 +278,7 @@ struct SlidingWindowCausalFusion : DefaultFusion {
       int q = get<0>(pos) + q_offset;
       int k = get<1>(pos);
       if (q < k || k >= get<3>(problem_size) ||
-          (sw > 0 && k < q - sw)) {
+          (sw > 0 && k <= q - sw)) {
         acc_qk(i) = -INFINITY;
       }
     }
