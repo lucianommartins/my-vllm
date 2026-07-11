@@ -968,9 +968,64 @@ __global__ void gemma_gqa_split_decode_kernel(
 // SPLIT=true:  grid (num_kv_heads, num_seqs, num_splits) -> partials + combine.
 // bf16 only (no fp8 dequant here); fp8 stays on the scalar path.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// SM90 1D bulk-TMA helpers (P1): cp.async.bulk global->shared with mbarrier
+// completion. Address-based (no tensor map), so paged KV at block_size=16
+// works. Bodies compile to no-ops below sm90; callers gate at runtime
+// (use_bulk is only set on sm90 devices).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void ds_mbar_init(uint64_t* bar, uint32_t count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(a), "r"(count));
+#endif
+}
+// Order prior generic-proxy smem accesses (zero-fill, wmma reads of the stage
+// being reused) before subsequent async-proxy (DMA) writes.
+__device__ __forceinline__ void ds_fence_proxy_async() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void ds_mbar_arrive_expect_tx(uint64_t* bar,
+                                                         uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
+                   a),
+               "r"(bytes)
+               : "memory");
+#endif
+}
+__device__ __forceinline__ void ds_bulk_g2s(void* dst, const void* src,
+                                            uint32_t bytes, uint64_t* bar) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  const uint32_t m = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1], %2, [%3];" ::"r"(d),
+      "l"(src), "r"(bytes), "r"(m)
+      : "memory");
+#endif
+}
+__device__ __forceinline__ void ds_mbar_wait(uint64_t* bar, uint32_t parity) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "{\n\t.reg .pred p;\n"
+      "DS_MBW%=:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+      "@!p bra DS_MBW%=;\n\t}" ::"r"(a),
+      "r"(parity)
+      : "memory");
+#endif
+}
+
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_N,
           int NUM_WARPS, int GQA_GROUP, bool K_EQ_V, bool USE_SLIDING_WINDOW,
-          bool SPLIT, int MIN_CTA = 1>
+          bool SPLIT, int MIN_CTA = 1, bool USE_BULK = false>
 __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
 gemma_decode_stream_kernel(
     scalar_t* __restrict__ out_or_tmp,   // SPLIT ? tmp_out partials : final out
@@ -1066,6 +1121,11 @@ gemma_decode_stream_kernel(
 #define DS_KBUF(s) (sKV + (s) * STAGE)
 #define DS_VBUF(s) (DS_KBUF(s) + KTILE)
 
+  // P1 bulk-TMA: one mbarrier per pipeline stage tracks that stage's
+  // cp.async.bulk transaction bytes. Static smem coexists with the dynamic
+  // blob. Only used when use_bulk (sm90).
+  __shared__ __align__(8) uint64_t ds_mbar[2];
+
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> Ofrag[MT][HNT_W];
 #pragma unroll
   for (int m = 0; m < MT; m++)
@@ -1094,39 +1154,80 @@ gemma_decode_stream_kernel(
   const int q_abs = seq_len - 1;
   const int ntiles_local = tile_hi - tile_lo;
 
-  // Async-stage tile (tile_lo + ti) into pipeline stage buffer `s` (per-token
-  // paged gather; 16B cp.async). One pending group committed per call.
+  // Async-stage tile (tile_lo + ti) into pipeline stage buffer `s`.
+  // Default path: per-(token, 16B-chunk) paged gather via cp.async, one
+  // pending group committed per call.
+  // use_bulk (P1, sm90): one cp.async.bulk per token row (HEAD_SIZE*2 bytes,
+  // the contiguous unit of the NHD cache), issued by tid 0, tracked by the
+  // stage's mbarrier. The tile never crosses a page (BLOCK_N <= page_size,
+  // _kv0 is a multiple of BLOCK_N), so one block_table lookup per tile.
 #define DS_STAGE(ti, s)                                                        \
   do {                                                                         \
     const int _kv0 = kv_begin + (ti) * BLOCK_N;                                \
     const int _ntok = min(BLOCK_N, seq_len - _kv0);                            \
-    for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {                  \
-      const int n = iv / hvps, dv = (iv - n * hvps) * VEC;                     \
-      if (n < _ntok) {                                                         \
-        const int tok = _kv0 + n;                                             \
-        const int64_t phys = block_table[tok / page_size];                    \
-        const int slot = tok % page_size;                                     \
-        const int64_t off = phys * kv_stride_block + slot * kv_stride_slot     \
-                            + kv_head * kv_stride_head + dv;                   \
-        __pipeline_memcpy_async(DS_KBUF(s) + n * LDH + dv, k_cache + off, 16); \
-        if (V_SMEM)                                                            \
-          __pipeline_memcpy_async(DS_VBUF(s) + n * LDH + dv, v_cache + off,    \
-                                  16);                                         \
+    if constexpr (USE_BULK) {                                                  \
+      if (tid == 0) {                                                          \
+        ds_fence_proxy_async();                                                \
+        ds_mbar_arrive_expect_tx(                                              \
+            &ds_mbar[s], (uint32_t)_ntok * HEAD_SIZE * sizeof(cache_t) *       \
+                             (V_SMEM ? 2 : 1));                                \
+        for (int n = 0; n < _ntok; n++) {                                      \
+          const int _tok = _kv0 + n;  /* per-token page: tile may span pages   \
+                                         when BLOCK_N > page_size */           \
+          const int64_t off =                                                  \
+              (int64_t)block_table[_tok / page_size] * kv_stride_block +       \
+              (int64_t)(_tok % page_size) * kv_stride_slot +                   \
+              kv_head * kv_stride_head;                                        \
+          ds_bulk_g2s(DS_KBUF(s) + n * LDH, k_cache + off,                     \
+                      HEAD_SIZE * sizeof(cache_t), &ds_mbar[s]);               \
+          if (V_SMEM)                                                          \
+            ds_bulk_g2s(DS_VBUF(s) + n * LDH, v_cache + off,                   \
+                        HEAD_SIZE * sizeof(cache_t), &ds_mbar[s]);             \
+        }                                                                      \
       }                                                                        \
+    } else {                                                                   \
+      for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {                \
+        const int n = iv / hvps, dv = (iv - n * hvps) * VEC;                   \
+        if (n < _ntok) {                                                       \
+          const int tok = _kv0 + n;                                            \
+          const int64_t phys = block_table[tok / page_size];                   \
+          const int slot = tok % page_size;                                    \
+          const int64_t off = phys * kv_stride_block + slot * kv_stride_slot   \
+                              + kv_head * kv_stride_head + dv;                 \
+          __pipeline_memcpy_async(DS_KBUF(s) + n * LDH + dv, k_cache + off,    \
+                                  16);                                         \
+          if (V_SMEM)                                                          \
+            __pipeline_memcpy_async(DS_VBUF(s) + n * LDH + dv, v_cache + off,  \
+                                    16);                                       \
+        }                                                                      \
+      }                                                                        \
+      __pipeline_commit();                                                     \
     }                                                                          \
-    __pipeline_commit();                                                       \
   } while (0)
 
-  __syncthreads();              // Q + zeroed KV visible before async loads land
+  if constexpr (USE_BULK) {
+    if (tid == 0) {
+      ds_mbar_init(&ds_mbar[0], 1);  // one arrive per phase (tid 0's expect_tx)
+      ds_mbar_init(&ds_mbar[1], 1);
+    }
+  }
+  uint32_t bulk_phase = 0;  // bit s = expected parity of ds_mbar[s]
+  (void)bulk_phase;
+
+  __syncthreads();              // Q + zeroed KV + mbarrier init visible
   DS_STAGE(tile_lo, 0);         // prefetch first tile
 
   for (int t = 0; t < ntiles_local; t++) {
     const int cur = t & 1;
     if (t + 1 < ntiles_local) {
       DS_STAGE(tile_lo + t + 1, (t + 1) & 1);
-      __pipeline_wait_prior(1);  // keep next tile's load in flight
-    } else {
+      if constexpr (!USE_BULK) __pipeline_wait_prior(1);  // next load in flight
+    } else if constexpr (!USE_BULK) {
       __pipeline_wait_prior(0);
+    }
+    if constexpr (USE_BULK) {
+      ds_mbar_wait(&ds_mbar[cur], (bulk_phase >> cur) & 1u);
+      bulk_phase ^= (1u << cur);
     }
     __syncthreads();
 

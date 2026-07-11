@@ -117,21 +117,26 @@ static constexpr int DS_MINCTA_256 = 3;
 // Phase 1 stream-decode launch. SPLITB selects grid + epilogue (false: final
 // out; true: partials + combine). smem = sQ[16,LDH] + 2 pipeline stages of
 // K(+V if !keqv) + sP[16,LDN] + sS[16,LDN] + sM/sL/sA.
-#define LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, GROUP, KEQV, USW, SPLITB)        \
+#define LAUNCH_GEMMA_STREAM(HEAD, BN, NW, MINCTA, GROUP, KEQV, USW, SPLITB)    \
   do {                                                                         \
     const dim3 sgrid = (SPLITB) ? dim3(num_kv_heads, num_seqs, num_splits)     \
                                 : dim3(num_kv_heads, num_seqs);                 \
     constexpr int SLDH = (HEAD) + 8;                                           \
-    constexpr int SLDN = DS_BN + 8;                                            \
-    constexpr int SKTILE = DS_BN * SLDH;  /* K tile; V staged too only for       \
+    constexpr int SLDN = (BN) + 8;                                             \
+    constexpr int SKTILE = (BN) * SLDH;  /* K tile; V staged too only for        \
         hd256 !k_eq_v (hd512 !k_eq_v reads V from gmem; k_eq_v reuses K) */      \
     constexpr int SSTAGE =                                                     \
         SKTILE + (((!(KEQV)) && ((HEAD) < 512)) ? SKTILE : 0);                 \
     size_t ssmem = (size_t)(16 * SLDH + 2 * SSTAGE + 16 * SLDN)                \
                        * sizeof(CACHE_T)                                       \
                    + (size_t)(16 * SLDN + 3 * 16) * sizeof(float);            \
-    auto sk = vllm::gemma::gemma_decode_stream_kernel<                         \
-        T, CACHE_T, HEAD, DS_BN, NW, GROUP, KEQV, USW, SPLITB, MINCTA>;       \
+    auto sk = use_bulk                                                         \
+        ? vllm::gemma::gemma_decode_stream_kernel<                             \
+              T, CACHE_T, HEAD, BN, NW, GROUP, KEQV, USW, SPLITB, MINCTA,     \
+              true>                                                            \
+        : vllm::gemma::gemma_decode_stream_kernel<                             \
+              T, CACHE_T, HEAD, BN, NW, GROUP, KEQV, USW, SPLITB, MINCTA,     \
+              false>;                                                          \
     {                                                                          \
       static bool attr_set = false;                                            \
       if (!attr_set) {                                                         \
@@ -161,11 +166,20 @@ static constexpr int DS_MINCTA_256 = 3;
 
 #define LAUNCH_GEMMA_STREAM_GROUP(HEAD, NW, MINCTA, KEQV, USW, SPLITB)         \
   switch (gqa_group) {                                                         \
-    case 1:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 1, KEQV, USW, SPLITB); break;\
-    case 2:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 2, KEQV, USW, SPLITB); break;\
-    case 4:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 4, KEQV, USW, SPLITB); break;\
-    case 8:  LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 8, KEQV, USW, SPLITB); break;\
-    case 16: LAUNCH_GEMMA_STREAM(HEAD, NW, MINCTA, 16, KEQV, USW, SPLITB);     \
+    case 1:                                                                    \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 1, KEQV, USW, SPLITB);      \
+      break;                                                                   \
+    case 2:                                                                    \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 2, KEQV, USW, SPLITB);      \
+      break;                                                                   \
+    case 4:                                                                    \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 4, KEQV, USW, SPLITB);      \
+      break;                                                                   \
+    case 8:                                                                    \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 8, KEQV, USW, SPLITB);      \
+      break;                                                                   \
+    case 16:                                                                   \
+      LAUNCH_GEMMA_STREAM(HEAD, DS_BN, NW, MINCTA, 16, KEQV, USW, SPLITB);     \
       break;                                                                   \
     default: STD_TORCH_CHECK(false, "stream decode bad group ", gqa_group);    \
   }
@@ -176,6 +190,22 @@ static constexpr int DS_MINCTA_256 = 3;
       LAUNCH_GEMMA_STREAM_GROUP(HEAD, NW, MINCTA, KEQV, USW, true);            \
     } else {                                                                   \
       LAUNCH_GEMMA_STREAM_GROUP(HEAD, NW, MINCTA, KEQV, USW, false);           \
+    }                                                                          \
+  } while (0)
+
+// Phase A' v0: large-tile stream decode. BLOCK_N=64 -> 4x fewer tile
+// iterations/barrier sets, QK across 4 warps; smem-bound to 1 CTA/SM (BN=64)
+// or 2 CTA/SM (BN=32). Covers the two gemma-4 decode configs: hd512 k_eq_v
+// full (GROUP 16) and hd256 sliding (GROUP 2). Opt-in via GEMMA_DECODE_BN
+// for A/B against the BLOCK_N=16 default.
+#define LAUNCH_GEMMA_STREAM_BIGTILE(HEAD, BN, MINCTA, GROUP, KEQV, USW)        \
+  do {                                                                         \
+    STD_TORCH_CHECK(gqa_group == (GROUP), "bigtile decode expects group ",     \
+                    GROUP, ", got ", gqa_group);                               \
+    if (num_splits > 1) {                                                      \
+      LAUNCH_GEMMA_STREAM(HEAD, BN, 8, MINCTA, GROUP, KEQV, USW, true);        \
+    } else {                                                                   \
+      LAUNCH_GEMMA_STREAM(HEAD, BN, 8, MINCTA, GROUP, KEQV, USW, false);       \
     }                                                                          \
   } while (0)
 
@@ -366,14 +396,24 @@ void gemma_paged_attention_launcher(
   // measured decode occupancy (~3 CTA/SM); a split-count sweep (hd512, A100)
   // matched ceil(DECODE_WAVES*CTA_PER_SM*SMs / total_ctas) across b=8..256.
   // Clamped to the KV blocks and the partition-buffer cap.
-  static constexpr int DECODE_CTA_PER_SM = 3;  // reg/smem-bound occupancy
-  static constexpr int DECODE_WAVES = 6;       // waves to saturate HBM (swept)
   static int num_sms = []() {
     int dev = 0;
     cudaGetDevice(&dev);
     int n = 1;
     cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
     return n;
+  }();
+  // Phase A' (Session 8): large-tile (BLOCK_N=64) stream decode is the
+  // DEFAULT for gemma-4's two decode configs (hd512 k_eq_v full, hd256
+  // sliding). Won every measured cell vs BLOCK_N=16: L{128,4k,16k} x
+  // b{4,16,32}, both head sizes (e.g. hd512 @16k: 46.7us vs 75.7, FA4 55.3;
+  // b16 short attn -33%). GEMMA_DECODE_BN=16 reverts to the legacy path;
+  // =32 selects the mid tile. Declared before the split heuristic: bigtile
+  // changes the split target (<=1 wave at its 1-2 CTA/SM residency).
+  static const int decode_bn = []() {
+    const char* e = getenv("GEMMA_DECODE_BN");
+    const int v = (e != nullptr) ? atoi(e) : 64;
+    return (v == 32 || v == 64) ? v : 0;
   }();
   int num_splits = 1;
   {
@@ -383,15 +423,81 @@ void gemma_paged_attention_launcher(
     const int eff_seq = (sliding_window > 0 && sliding_window < max_seq_len)
                             ? sliding_window : max_seq_len;
     const int max_seq_blocks = (eff_seq + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    const int desired_ctas = DECODE_WAVES * DECODE_CTA_PER_SM * num_sms;
+    // Split-KV target (Session 7 retune). Profiling (in-engine, GEMMA vs FA4)
+    // showed the old DECODE_WAVES=6 target (~18 CTA/SM) massively over-splits:
+    // the combine kernel is a ~fixed cost whenever splits>1, and 1-tile splits
+    // kill the decode pipeline. Worst case: b=4 long-ctx emitted 64 splits ->
+    // combine 0.9ms/step vs FA4 0.13ms. Data wants ~2-3 CTA/SM AND >=~3-4 tiles
+    // per split (pipeline depth). Both knobs are env-tunable for sweeping.
+    // 1.5 CTA/SM won a same-build sweep {1.5,2.5,3.0,18}: at b=32 it yields 1
+    // split (no combine) -> +2.4% vs FA4; b=16 -1.3% (was -3.2%); b=1/8 hold wins.
+    static const float split_cta_per_sm = []() {
+      const char* e = getenv("GEMMA_SPLIT_CTA_PER_SM");
+      return e != nullptr ? (float)atof(e) : 1.5f;
+    }();
+    static const int min_tiles_per_split = []() {
+      const char* e = getenv("GEMMA_MIN_TILES");
+      return e != nullptr ? atoi(e) : 0;  // 0=off; low batch needs fine splits
+    }();
+    const int desired_ctas = (int)(split_cta_per_sm * num_sms);
     int target = (total_ctas > 0)
                      ? (desired_ctas + total_ctas - 1) / total_ctas
                      : 1;
     num_splits = target < 1 ? 1 : target;
+    // Pipeline guard: never split so finely that a split gets < min tiles.
+    const int max_splits_by_tiles =
+        (min_tiles_per_split > 0)
+            ? (max_seq_blocks + min_tiles_per_split - 1) / min_tiles_per_split
+            : max_seq_blocks;
+    if (num_splits > max_splits_by_tiles) num_splits = max_splits_by_tiles;
     if (num_splits > max_seq_blocks) num_splits = max_seq_blocks;
     if (num_splits > max_parts) num_splits = max_parts;
     if (max_seq_blocks <= 4) num_splits = 1;
     if (num_splits < 1) num_splits = 1;
+    // Bigtile (GEMMA_DECODE_BN=32|64) split target. The bigtile instantiation
+    // runs at 1 CTA/SM for BN64 (2 for BN32, smem-bound), so the sweet spot
+    // is at most ONE full wave: splits = floor(per_sm*num_sms / base_ctas),
+    // quantized to the kernel's BN-token tiles. Measured (hd512, L=16k b=4,
+    // BN64): 33 splits (132 CTAs, 1 wave) 46.6us vs default-50 (172 CTAs,
+    // 1.3 waves) 70.9us vs 17 (0.5 wave) 87.5us.
+    if (decode_bn != 0 &&
+        ((actual_head_size == 512 && k_eq_v && sliding_window <= 0) ||
+         (actual_head_size == 256 && !k_eq_v && sliding_window > 0))) {
+      const int n_tiles_bt = (eff_seq + decode_bn - 1) / decode_bn;
+      const int per_sm = (decode_bn == 64) ? 1 : 2;  // CTAs resident per SM
+      int target = (per_sm * num_sms) / (total_ctas > 0 ? total_ctas : 1);
+      if (target > n_tiles_bt) target = n_tiles_bt;
+      if (target > max_parts) target = max_parts;
+      if (target < 1) target = 1;
+      num_splits = target;
+    }
+    // Debug override: GEMMA_FORCE_SPLITS=N (>0) pins the split count for all
+    // layers. GEMMA_FORCE_SPLITS_HD256 / _HD512 pin per head size: sliding
+    // (hd256) and global (hd512) layers want opposite split counts at low
+    // batch, so sweeps must decouple them.
+    static const int force_splits = []() {
+      const char* e = getenv("GEMMA_FORCE_SPLITS");
+      return e != nullptr ? atoi(e) : 0;
+    }();
+    static const int force_splits_hd256 = []() {
+      const char* e = getenv("GEMMA_FORCE_SPLITS_HD256");
+      return e != nullptr ? atoi(e) : 0;
+    }();
+    static const int force_splits_hd512 = []() {
+      const char* e = getenv("GEMMA_FORCE_SPLITS_HD512");
+      return e != nullptr ? atoi(e) : 0;
+    }();
+    const int force_eff =
+        force_splits > 0
+            ? force_splits
+            : (actual_head_size == 512 ? force_splits_hd512
+                                       : force_splits_hd256);
+    if (force_eff > 0) {
+      num_splits = force_eff;
+      if (num_splits > max_seq_blocks) num_splits = max_seq_blocks;
+      if (num_splits > max_parts) num_splits = max_parts;
+      if (num_splits < 1) num_splits = 1;
+    }
   }
 
   // The bandwidth-saturating tensor-core decode (gemma_decode_stream_kernel) is
@@ -404,6 +510,20 @@ void gemma_paged_attention_launcher(
       std::is_same<T, __nv_bfloat16>::value &&
       (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto);
   constexpr bool use_stream = DS_DTYPE_OK;
+  // P1 (bulk-TMA): opt-in cp.async.bulk KV staging in the stream decode
+  // kernel. sm90-only; env-gated for same-build A/B: GEMMA_DECODE_BULK=1.
+  static const bool bulk_env = []() {
+    const char* e = getenv("GEMMA_DECODE_BULK");
+    return e != nullptr && e[0] == '1';
+  }();
+  static const bool bulk_sm90 = []() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int major = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    return major >= 9;
+  }();
+  const bool use_bulk = bulk_env && bulk_sm90;
   // Opt-in bandwidth-first SIMT decode (k_eq_v only) for A/B vs the wmma stream
   // kernel. Read once. The wmma path is occupancy-limited (~37% -> ~40% DRAM);
   // SIMT trades tensor cores for occupancy to saturate HBM.
@@ -478,8 +598,34 @@ void gemma_paged_attention_launcher(
   do {                                                              \
     bool did_stream = false;                                       \
     if constexpr (DS_DTYPE_OK) {                                   \
+      if constexpr ((KEQV) && !(USW) && (HS) == 512) {             \
+        if (!did_stream && use_stream && decode_bn != 0 &&         \
+            gqa_group == 16) {                                     \
+          if (decode_bn == 64) {                                   \
+            LAUNCH_GEMMA_STREAM_BIGTILE(512, 64, 1, 16, true,      \
+                                        false);                    \
+          } else {                                                 \
+            LAUNCH_GEMMA_STREAM_BIGTILE(512, 32, 2, 16, true,      \
+                                        false);                    \
+          }                                                        \
+          did_stream = true;                                       \
+        }                                                          \
+      }                                                            \
+      if constexpr (!(KEQV) && (USW) && (HS) == 256) {             \
+        if (!did_stream && use_stream && decode_bn != 0 &&         \
+            gqa_group == 2) {                                      \
+          if (decode_bn == 64) {                                   \
+            LAUNCH_GEMMA_STREAM_BIGTILE(256, 64, 1, 2, false,      \
+                                        true);                     \
+          } else {                                                 \
+            LAUNCH_GEMMA_STREAM_BIGTILE(256, 32, 2, 2, false,      \
+                                        true);                     \
+          }                                                        \
+          did_stream = true;                                       \
+        }                                                          \
+      }                                                            \
       if constexpr (KEQV && !(USW)) {                              \
-        if (use_mma && num_splits == 1) {                         \
+        if (!did_stream && use_mma && num_splits == 1) {           \
           LAUNCH_GEMMA_MMA_HEAD(HS, 16);                           \
           did_stream = true;                                       \
         }                                                          \
