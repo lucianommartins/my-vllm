@@ -60,6 +60,20 @@ struct DefaultFusion {
     return 0;
   }
 
+  // Whether k-tile `k_tile` needs the per-element mask (conservative
+  // default: always). Fusions with a known unmasked interior override this
+  // so interior tiles skip the predicate loop.
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  bool tile_needs_mask(
+    int k_tile,
+    BlkCoord const& blk_coord,
+    TileShape const& tile_shape,
+    ProblemSize const& problem_size
+  ) {
+    return true;
+  }
+
   template<class BlkCoord, class TileShape, class ProblemSize>
   CUTLASS_DEVICE
   int get_masked_trip_count(
@@ -261,6 +275,32 @@ struct SlidingWindowCausalFusion : DefaultFusion {
     ProblemSize const& problem_size
   ) {
     return 0;
+  }
+
+  // Unmasked interior [A, B): tiles whose k-range is fully valid for EVERY
+  // row of the q-tile. A = first tile with all k >= (q_max - sw + 1)
+  // (window; A=0 when sw<=0), B = first tile with any k > q_min (causal
+  // diagonal). Padded q rows only widen the front conservatively.
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  bool tile_needs_mask(
+    int k_tile,
+    BlkCoord const& blk_coord,
+    TileShape const& tile_shape,
+    ProblemSize const& problem_size
+  ) {
+    int sw = get<5>(problem_size);
+    int q_offset = get<6>(problem_size);
+    int q_min = get<0>(blk_coord) * get<0>(tile_shape) + q_offset;
+    int q_max = q_min + get<0>(tile_shape) - 1;
+    int tk = get<1>(tile_shape);
+    int A = 0;
+    if (sw > 0) {
+      int lo_max = q_max - sw + 1;
+      if (lo_max > 0) A = (lo_max + tk - 1) / tk;
+    }
+    int B = (q_min + 1) / tk;   // tiles < B have k_max <= q_min
+    return k_tile < A || k_tile >= B;
   }
 
   template<class AccQK, class IndexQK, class ProblemSize>

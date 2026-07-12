@@ -745,6 +745,9 @@ struct FmhaMainloopTmaWarpSpecialized {
     }
 
     k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    // Absolute k-tile index for the masked loop (for tile_needs_mask):
+    // everything before this loop processed [start, end - k_tile_count).
+    int mask_t_abs = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size) - k_tile_count;
 
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0)
@@ -775,7 +778,8 @@ struct FmhaMainloopTmaWarpSpecialized {
         //  if (k_tile_count == 0) pipeline_q.consumer_release(smem_pipe_release_q);
 
         if constexpr (kIsMainloopLocked) math_wg_order_barrier.wait();
-        softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state, acc_pv, tiled_mma_pv, problem_size);
+        softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state, acc_pv, tiled_mma_pv, problem_size,
+                     Fusion{}.tile_needs_mask(mask_t_abs++, blk_coord, TileShape{}, problem_size));
         if constexpr (kIsMainloopLocked) math_wg_order_barrier.arrive();
 
         Tensor acc_qk_fixed = make_acc_into_op<Element>(acc_qk, typename TiledMmaPV::LayoutA_TV{});
@@ -953,6 +957,9 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     // ===== Subsequent KV tiles =====
     k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    // Absolute k-tile index for the masked loop (for tile_needs_mask):
+    // everything before this loop processed [start, end - k_tile_count).
+    int mask_t_abs = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size) - k_tile_count;
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
       --k_tile_count;
@@ -1297,6 +1304,9 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     // ===== Subsequent KV tiles =====
     k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    // Absolute k-tile index for the masked loop (for tile_needs_mask):
+    // everything before this loop processed [start, end - k_tile_count).
+    int mask_t_abs = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size) - k_tile_count;
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
       --k_tile_count;
@@ -1323,7 +1333,9 @@ struct FmhaMainloopTmaWarpSpecialized {
 
       pre_step_max_exchange(acc_qk);
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
-                   acc_pv, tiled_mma_pv, problem_size);
+                   acc_pv, tiled_mma_pv, problem_size,
+                   Fusion{}.tile_needs_mask(mask_t_abs++, blk_coord,
+                                            TileShape{}, problem_size));
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(acc_qk); i++) {
@@ -1564,6 +1576,9 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     // ===== Subsequent KV tiles =====
     k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    // Absolute k-tile index for the masked loop (for tile_needs_mask):
+    // everything before this loop processed [start, end - k_tile_count).
+    int mask_t_abs = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size) - k_tile_count;
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
       --k_tile_count;
@@ -1789,6 +1804,9 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     // ===== Subsequent KV tiles =====
     k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    // Absolute k-tile index for the masked loop (for tile_needs_mask):
+    // everything before this loop processed [start, end - k_tile_count).
+    int mask_t_abs = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size) - k_tile_count;
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
       --k_tile_count;

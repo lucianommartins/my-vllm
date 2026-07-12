@@ -109,9 +109,11 @@ struct CollectiveSoftmax {
   }
 
   template<class AccQK, class TiledMmaQK, class CountQK, class State, class ProblemShape>
-  CUTLASS_DEVICE auto step(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, CountQK const& count_qk, State& state, ProblemShape const& problem_shape) {
-    Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
-    apply_mm_prefix_override(acc_qk, count_qk);
+  CUTLASS_DEVICE auto step(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, CountQK const& count_qk, State& state, ProblemShape const& problem_shape, bool needs_mask = true) {
+    if (needs_mask) {
+      Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
+      apply_mm_prefix_override(acc_qk, count_qk);
+    }
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
     auto reduction_target_qk = reduction_target_n(tiled_mma_qk);
     constexpr int red_rank = decltype(rank(reduction_target_qk))::value;
@@ -231,11 +233,16 @@ struct CollectiveSoftmax {
   }
 
   template<bool kUseFusion=true, class AccQK, class TiledMmaQK, class CountQK, class State, class AccPV, class TiledMmaPV, class ProblemShape>
-  CUTLASS_DEVICE auto step(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, CountQK const& count_qk, State& state, AccPV& acc_pv, TiledMmaPV const& tiled_mma_pv, ProblemShape const& problem_shape) {
+  CUTLASS_DEVICE auto step(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, CountQK const& count_qk, State& state, AccPV& acc_pv, TiledMmaPV const& tiled_mma_pv, ProblemShape const& problem_shape, bool needs_mask = true) {
 
     if constexpr (kUseFusion) {
-      Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
-    apply_mm_prefix_override(acc_qk, count_qk);
+      // Interior band tiles skip the per-element predicate loop entirely
+      // (it cost 4-6x vs FA4 on banded chunk shapes; mask-free tiles have
+      // nothing for the mm override to un-mask either).
+      if (needs_mask) {
+        Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
+        apply_mm_prefix_override(acc_qk, count_qk);
+      }
     }
 
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));

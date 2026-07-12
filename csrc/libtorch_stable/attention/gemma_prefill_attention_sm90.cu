@@ -63,6 +63,7 @@ struct FmhaCachedLauncher {
   int cached_seq_k = 0;
   int cached_q_offset = -1;
   int cached_num_q_heads = 0;
+  int cached_num_seqs = 0;
   int cached_sliding_window = -1;
 
   bool launch(
@@ -73,6 +74,7 @@ struct FmhaCachedLauncher {
       float* lse_ptr,
       int num_q_heads,
       int gqa_group,
+      int num_seqs,
       int seq_q,
       int seq_k,
       int q_offset,
@@ -92,22 +94,29 @@ struct FmhaCachedLauncher {
         (seq_q != cached_seq_len || seq_k != cached_seq_k ||
          q_offset != cached_q_offset ||
          num_q_heads != cached_num_q_heads ||
+         num_seqs != cached_num_seqs ||
          sliding_window != cached_sliding_window);
 
     if (shape_changed) {
+      // Batched (uniform) launch: batch mode strides. Q/O rows are packed
+      // varlen with uniform q_len -> per-seq stride seq_q*q_stride. Gathered
+      // KV scratch is [seq][kv_head][seq_k][hd] dense.
       auto stride_qo = cute::make_tuple(
-          q_stride, cute::_1{}, cute::make_tuple(HeadDim, HeadDim));
+          q_stride, cute::_1{},
+          cute::make_tuple(HeadDim, seq_q * q_stride));
       const int kv_bs = seq_k * HeadDim;  // gathered KV is [seq_k, hd]/head
+      const int n_kvh = num_q_heads / (gqa_group > 0 ? gqa_group : 1);
       auto stride_kv = cute::make_tuple(
-          HeadDim, cute::_1{}, cute::make_tuple(kv_bs, HeadDim));
+          HeadDim, cute::_1{},
+          cute::make_tuple(kv_bs, n_kvh * kv_bs));
       auto stride_lse = cute::make_tuple(
-          cute::_1{}, cute::make_tuple(seq_q, seq_q));
+          cute::_1{}, cute::make_tuple(seq_q, seq_q * num_q_heads));
       // q_offset = context length (kv_len - UNPADDED q_len): query rows map
       // to absolute positions [q_offset, q_offset + q_len). Hardcoded 0 broke
       // every extend; deriving it from the PADDED seq_q broke non-multiple-
       // of-8 lengths, so the caller passes it explicitly.
       auto problem = cute::make_tuple(
-          num_q_heads, 1, seq_q, seq_k, HeadDim, sliding_window,
+          num_q_heads, num_seqs, seq_q, seq_k, HeadDim, sliding_window,
           q_offset, 0);
 
       cutlass::KernelHardwareInfo hw_info;
@@ -131,6 +140,7 @@ struct FmhaCachedLauncher {
       cached_seq_k = seq_k;
       cached_q_offset = q_offset;
       cached_num_q_heads = num_q_heads;
+      cached_num_seqs = num_seqs;
       cached_sliding_window = sliding_window;
     } else {
       // Shape unchanged — update only base pointers in TMA descriptors
@@ -176,6 +186,7 @@ static bool launch_fmha_batched(
     float* lse_ptr,
     int num_q_heads,
     int gqa_group,
+    int num_seqs,
     int seq_q,
     int seq_k,
     int q_offset,
@@ -189,9 +200,9 @@ static bool launch_fmha_batched(
     cudaStream_t stream) {
   static FmhaCachedLauncher<HeadDim, KEqV> launcher;
   return launcher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, num_q_heads,
-                         gqa_group, seq_q, seq_k, q_offset, q_stride, scale,
-                         sliding_window, mm_ranges_ptr, max_mm_ranges,
-                         device_id, sm_count, stream);
+                         gqa_group, num_seqs, seq_q, seq_k, q_offset,
+                         q_stride, scale, sliding_window, mm_ranges_ptr,
+                         max_mm_ranges, device_id, sm_count, stream);
 }
 
 template <typename T, typename CACHE_T>
@@ -351,6 +362,86 @@ bool gemma_prefill_sm90_launcher(
   bool ok = true;
   const int padded_qo_stride = num_q_heads * head_size;
 
+  // ---- Uniform-batch fast path: ONE fmha launch per layer call ----
+  // (equal q_len and kv_len across seqs, TMA-aligned q_len, no mm ranges).
+  // The per-seq loop pays host Params re-init + serialized small kernels
+  // (~4x on b=4 chunked re-prefill); the tile scheduler already supports
+  // batch via grid.z and the loaders slice the batch coord.
+  if (equal_lens && mm_prefix_ranges.numel() == 0 && seq_len > 0 &&
+      (seq_len % kAlignment) == 0) {
+    bool kv_uniform = true;
+    for (int s2 = 1; s2 < num_seqs; s2++)
+      kv_uniform &= (h_seq_lens[s2] == h_seq_lens[0]);
+    if (kv_uniform) {
+      const int kv_len_full = h_seq_lens[0];
+      int kv_lo = 0;
+      if (sliding_window > 0) {
+        kv_lo = kv_len_full - seq_len - sliding_window + 1;
+        if (kv_lo < 0) kv_lo = 0;
+      }
+      const int kv_len_s = kv_len_full - kv_lo;
+      const int q_off_s = kv_len_s - seq_len;
+      const size_t seq_slot = (size_t)num_kv_heads * kv_len_s * head_size;
+      const size_t batch_kv_bytes =
+          (size_t)num_seqs * seq_slot * sizeof(CACHE_T);
+      const size_t batch_lse_bytes =
+          (size_t)num_seqs * seq_len * num_q_heads * sizeof(float);
+      if (batch_kv_bytes <= ((size_t)2 << 30)) {  // scratch cap; else loop
+        if (batch_kv_bytes > s_kv_cap) {
+          if (k_expanded) cudaFree(k_expanded);
+          cudaMalloc(&k_expanded, batch_kv_bytes);
+          s_kv_cap = batch_kv_bytes;
+        }
+        if (!k_eq_v && batch_kv_bytes > s_v_cap) {
+          if (v_expanded) cudaFree(v_expanded);
+          cudaMalloc(&v_expanded, batch_kv_bytes);
+          s_v_cap = batch_kv_bytes;
+        }
+        if (batch_lse_bytes > s_lse_cap) {
+          if (lse_scratch) cudaFree(lse_scratch);
+          cudaMalloc(&lse_scratch, batch_lse_bytes);
+          s_lse_cap = batch_lse_bytes;
+        }
+        constexpr int kThreads = 256;
+        const int total_elems = num_kv_heads * kv_len_s * head_size;
+        const int gb = (total_elems + kThreads - 1) / kThreads;
+        for (int s2 = 0; s2 < num_seqs; s2++) {
+          const int* bt_s = block_tables_ptr + s2 * max_num_blocks_per_seq;
+          gather_kv_expanded_kernel<CACHE_T><<<gb, kThreads, 0, stream>>>(
+              k_expanded + s2 * seq_slot, key_cache_ptr, bt_s, kv_len_s,
+              kv_len_s, num_kv_heads, num_kv_heads, head_size, 1, page_size,
+              kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
+          if (!k_eq_v)
+            gather_kv_expanded_kernel<CACHE_T><<<gb, kThreads, 0, stream>>>(
+                v_expanded + s2 * seq_slot, value_cache_ptr, bt_s, kv_len_s,
+                kv_len_s, num_kv_heads, num_kv_heads, head_size, 1, page_size,
+                kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
+        }
+        Element* kb = reinterpret_cast<Element*>(k_expanded);
+        Element* vb = k_eq_v ? kb : reinterpret_cast<Element*>(v_expanded);
+        if (head_size == 256) {
+          return launch_fmha_batched<256>(
+              query_ptr, kb, vb, out_ptr, lse_scratch, num_q_heads,
+              gqa_group, num_seqs, seq_len, kv_len_s, q_off_s, q_stride,
+              scale, sliding_window, nullptr, 0, s_device_id, s_sm_count,
+              stream);
+        } else if (k_eq_v) {
+          return launch_fmha_batched<512, true>(
+              query_ptr, kb, vb, out_ptr, lse_scratch, num_q_heads,
+              gqa_group, num_seqs, seq_len, kv_len_s, q_off_s, q_stride,
+              scale, sliding_window, nullptr, 0, s_device_id, s_sm_count,
+              stream);
+        } else {
+          return launch_fmha_batched<512>(
+              query_ptr, kb, vb, out_ptr, lse_scratch, num_q_heads,
+              gqa_group, num_seqs, seq_len, kv_len_s, q_off_s, q_stride,
+              scale, sliding_window, nullptr, 0, s_device_id, s_sm_count,
+              stream);
+        }
+      }
+    }
+  }
+
   for (int s = 0; s < num_seqs && ok; s++) {
     const int token_offset = equal_lens ? s * seq_len
                                         : h_cu_seqlens_q[s];
@@ -427,20 +518,20 @@ bool gemma_prefill_sm90_launcher(
 
     if (head_size == 256) {
       ok = launch_fmha_batched<256>(q_fmha, k, v, o_fmha, lse_scratch,
-                                    num_q_heads, gqa_group, padded_sl_s,
+                                    num_q_heads, gqa_group, 1, padded_sl_s,
                                     kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
                                     s_device_id, s_sm_count, stream);
     } else if (k_eq_v) {
       // Gemma global layers: V == K -> single-slot pipeline, no V TMA loads.
       ok = launch_fmha_batched<512, true>(q_fmha, k, v, o_fmha, lse_scratch,
-                                    num_q_heads, gqa_group, padded_sl_s,
+                                    num_q_heads, gqa_group, 1, padded_sl_s,
                                     kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
                                     s_device_id, s_sm_count, stream);
     } else {
       ok = launch_fmha_batched<512>(q_fmha, k, v, o_fmha, lse_scratch,
-                                    num_q_heads, gqa_group, padded_sl_s,
+                                    num_q_heads, gqa_group, 1, padded_sl_s,
                                     kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
                                     s_device_id, s_sm_count, stream);
