@@ -122,6 +122,11 @@ class GemmaAttentionMetadata:
     # D2H + stream sync in the SM90 launcher.
     seq_lens_cpu: torch.Tensor | None = None
     query_start_loc_cpu: torch.Tensor | None = None
+    # Small-q extend steps (prefix-cache recompute, tiny extends): per-offset
+    # (rows, seq_idx, seq_lens, max_seq_len) decode sub-batches, precomputed
+    # host-side once per step. When set, forward() runs these through the
+    # DECODE kernel (paged, split-KV, no gather) instead of any prefill path.
+    tiny_extend_plan: list | None = None
     # Multimodal bidirectional ("mm-prefix") image-token spans. Field names match
     # what Gemma4ForConditionalGeneration._clear_mm_prefix_for_full_attn_layers
     # looks for (it nulls these on full-attention layers so only sliding layers
@@ -235,6 +240,33 @@ class GemmaAttentionMetadataBuilder(
         # Shortest sequence (CPU-side; no GPU sync) for the top-k gate.
         min_seq_len = 0  # only needed for topk (disabled by default)
 
+        # Small-q extend plan: at 1 < max_query_len <= 4 every query token's
+        # KV is already written to the paged cache before attention runs, so
+        # row offset o of seq i is a plain paged decode at context_i + o + 1.
+        # The decode kernel beats both prefill paths by an order of magnitude
+        # on these steps (no gather, split-KV, one launch per offset).
+        tiny_extend_plan = None
+        mql = common_attn_metadata.max_query_len
+        if 1 < mql <= 4 and mm_range_tensor is None:
+            dev = common_attn_metadata.query_start_loc.device
+            cu = common_attn_metadata.query_start_loc_cpu
+            q_lens = (cu[1:] - cu[:-1]).to(torch.int64)
+            slc = common_attn_metadata.seq_lens_cpu.to(torch.int64)
+            plan = []
+            for o in range(int(mql)):
+                sel = (q_lens > o).nonzero(as_tuple=True)[0]
+                if sel.numel() == 0:
+                    break
+                rows = cu[:-1].to(torch.int64)[sel] + o
+                slens = slc[sel] - (q_lens[sel] - 1) + o
+                plan.append((
+                    rows.to(dev, non_blocking=True),
+                    sel.to(dev, non_blocking=True),
+                    slens.to(torch.int32).to(dev, non_blocking=True),
+                    int(slens.max()),
+                ))
+            tiny_extend_plan = plan
+
         return GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -244,8 +276,17 @@ class GemmaAttentionMetadataBuilder(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             min_seq_len=min_seq_len,
-            seq_lens_cpu=common_attn_metadata.seq_lens_cpu,
+            # seq_lens_cpu is a LAZY property that syncs GPU->CPU; touch it
+            # only on prefill-shaped steps (the only consumer). Fetching it
+            # unconditionally cost -12% decode tok/s at L=16k (one sync per
+            # decode step).
+            seq_lens_cpu=(
+                common_attn_metadata.seq_lens_cpu
+                if common_attn_metadata.max_query_len > 1
+                else None
+            ),
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+            tiny_extend_plan=tiny_extend_plan,
             mm_prefix_range=mm_ranges,
             mm_prefix_range_tensor=mm_range_tensor,
             use_cascade=use_cascade,
@@ -477,6 +518,10 @@ class GemmaAttentionImpl(AttentionImpl):
             value_cache = value_cache.view(fp8_dtype)
 
         if attn_metadata.max_query_len > 1:
+            if attn_metadata.tiny_extend_plan is not None:
+                return self._forward_tiny_extend(
+                    layer, query, key_cache, value_cache, output,
+                    attn_metadata)
             return self._forward_prefill(
                 query[:num_actual_tokens],
                 key_cache,
@@ -504,6 +549,53 @@ class GemmaAttentionImpl(AttentionImpl):
             attn_metadata,
         )
 
+    def _forward_tiny_extend(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+    ) -> torch.Tensor:
+        """Small-q extends as per-offset paged decodes (see builder note)."""
+        if self._empty_lse is None:
+            self._empty_lse = output.new_empty(0, dtype=torch.float32)
+            self._empty_sel = output.new_empty(0, dtype=torch.int32)
+        n = attn_metadata.num_actual_tokens
+        for rows, seq_sel, slens, max_sl in attn_metadata.tiny_extend_plan:
+            q_sub = query[:n].index_select(0, rows)
+            out_sub = torch.empty_like(q_sub)
+            bt_sub = attn_metadata.block_table.index_select(0, seq_sel)
+            exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
+                q_sub.shape[0], max_sl, query.dtype, query.device,
+            )
+            torch.ops._C.gemma_paged_attention(
+                out_sub,
+                exp_sums,
+                max_logits,
+                tmp_out,
+                q_sub,
+                key_cache,
+                value_cache,
+                self.num_kv_heads,
+                self.scale,
+                bt_sub,
+                slens,
+                key_cache.shape[1],
+                max_sl,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+                self.actual_head_size,
+                self.k_eq_v,
+                self.sliding_window,
+                self._empty_lse,
+                self._empty_sel,
+            )
+            output[:n].index_copy_(0, rows, out_sub)
+        return output
+
     def _forward_prefill(
         self,
         query: torch.Tensor,
@@ -520,10 +612,10 @@ class GemmaAttentionImpl(AttentionImpl):
             return self._forward_prefill_triton(
                 query, key_cache, value_cache, output, attn_metadata)
 
-        # P7: GEMMA_PREFILL=custom routes the default prefill through our own
-        # gemma_prefill_attention op (CUTLASS SM90 kernel when
-        # GEMMA_SM90_PREFILL=1, wmma fallback otherwise) instead of FA4.
-        if os.environ.get("GEMMA_PREFILL", "") == "custom":
+        # P7: prefill runs on our own gemma_prefill_attention op (CUTLASS
+        # SM90 kernel by default on Hopper, wmma otherwise). GEMMA_PREFILL=fa4
+        # is a benchmarking escape hatch only.
+        if os.environ.get("GEMMA_PREFILL", "custom") != "fa4":
             return self._forward_prefill_custom(
                 query, key_cache, value_cache, output, attn_metadata)
 
@@ -747,30 +839,36 @@ class GemmaAttentionImpl(AttentionImpl):
         suffix_out = torch.empty_like(query)
         suffix_lse = torch.empty(nq, num_seqs, dtype=torch.float32, device=dev)
 
-        # Prefix pass: all decode queries (as one merged sequence) attend to the
-        # shared prefix blocks (block_table row 0), non-causal, via FA4.
-        from vllm.v1.attention.backends.fa_utils import (
-            flash_attn_varlen_func,
+        # Prefix pass: all decode queries (as one merged sequence) attend to
+        # the shared prefix blocks (block_table row 0), non-causal, via the
+        # own prefill op (wmma path handles non_causal + LSE; the merged
+        # "sequence" is small so its speed is not TTFT-critical).
+        prefix_out = torch.empty_like(query)
+        prefix_lse = torch.empty(
+            nq, num_seqs, dtype=torch.float32, device=dev
         )
-
-        prefix_out, prefix_lse_raw = flash_attn_varlen_func(
-            q=query,
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=attn_metadata.cu_prefix_query_lens,
-            max_seqlen_q=num_seqs,
-            seqused_k=attn_metadata.prefix_kv_lens,
-            max_seqlen_k=attn_metadata.common_prefix_len,
-            softmax_scale=self.scale,
-            causal=False,
-            window_size=(-1, -1),
-            block_table=attn_metadata.block_table[:1],
-            softcap=0.0,
-            fa_version=self._fa_version,
-            return_softmax_lse=True,
+        torch.ops._C.gemma_prefill_attention(
+            prefix_out,
+            query,
+            key_cache,
+            value_cache,
+            self.num_kv_heads,
+            self.scale,
+            attn_metadata.block_table[:1],
+            attn_metadata.prefix_kv_lens,
+            attn_metadata.cu_prefix_query_lens,
+            num_seqs,
+            block_size,
+            self.k_eq_v,
+            0,
+            torch.empty(0, dtype=torch.int32, device=dev),
+            True,
+            prefix_lse,
+            torch.tensor(
+                [attn_metadata.common_prefix_len], dtype=torch.int32
+            ),
+            torch.tensor([0, num_seqs], dtype=torch.int32),
         )
-        # FA4 LSE shape: (1, nq, num_seqs) -> need (nq, num_seqs)
-        prefix_lse = prefix_lse_raw.squeeze(0)
 
         # Suffix pass: per-request causal decode over the post-prefix KV.
         suffix_bt = attn_metadata.block_table[:, ncb:].contiguous()

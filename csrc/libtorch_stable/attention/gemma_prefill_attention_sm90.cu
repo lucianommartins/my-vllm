@@ -31,7 +31,8 @@ __global__ void gather_kv_expanded_kernel(
     const int* __restrict__ block_table,
     int seq_len, int out_seq_stride, int num_q_heads, int num_kv_heads,
     int head_size, int gqa_group, int page_size,
-    int64_t stride_block, int64_t stride_slot, int64_t stride_head) {
+    int64_t stride_block, int64_t stride_slot, int64_t stride_head,
+    int tok_offset = 0) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = num_q_heads * seq_len * head_size;
   if (idx >= total) return;
@@ -41,8 +42,9 @@ __global__ void gather_kv_expanded_kernel(
   const int h_q = idx / (head_size * seq_len);
   const int h_kv = h_q / gqa_group;
 
-  const int logical_block = t / page_size;
-  const int slot = t % page_size;
+  const int tok = t + tok_offset;  // sliding: window slice, not full context
+  const int logical_block = tok / page_size;
+  const int slot = tok % page_size;
   const int physical_block = block_table[logical_block];
 
   kv_out[h_q * out_seq_stride * head_size + t * head_size + d] =
@@ -203,20 +205,27 @@ bool gemma_prefill_sm90_launcher(
     torch::stable::Tensor& lse_out, torch::stable::Tensor& seq_lens_cpu,
     torch::stable::Tensor& cu_seqlens_q_cpu) {
 
-  static const bool forced = []() {
+  // Default ON (P7): the CUTLASS warp-spec path is the production prefill on
+  // Hopper (TTFT 28.5/180.6/783ms at 512/4k/16k b=1 vs FA4's 34.4/177.4/773).
+  // GEMMA_SM90_PREFILL=0 reverts to the wmma v2 kernel.
+  static const bool enabled = []() {
     const char* e = getenv("GEMMA_SM90_PREFILL");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
-  if (!forced) return false;
+  if (!enabled) return false;
 
   const int num_q_heads = query.size(1);
   const int head_size = query.size(2);
   const int num_seqs = seq_lens.size(0);
 
   if (head_size != 256 && head_size != 512) return false;
-  if (non_causal) return false;
-  STD_TORCH_CHECK(lse_out.numel() == 0,
-                  "SM90 prefill: cascade LSE output not supported (prefill always passes empty lse_out)");
+  if (non_causal) return false;   // cascade prefix pass -> wmma fallback
+  if (lse_out.numel() > 0) return false;  // LSE epilogue not implemented here
+  // Tiny-query steps (1-token prefix-cache recompute, small extends): the
+  // per-seq gather+launch of this path costs more than the attention itself;
+  // the wmma kernel reads paged KV directly (no gather) and is decode-like
+  // at q_len<=16. Real prefills (chunked or full) stay here.
+  if (max_q_len <= 16) return false;
 
   constexpr int kAlignment = 16 / sizeof(T);
   if (max_q_len == 0) return false;
@@ -348,8 +357,19 @@ bool gemma_prefill_sm90_launcher(
     const int seq_len_s = equal_lens ? seq_len
                                      : (h_cu_seqlens_q[s + 1] - h_cu_seqlens_q[s]);
     if (seq_len_s == 0) continue;
-    const int kv_len_s = h_seq_lens[s];
-    const int q_off_s = kv_len_s - seq_len_s;  // context length
+    const int kv_len_full = h_seq_lens[s];
+    // Sliding layers only attend [q_min - sw + 1, kv_end): gather just that
+    // window slice. Chunked prefill previously re-gathered the WHOLE growing
+    // context every chunk per layer (~186ms/step at L=16k vs FA4's paged
+    // reads). kv_lo is the absolute token of gathered index 0; the kernel's
+    // masks are shift-invariant (q_offset shifted consistently).
+    int kv_lo = 0;
+    if (sliding_window > 0) {
+      kv_lo = kv_len_full - seq_len_s - sliding_window + 1;
+      if (kv_lo < 0) kv_lo = 0;
+    }
+    const int kv_len_s = kv_len_full - kv_lo;
+    const int q_off_s = kv_len_s - seq_len_s;  // context length (shifted)
     const int padded_sl_s = (seq_len_s + kAlignment - 1) / kAlignment * kAlignment;
     const bool needs_pad_s = (padded_sl_s != seq_len_s);
 
@@ -365,7 +385,7 @@ bool gemma_prefill_sm90_launcher(
     gather_kv_expanded_kernel<CACHE_T><<<gather_blocks, kThreads, 0, stream>>>(
         k_expanded, key_cache_ptr, seq_block_table, kv_len_s, kv_len_s,
         num_kv_heads, num_kv_heads, head_size, /*gqa_group=*/1, page_size,
-        kv_stride_block, kv_stride_slot, kv_stride_head);
+        kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
 
     if (!k_eq_v) {
       gather_kv_expanded_kernel<CACHE_T>
@@ -373,7 +393,7 @@ bool gemma_prefill_sm90_launcher(
               v_expanded, value_cache_ptr, seq_block_table, kv_len_s,
               kv_len_s, num_kv_heads, num_kv_heads, head_size,
               /*gqa_group=*/1, page_size,
-              kv_stride_block, kv_stride_slot, kv_stride_head);
+              kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
     }
 
     Element* q_src = query_ptr + token_offset * q_stride;
