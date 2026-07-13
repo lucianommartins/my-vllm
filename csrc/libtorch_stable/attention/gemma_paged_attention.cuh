@@ -1646,6 +1646,374 @@ gemma_decode_mma_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Gate D: fused mma.sync decode (register softmax). Differences vs the wmma
+// stream kernel: S never touches smem (each warp owns an 8-column slice of
+// S[16, BLOCK_N] in mma.sync c-frags with a DOCUMENTED thread layout, so the
+// online softmax runs in registers; only 16 f32 of row-stats per warp cross
+// through smem); QK runs on ALL warps (one n8 slice each); 3 CTA barriers per
+// tile instead of 4-5. O rescale needs no data movement at all: the same
+// lane owns the same rows in the S and O fragments. Split partials use the
+// stream kernel's exact base-2 conventions -> combine v2 reused verbatim.
+// GROUP <= 16, BLOCK_N == 8 * NWARP (64), bf16, k_eq_v or V_SMEM staged.
+// ---------------------------------------------------------------------------
+template <typename scalar_t, typename cache_t, int HEAD_SIZE, int GQA_GROUP,
+          bool K_EQ_V, bool USE_SLIDING_WINDOW, bool SPLIT>
+__global__ void __launch_bounds__(256, 1)
+gemma_decode_fused_kernel(
+    scalar_t* __restrict__ out_or_tmp,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const scalar_t* __restrict__ q,
+    const cache_t* __restrict__ k_cache,
+    const cache_t* __restrict__ v_cache,
+    const int num_kv_heads, const float scale,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int max_num_blocks_per_seq, const int page_size, const int q_stride,
+    const int64_t kv_stride_block, const int64_t kv_stride_slot,
+    const int64_t kv_stride_head, const int sliding_window,
+    const int num_splits, const int max_parts,
+    float* __restrict__ lse_out = nullptr) {
+  constexpr int NWARP = 8;
+  constexpr int BLOCK_N = 8 * NWARP;        // 64: one n8 S-slice per warp
+  constexpr int KCH = HEAD_SIZE / 16;       // QK k-chunks
+  constexpr int HDPW = HEAD_SIZE / NWARP;   // O head-slice per warp
+  constexpr int NPV = HDPW / 8;             // O n8 tiles per warp
+  constexpr int SPAD = 8;
+  constexpr int LDH = HEAD_SIZE + SPAD;
+  constexpr int LDN = BLOCK_N + SPAD;
+  constexpr int VEC = 16 / sizeof(cache_t);
+  constexpr bool V_SMEM = !K_EQ_V;          // decode: stage V unless V==K
+  constexpr int KTILE = BLOCK_N * LDH;
+  constexpr int STAGE = KTILE * (V_SMEM ? 2 : 1);
+  // 2-stage double buffer (3-stage measured -3%: depth is not the decode
+  // constraint; modulo indexing + fatter footprint cost more than they buy).
+  constexpr int NSTG = 2;
+  static_assert(GQA_GROUP <= 16 && HEAD_SIZE % (16 * NWARP) == 0);
+
+  const int kv_head = blockIdx.x;
+  const int seq_idx = blockIdx.y;
+  const int split_idx = SPLIT ? blockIdx.z : 0;
+  const int nsplits = SPLIT ? num_splits : 1;
+  const int num_q_heads = gridDim.x * GQA_GROUP;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int group = lane >> 2, tg = lane & 3;   // c-frag: rows {group, group+8}
+  const int seq_len = seq_lens[seq_idx];
+  const int nthreads = NWARP * 32;
+
+#define DFUSED_PART(qh) \
+  (((int64_t)(seq_idx) * num_q_heads + (qh)) * max_parts + split_idx)
+
+  int kv_begin = 0;
+  if (USE_SLIDING_WINDOW && sliding_window > 0) {
+    const int lo = seq_len - sliding_window;
+    kv_begin = (lo > 0) ? (lo / BLOCK_N) * BLOCK_N : 0;
+  }
+  const int n_tiles = GEMMA_CDIV(seq_len - kv_begin, BLOCK_N);
+  const int tiles_per_split = GEMMA_CDIV(n_tiles, nsplits);
+  const int tile_lo = split_idx * tiles_per_split;
+  int tile_hi = tile_lo + tiles_per_split;
+  if (tile_hi > n_tiles) tile_hi = n_tiles;
+  const int hvps = HEAD_SIZE / VEC;
+
+  if (SPLIT && tile_lo >= tile_hi) {
+    for (int g = warp; g < GQA_GROUP; g += NWARP)
+      if (lane == 0) {
+        const int qh = kv_head * GQA_GROUP + g;
+        max_logits[DFUSED_PART(qh)] = -FLT_MAX;
+        exp_sums[DFUSED_PART(qh)] = 0.f;
+      }
+    for (int iv = tid; iv < GQA_GROUP * hvps; iv += nthreads) {
+      const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
+      const int qh = kv_head * GQA_GROUP + r;
+      *reinterpret_cast<uint4*>(out_or_tmp + DFUSED_PART(qh) * HEAD_SIZE + dv) =
+          uint4{0, 0, 0, 0};
+    }
+    return;
+  }
+
+  extern __shared__ char df_smem[];
+  cache_t* sQ = reinterpret_cast<cache_t*>(df_smem);        // [16, LDH]
+  cache_t* sKV = sQ + 16 * LDH;                             // NSTG-stage ring
+  cache_t* sP = sKV + NSTG * STAGE;                         // [16, LDN] bf16
+  float* sWm = reinterpret_cast<float*>(sP + 16 * LDN);     // [NWARP, 16]
+  float* sWl = sWm + NWARP * 16;                            // [NWARP, 16]
+#define DF_KBUF(s) (sKV + (s) * STAGE)
+#define DF_VBUF(s) (DF_KBUF(s) + KTILE)
+
+  // Q rows 0..GQA_GROUP-1 real, rest zero (M=16 pad).
+  for (int iv = tid; iv < 16 * hvps; iv += nthreads) {
+    const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
+    if (r < GQA_GROUP) {
+      const scalar_t* gq =
+          q + (int64_t)seq_idx * q_stride + (kv_head * GQA_GROUP + r) * HEAD_SIZE + dv;
+      *reinterpret_cast<uint4*>(sQ + r * LDH + dv) =
+          *reinterpret_cast<const uint4*>(gq);
+    } else {
+      *reinterpret_cast<uint4*>(sQ + r * LDH + dv) = uint4{0, 0, 0, 0};
+    }
+  }
+
+  // Zero the ring once so tail-pad rows stay finite for the mma (lazy
+  // per-tile pad zeroing measured SLOWER and subtly racy — keep this).
+  for (int i = tid; i < NSTG * STAGE; i += nthreads)
+    sKV[i] = static_cast<cache_t>(0);
+
+  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+  const float scale_log2 = scale * LOG2E;
+  const int q_abs = seq_len - 1;
+  const int ntiles_local = tile_hi - tile_lo;
+
+  // Q fragments cached in registers for the WHOLE loop: this thread only
+  // ever consumes rows {group, group+8} at cols {2tg, 2tg+1} (+8) of each
+  // k16 chunk. Re-reading them from smem cost ~128KB of smem traffic per
+  // tile. KCH*4 uint32 = 128 regs at hd512.
+  uint32_t qreg[KCH][4];
+  __syncthreads();  // sQ populated
+  {
+    const cache_t* q0 = sQ + group * LDH;
+    const cache_t* q1 = sQ + (group + 8) * LDH;
+#pragma unroll
+    for (int c = 0; c < KCH; c++) {
+      qreg[c][0] = *reinterpret_cast<const uint32_t*>(q0 + c * 16 + 2 * tg);
+      qreg[c][1] = *reinterpret_cast<const uint32_t*>(q1 + c * 16 + 2 * tg);
+      qreg[c][2] = *reinterpret_cast<const uint32_t*>(q0 + c * 16 + 2 * tg + 8);
+      qreg[c][3] = *reinterpret_cast<const uint32_t*>(q1 + c * 16 + 2 * tg + 8);
+    }
+  }
+
+  // Per-thread online state for its two c-frag rows (quad-redundant).
+  float m_run0 = -FLT_MAX, m_run1 = -FLT_MAX;
+  float l_run0 = 0.f, l_run1 = 0.f;
+  float oacc[NPV][4];
+#pragma unroll
+  for (int n = 0; n < NPV; n++)
+    oacc[n][0] = oacc[n][1] = oacc[n][2] = oacc[n][3] = 0.f;
+
+#define DF_STAGE(ti, st)                                                       \
+  do {                                                                         \
+    const int _kv0 = kv_begin + (ti) * BLOCK_N;                                \
+    const int _ntok = min(BLOCK_N, seq_len - _kv0);                            \
+    for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {                  \
+      const int n = iv / hvps, dv = (iv - n * hvps) * VEC;                     \
+      if (n < _ntok) {                                                         \
+        const int tok = _kv0 + n;                                              \
+        const int64_t phys = block_table[tok / page_size];                     \
+        const int64_t off = phys * kv_stride_block +                           \
+                            (tok % page_size) * kv_stride_slot +               \
+                            kv_head * kv_stride_head + dv;                     \
+        __pipeline_memcpy_async(DF_KBUF(st) + n * LDH + dv, k_cache + off,     \
+                                16);                                           \
+        if (V_SMEM)                                                            \
+          __pipeline_memcpy_async(DF_VBUF(st) + n * LDH + dv, v_cache + off,   \
+                                  16);                                         \
+      }                                                                        \
+    }                                                                          \
+    __pipeline_commit();                                                       \
+  } while (0)
+
+  __syncthreads();
+  DF_STAGE(tile_lo, 0);
+  if (NSTG >= 3 && ntiles_local > 1) DF_STAGE(tile_lo + 1, 1);
+
+  for (int t = 0; t < ntiles_local; t++) {
+    const int cur = (NSTG == 2) ? (t & 1) : (t % NSTG);
+    {
+      const int rem = ntiles_local - 1 - t;  // tiles still outstanding
+      __pipeline_wait_prior(rem >= NSTG - 1 ? NSTG - 1 : rem);
+    }
+    __syncthreads();  // B1: staged K(+V) visible CTA-wide
+
+    const int kv0 = kv_begin + (tile_lo + t) * BLOCK_N;
+    const int n_tok = min(BLOCK_N, seq_len - kv0);
+    cache_t* kbuf = DF_KBUF(cur);
+    cache_t* vbuf = V_SMEM ? DF_VBUF(cur) : kbuf;
+
+    // ---- QK: this warp's n8 slice, Q from registers ----
+    float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int c = 0; c < KCH; c++) {
+      uint32_t kb[2];
+      mma_ldm_x2(kb, kbuf + (warp * 8 + (lane & 7)) * LDH + c * 16 +
+                         ((lane >> 3) & 1) * 8);
+      mma_m16n8k16(sacc, qreg[c], kb, sacc);
+    }
+
+    // ---- masking + slice row-max (registers) ----
+    const int col0 = kv0 + warp * 8 + 2 * tg;      // this thread's 2 columns
+    const bool v0 = (warp * 8 + 2 * tg) < n_tok;
+    const bool v1 = (warp * 8 + 2 * tg + 1) < n_tok;
+    bool s0 = v0, s1 = v1;
+    if (USE_SLIDING_WINDOW && sliding_window > 0) {
+      s0 = s0 && (col0 > q_abs - sliding_window);
+      s1 = s1 && (col0 + 1 > q_abs - sliding_window);
+    }
+    if (!s0) { sacc[0] = -FLT_MAX; sacc[2] = -FLT_MAX; }
+    if (!s1) { sacc[1] = -FLT_MAX; sacc[3] = -FLT_MAX; }
+    float sm0 = fmaxf(sacc[0], sacc[1]);
+    float sm1 = fmaxf(sacc[2], sacc[3]);
+#pragma unroll
+    for (int o = 1; o <= 2; o <<= 1) {
+      sm0 = fmaxf(sm0, __shfl_xor_sync(0xffffffffu, sm0, o));
+      sm1 = fmaxf(sm1, __shfl_xor_sync(0xffffffffu, sm1, o));
+    }
+    if (tg == 0) {
+      sWm[warp * 16 + group] = sm0;
+      sWm[warp * 16 + group + 8] = sm1;
+    }
+    __syncthreads();  // B2: stats visible; PV(t-1) provably complete
+
+    // Prefetch tile t+NSTG-1 now: overlaps softmax+PV. Its ring slot was
+    // last read at iteration t-1, and B2 (all threads past QK(t)) certifies
+    // iteration t-1 fully complete.
+    if (t + NSTG - 1 < ntiles_local)
+      DF_STAGE(tile_lo + t + NSTG - 1, (t + NSTG - 1) % NSTG);
+
+    // ---- global row stats + exp + P + O rescale (registers) ----
+    float tm0 = -FLT_MAX, tm1 = -FLT_MAX;
+#pragma unroll
+    for (int w = 0; w < NWARP; w++) {
+      tm0 = fmaxf(tm0, sWm[w * 16 + group]);
+      tm1 = fmaxf(tm1, sWm[w * 16 + group + 8]);
+    }
+    const float mn0 = fmaxf(m_run0, tm0);
+    const float mn1 = fmaxf(m_run1, tm1);
+    const float al0 =
+        (m_run0 <= -FLT_MAX) ? 0.f : exp2f((m_run0 - mn0) * scale_log2);
+    const float al1 =
+        (m_run1 <= -FLT_MAX) ? 0.f : exp2f((m_run1 - mn1) * scale_log2);
+    float p0 = s0 && mn0 > -FLT_MAX ? exp2f((sacc[0] - mn0) * scale_log2) : 0.f;
+    float p1 = s1 && mn0 > -FLT_MAX ? exp2f((sacc[1] - mn0) * scale_log2) : 0.f;
+    float p2 = s0 && mn1 > -FLT_MAX ? exp2f((sacc[2] - mn1) * scale_log2) : 0.f;
+    float p3 = s1 && mn1 > -FLT_MAX ? exp2f((sacc[3] - mn1) * scale_log2) : 0.f;
+    m_run0 = mn0; m_run1 = mn1;
+    // P -> smem (bf16 pairs; this warp's 8 columns).
+    {
+      __nv_bfloat162* d0 = reinterpret_cast<__nv_bfloat162*>(
+          sP + group * LDN + warp * 8 + 2 * tg);
+      __nv_bfloat162* d1 = reinterpret_cast<__nv_bfloat162*>(
+          sP + (group + 8) * LDN + warp * 8 + 2 * tg);
+      *d0 = __floats2bfloat162_rn(p0, p1);
+      *d1 = __floats2bfloat162_rn(p2, p3);
+    }
+    // slice row-sums -> smem
+    float ss0 = p0 + p1, ss1 = p2 + p3;
+#pragma unroll
+    for (int o = 1; o <= 2; o <<= 1) {
+      ss0 += __shfl_xor_sync(0xffffffffu, ss0, o);
+      ss1 += __shfl_xor_sync(0xffffffffu, ss1, o);
+    }
+    if (tg == 0) {
+      sWl[warp * 16 + group] = ss0;
+      sWl[warp * 16 + group + 8] = ss1;
+    }
+    // O rescale: same lanes own the same rows in O c-frags.
+#pragma unroll
+    for (int n = 0; n < NPV; n++) {
+      oacc[n][0] *= al0; oacc[n][1] *= al0;
+      oacc[n][2] *= al1; oacc[n][3] *= al1;
+    }
+    __syncthreads();  // B3: sP + sWl visible
+
+    // ---- PV: O[:, warp's HDPW slice] += P[16, BLOCK_N] @ V ----
+#pragma unroll
+    for (int kk = 0; kk < BLOCK_N / 16; kk++) {
+      uint32_t pa[4];
+      mma_ldm_x4(pa, sP + (lane & 15) * LDN + kk * 16 + (lane >> 4) * 8);
+#pragma unroll
+      for (int b = 0; b < NPV / 2; b++) {
+        const int hd = warp * HDPW + b * 16;
+        uint32_t vb[4];
+        mma_ldm_x4t(vb, vbuf + (kk * 16 + (lane & 15)) * LDH + hd +
+                            (lane >> 4) * 8);
+        mma_m16n8k16(oacc[2 * b], pa, &vb[0], oacc[2 * b]);
+        mma_m16n8k16(oacc[2 * b + 1], pa, &vb[2], oacc[2 * b + 1]);
+      }
+    }
+    // l update (quad-redundant, reads this tile's sWl).
+    {
+      float tl0 = 0.f, tl1 = 0.f;
+#pragma unroll
+      for (int w = 0; w < NWARP; w++) {
+        tl0 += sWl[w * 16 + group];
+        tl1 += sWl[w * 16 + group + 8];
+      }
+      l_run0 = l_run0 * al0 + tl0;
+      l_run1 = l_run1 * al1 + tl1;
+    }
+  }
+#undef DF_STAGE
+
+  // ---- epilogue: per-thread c-frag writes (rows group / group+8) ----
+  const float inv0 = (l_run0 > 0.f) ? (1.f / l_run0) : 0.f;
+  const float inv1 = (l_run1 > 0.f) ? (1.f / l_run1) : 0.f;
+  if (SPLIT) {
+    if (warp == 0 && tg == 0) {
+      if (group < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group;
+        max_logits[DFUSED_PART(qh)] = m_run0 * scale_log2;
+        exp_sums[DFUSED_PART(qh)] = l_run0;
+      }
+      if (group + 8 < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group + 8;
+        max_logits[DFUSED_PART(qh)] = m_run1 * scale_log2;
+        exp_sums[DFUSED_PART(qh)] = l_run1;
+      }
+    }
+#pragma unroll
+    for (int n = 0; n < NPV; n++) {
+      const int hd = warp * HDPW + n * 8 + 2 * tg;
+      if (group < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group;
+        scalar_t* go = out_or_tmp + DFUSED_PART(qh) * HEAD_SIZE + hd;
+        from_float(go[0], oacc[n][0] * inv0);
+        from_float(go[1], oacc[n][1] * inv0);
+      }
+      if (group + 8 < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group + 8;
+        scalar_t* go = out_or_tmp + DFUSED_PART(qh) * HEAD_SIZE + hd;
+        from_float(go[0], oacc[n][2] * inv1);
+        from_float(go[1], oacc[n][3] * inv1);
+      }
+    }
+  } else {
+#pragma unroll
+    for (int n = 0; n < NPV; n++) {
+      const int hd = warp * HDPW + n * 8 + 2 * tg;
+      if (group < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group;
+        scalar_t* go = out_or_tmp + (int64_t)seq_idx * num_q_heads * HEAD_SIZE +
+                       qh * HEAD_SIZE + hd;
+        from_float(go[0], oacc[n][0] * inv0);
+        from_float(go[1], oacc[n][1] * inv0);
+      }
+      if (group + 8 < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group + 8;
+        scalar_t* go = out_or_tmp + (int64_t)seq_idx * num_q_heads * HEAD_SIZE +
+                       qh * HEAD_SIZE + hd;
+        from_float(go[0], oacc[n][2] * inv1);
+        from_float(go[1], oacc[n][3] * inv1);
+      }
+    }
+    if (lse_out != nullptr && warp == 0 && tg == 0) {
+      const int num_seqs = gridDim.y;
+      if (group < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group;
+        lse_out[(int64_t)qh * num_seqs + seq_idx] =
+            m_run0 * scale + logf(l_run0 > 0.f ? l_run0 : 1e-30f);
+      }
+      if (group + 8 < GQA_GROUP) {
+        const int qh = kv_head * GQA_GROUP + group + 8;
+        lse_out[(int64_t)qh * num_seqs + seq_idx] =
+            m_run1 * scale + logf(l_run1 > 0.f ? l_run1 : 1e-30f);
+      }
+    }
+  }
+#undef DFUSED_PART
+}
+
+// ---------------------------------------------------------------------------
 // Bandwidth-first SIMT decode (no tensor cores). The wmma stream kernel is
 // occupancy-limited (79 reg + 52KB smem -> 3 CTA/SM -> 37.5% occ -> 40% DRAM,
 // latency-bound). This kernel is lean: O accumulated in registers (no wmma

@@ -220,6 +220,54 @@ static constexpr int DS_MINCTA_256 = 3;
 // or 2 CTA/SM (BN=32). Covers the two gemma-4 decode configs: hd512 k_eq_v
 // full (GROUP 16) and hd256 sliding (GROUP 2). Opt-in via GEMMA_DECODE_BN
 // for A/B against the BLOCK_N=16 default.
+// Gate D fused mma.sync decode (register softmax). BLOCK_N fixed at 64
+// (8 warps x n8 slices). smem = sQ + 2-stage K(+V) ring + sP + warp stats.
+#define LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, SPLITB)                     \
+  do {                                                                         \
+    const dim3 fgrid = (SPLITB) ? dim3(num_kv_heads, num_seqs, num_splits)     \
+                                : dim3(num_kv_heads, num_seqs);                 \
+    constexpr int FLDH = (HEAD) + 8;                                           \
+    constexpr int FLDN = 64 + 8;                                               \
+    constexpr int FSTAGE = 64 * FLDH * ((KEQV) ? 1 : 2);                       \
+    constexpr int FNSTG = 2;                                                   \
+    size_t fsmem = (size_t)(16 * FLDH + FNSTG * FSTAGE + 16 * FLDN)            \
+                       * sizeof(CACHE_T)                                       \
+                   + (size_t)(2 * 8 * 16) * sizeof(float);                     \
+    auto fk = vllm::gemma::gemma_decode_fused_kernel<                          \
+        T, CACHE_T, HEAD, GROUP, KEQV, USW, SPLITB>;                           \
+    {                                                                          \
+      static bool fattr = false;                                               \
+      if (!fattr) {                                                            \
+        if (fsmem > 48 * 1024)                                                 \
+          cudaFuncSetAttribute(                                                \
+              fk, cudaFuncAttributeMaxDynamicSharedMemorySize, fsmem);         \
+        cudaFuncSetAttribute(                                                  \
+            fk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);          \
+        fattr = true;                                                          \
+      }                                                                        \
+    }                                                                          \
+    T* fout = (SPLITB) ? tmp_out_ptr : out_ptr;                                \
+    fk<<<fgrid, 256, fsmem, stream>>>(                                         \
+        fout, exp_sums_ptr, max_logits_ptr, query_ptr, key_cache_ptr,          \
+        value_cache_ptr, num_kv_heads, scale, block_tables_ptr,                \
+        seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,            \
+        kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,       \
+        num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr);              \
+    if (SPLITB) {                                                              \
+      const dim3 fcg(num_kv_heads * (GROUP), num_seqs);                        \
+      LAUNCH_GEMMA_COMBINE(HEAD, fcg, lse_out_ptr);                            \
+    }                                                                          \
+  } while (0)
+
+#define LAUNCH_GEMMA_FUSED_SB(HEAD, GROUP, KEQV, USW)                          \
+  do {                                                                         \
+    if (num_splits > 1) {                                                      \
+      LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true);                        \
+    } else {                                                                   \
+      LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false);                       \
+    }                                                                          \
+  } while (0)
+
 #define LAUNCH_GEMMA_STREAM_BIGTILE(HEAD, BN, MINCTA, GROUP, KEQV, USW, NST)   \
   do {                                                                         \
     STD_TORCH_CHECK(gqa_group == (GROUP), "bigtile decode expects group ",     \
@@ -429,6 +477,11 @@ void gemma_paged_attention_launcher(
   // b16 short attn -33%). GEMMA_DECODE_BN=16 reverts to the legacy path;
   // =32 selects the mid tile. Declared before the split heuristic: bigtile
   // changes the split target (<=1 wave at its 1-2 CTA/SM residency).
+  // Gate D: fused mma.sync decode (register softmax), opt-in for A/B.
+  static const bool decode_fused = []() {
+    const char* e = getenv("GEMMA_DECODE_FUSED");
+    return e != nullptr && e[0] == '1';
+  }();
   static const int decode_bn = []() {
     const char* e = getenv("GEMMA_DECODE_BN");
     const int v = (e != nullptr) ? atoi(e) : 64;
@@ -624,6 +677,11 @@ void gemma_paged_attention_launcher(
     bool did_stream = false;                                       \
     if constexpr (DS_DTYPE_OK) {                                   \
       if constexpr ((KEQV) && !(USW) && (HS) == 512) {             \
+        if (!did_stream && use_stream && decode_fused &&           \
+            gqa_group == 16) {                                     \
+          LAUNCH_GEMMA_FUSED_SB(512, 16, true, false);             \
+          did_stream = true;                                       \
+        }                                                          \
         if (!did_stream && use_stream && decode_bn != 0 &&         \
             gqa_group == 16) {                                     \
           if (decode_bn == 96) {                                   \
