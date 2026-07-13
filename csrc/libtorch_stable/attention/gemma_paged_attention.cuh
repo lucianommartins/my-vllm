@@ -1820,10 +1820,22 @@ gemma_decode_fused_kernel(
   for (int t = 0; t < ntiles_local; t++) {
     const int cur = (NSTG == 2) ? (t & 1) : (t % NSTG);
     {
+      // Unlike the stream ring (issue-at-top), this kernel commits tile
+      // t+NSTG-1 AFTER B2, so at this wait the newest committed group IS
+      // tile t: in-flight-but-not-needed = min(rem, NSTG-2), NOT NSTG-1.
+      // (NSTG-1 skipped the wait on the current tile -> QK read zeros
+      // under DMA contention; showed as 0.007-0.02 split-partial error.)
       const int rem = ntiles_local - 1 - t;  // tiles still outstanding
-      __pipeline_wait_prior(rem >= NSTG - 1 ? NSTG - 1 : rem);
+      __pipeline_wait_prior(rem >= NSTG - 2 ? NSTG - 2 : rem);
     }
     __syncthreads();  // B1: staged K(+V) visible CTA-wide
+
+    // Prefetch tile t+NSTG-1 right after B1: every thread passed the loop
+    // back-edge to reach B1, so iteration t-1's reads of this ring slot are
+    // complete CTA-wide. Committing here (vs post-B2) gives the DMA the
+    // whole iteration (QK+softmax+PV) to land instead of just softmax+PV.
+    if (t + NSTG - 1 < ntiles_local)
+      DF_STAGE(tile_lo + t + NSTG - 1, (t + NSTG - 1) % NSTG);
 
     const int kv0 = kv_begin + (tile_lo + t) * BLOCK_N;
     const int n_tok = min(BLOCK_N, seq_len - kv0);
@@ -1862,13 +1874,7 @@ gemma_decode_fused_kernel(
       sWm[warp * 16 + group] = sm0;
       sWm[warp * 16 + group + 8] = sm1;
     }
-    __syncthreads();  // B2: stats visible; PV(t-1) provably complete
-
-    // Prefetch tile t+NSTG-1 now: overlaps softmax+PV. Its ring slot was
-    // last read at iteration t-1, and B2 (all threads past QK(t)) certifies
-    // iteration t-1 fully complete.
-    if (t + NSTG - 1 < ntiles_local)
-      DF_STAGE(tile_lo + t + NSTG - 1, (t + NSTG - 1) % NSTG);
+    __syncthreads();  // B2: stats visible
 
     // ---- global row stats + exp + P + O rescale (registers) ----
     float tm0 = -FLT_MAX, tm1 = -FLT_MAX;
