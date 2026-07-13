@@ -1657,8 +1657,8 @@ gemma_decode_mma_kernel(
 // GROUP <= 16, BLOCK_N == 8 * NWARP (64), bf16, k_eq_v or V_SMEM staged.
 // ---------------------------------------------------------------------------
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int GQA_GROUP,
-          bool K_EQ_V, bool USE_SLIDING_WINDOW, bool SPLIT>
-__global__ void __launch_bounds__(256, 1)
+          bool K_EQ_V, bool USE_SLIDING_WINDOW, bool SPLIT, int NWARP_T = 8>
+__global__ void __launch_bounds__(NWARP_T * 32, 1)
 gemma_decode_fused_kernel(
     scalar_t* __restrict__ out_or_tmp,
     float* __restrict__ exp_sums,
@@ -1674,8 +1674,8 @@ gemma_decode_fused_kernel(
     const int64_t kv_stride_head, const int sliding_window,
     const int num_splits, const int max_parts,
     float* __restrict__ lse_out = nullptr) {
-  constexpr int NWARP = 8;
-  constexpr int BLOCK_N = 8 * NWARP;        // 64: one n8 S-slice per warp
+  constexpr int NWARP = NWARP_T;            // 8 (BN64) or 4 (BN32, 2-3 CTA/SM)
+  constexpr int BLOCK_N = 8 * NWARP;        // one n8 S-slice per warp
   constexpr int KCH = HEAD_SIZE / 16;       // QK k-chunks
   constexpr int HDPW = HEAD_SIZE / NWARP;   // O head-slice per warp
   constexpr int NPV = HDPW / 8;             // O n8 tiles per warp

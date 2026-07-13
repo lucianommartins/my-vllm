@@ -222,19 +222,20 @@ static constexpr int DS_MINCTA_256 = 3;
 // for A/B against the BLOCK_N=16 default.
 // Gate D fused mma.sync decode (register softmax). BLOCK_N fixed at 64
 // (8 warps x n8 slices). smem = sQ + 2-stage K(+V) ring + sP + warp stats.
-#define LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, SPLITB)                     \
+#define LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, SPLITB, NW)                 \
   do {                                                                         \
     const dim3 fgrid = (SPLITB) ? dim3(num_kv_heads, num_seqs, num_splits)     \
                                 : dim3(num_kv_heads, num_seqs);                 \
     constexpr int FLDH = (HEAD) + 8;                                           \
-    constexpr int FLDN = 64 + 8;                                               \
-    constexpr int FSTAGE = 64 * FLDH * ((KEQV) ? 1 : 2);                       \
+    constexpr int FBN = 8 * (NW);                                              \
+    constexpr int FLDN = FBN + 8;                                              \
+    constexpr int FSTAGE = FBN * FLDH * ((KEQV) ? 1 : 2);                      \
     constexpr int FNSTG = 2;                                                   \
     size_t fsmem = (size_t)(16 * FLDH + FNSTG * FSTAGE + 16 * FLDN)            \
                        * sizeof(CACHE_T)                                       \
-                   + (size_t)(2 * 8 * 16) * sizeof(float);                     \
+                   + (size_t)(2 * (NW) * 16) * sizeof(float);                  \
     auto fk = vllm::gemma::gemma_decode_fused_kernel<                          \
-        T, CACHE_T, HEAD, GROUP, KEQV, USW, SPLITB>;                           \
+        T, CACHE_T, HEAD, GROUP, KEQV, USW, SPLITB, NW>;                       \
     {                                                                          \
       static bool fattr = false;                                               \
       if (!fattr) {                                                            \
@@ -247,7 +248,7 @@ static constexpr int DS_MINCTA_256 = 3;
       }                                                                        \
     }                                                                          \
     T* fout = (SPLITB) ? tmp_out_ptr : out_ptr;                                \
-    fk<<<fgrid, 256, fsmem, stream>>>(                                         \
+    fk<<<fgrid, (NW) * 32, fsmem, stream>>>(                                   \
         fout, exp_sums_ptr, max_logits_ptr, query_ptr, key_cache_ptr,          \
         value_cache_ptr, num_kv_heads, scale, block_tables_ptr,                \
         seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,            \
@@ -261,10 +262,18 @@ static constexpr int DS_MINCTA_256 = 3;
 
 #define LAUNCH_GEMMA_FUSED_SB(HEAD, GROUP, KEQV, USW)                          \
   do {                                                                         \
-    if (num_splits > 1) {                                                      \
-      LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true);                        \
+    if (fused_nw == 4) {                                                       \
+      if (num_splits > 1) {                                                    \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true, 4);                   \
+      } else {                                                                 \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false, 4);                  \
+      }                                                                        \
     } else {                                                                   \
-      LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false);                       \
+      if (num_splits > 1) {                                                    \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true, 8);                   \
+      } else {                                                                 \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false, 8);                  \
+      }                                                                        \
     }                                                                          \
   } while (0)
 
@@ -485,6 +494,21 @@ void gemma_paged_attention_launcher(
     const char* e = getenv("GEMMA_DECODE_FUSED");
     return e == nullptr || e[0] != '0';
   }();
+  // Fused CTA width: 8-warp/BN64 for deep-work regimes; 4-warp/BN32 when the
+  // base grid is already wide (many small CTAs pack 2-3/SM and win -26% at
+  // hd256 short-b32; measured LOSS at long context / narrow grids). Keyed on
+  // num_seqs*kv_heads only -> sequence-independent -> CUDA-graph-safe.
+  // GEMMA_DECODE_FUSED_NW=4|8 overrides.
+  static const int fused_nw_env = []() {
+    const char* e = getenv("GEMMA_DECODE_FUSED_NW");
+    if (e == nullptr) return 0;
+    return e[0] == '4' ? 4 : (e[0] == '8' ? 8 : 0);
+  }();
+  const int fused_nw =
+      (fused_nw_env != 0)
+          ? fused_nw_env
+          : ((num_seqs * (num_kv_heads > 0 ? num_kv_heads : 1) >= 256) ? 4
+                                                                       : 8);
   static const int decode_bn = []() {
     const char* e = getenv("GEMMA_DECODE_BN");
     const int v = (e != nullptr) ? atoi(e) : 64;
