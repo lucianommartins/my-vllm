@@ -232,11 +232,16 @@ bool gemma_prefill_sm90_launcher(
   if (head_size != 256 && head_size != 512) return false;
   if (non_causal) return false;   // cascade prefix pass -> wmma fallback
   if (lse_out.numel() > 0) return false;  // LSE epilogue not implemented here
-  // Tiny-query steps (1-token prefix-cache recompute, small extends): the
-  // per-seq gather+launch of this path costs more than the attention itself;
-  // the wmma kernel reads paged KV directly (no gather) and is decode-like
-  // at q_len<=16. Real prefills (chunked or full) stay here.
-  if (max_q_len <= 16) return false;
+  // Tiny-query steps (prefix-cache last-block recompute q<=17, small
+  // extends): the per-seq gather+launch of this path costs more than the
+  // attention itself; the wmma kernel reads paged KV directly (no gather)
+  // and is decode-like at small q. Real prefills (chunked q>=64 or full)
+  // stay here.
+  if (getenv("GEMMA_PREFILL_DEBUG") != nullptr) {
+    fprintf(stderr, "[sm90-prefill] num_seqs=%d max_q_len=%d num_tokens=%d\n",
+            num_seqs, max_q_len, static_cast<int>(query.size(0)));
+  }
+  if (max_q_len <= 32) return false;
 
   constexpr int kAlignment = 16 / sizeof(T);
   if (max_q_len == 0) return false;
