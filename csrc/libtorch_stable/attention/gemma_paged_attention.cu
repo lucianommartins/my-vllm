@@ -477,10 +477,13 @@ void gemma_paged_attention_launcher(
   // b16 short attn -33%). GEMMA_DECODE_BN=16 reverts to the legacy path;
   // =32 selects the mid tile. Declared before the split heuristic: bigtile
   // changes the split target (<=1 wave at its 1-2 CTA/SM residency).
-  // Gate D: fused mma.sync decode (register softmax), opt-in for A/B.
+  // Gate D: fused mma.sync decode (register softmax) — DEFAULT. Won every
+  // measured cell vs the wmma stream kernel (hd512 −7..14%, hd256 −11%,
+  // short-b32 attn −16%; E2E b16/b32 flip to wins, 16k 226.7).
+  // GEMMA_DECODE_FUSED=0 reverts to the wmma bigtile stream kernel.
   static const bool decode_fused = []() {
     const char* e = getenv("GEMMA_DECODE_FUSED");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   static const int decode_bn = []() {
     const char* e = getenv("GEMMA_DECODE_BN");
@@ -698,6 +701,11 @@ void gemma_paged_attention_launcher(
         }                                                          \
       }                                                            \
       if constexpr (!(KEQV) && (USW) && (HS) == 256) {             \
+        if (!did_stream && use_stream && decode_fused &&           \
+            gqa_group == 2) {                                      \
+          LAUNCH_GEMMA_FUSED_SB(256, 2, false, true);              \
+          did_stream = true;                                       \
+        }                                                          \
         if (!did_stream && use_stream && decode_bn != 0 &&         \
             gqa_group == 2) {                                      \
           if (decode_bn >= 64) {                                   \
