@@ -458,17 +458,8 @@ bool gemma_prefill_sm90_launcher(
     fprintf(stderr, "[sm90-prefill] num_seqs=%d max_q_len=%d num_tokens=%d\n",
             num_seqs, max_q_len, static_cast<int>(query.size(0)));
   }
-  if (max_q_len <= 32) return false;
-
-  constexpr int kAlignment = 16 / sizeof(T);
-  if (max_q_len == 0) return false;
-
-  const int num_tokens = static_cast<int>(query.size(0));
-  const bool equal_lens = (num_tokens == num_seqs * max_q_len);
-
-  // Paged KV reads straight from the block_size=16 cache pool: no gather, no
-  // dense scratch, TMA descriptors stable across steps. GEMMA_PREFILL_PAGED=0
-  // reverts to the gather path.
+  // Paged KV reads straight from the block_size 16/64 cache pools: no
+  // gather, descriptors stable. GEMMA_PREFILL_PAGED=0 reverts.
   static const bool paged_enabled = []() {
     const char* e = getenv("GEMMA_PREFILL_PAGED");
     return e == nullptr || e[0] != '0';
@@ -483,6 +474,36 @@ bool gemma_prefill_sm90_launcher(
   if (prefill_debug)
     fprintf(stderr, "[sm90-prefill] use_paged=%d page_size=%d\n",
             int(use_paged), page_size);
+  // Tiny-q MULTI-SEQ batches (hd512 spec-verify: q=1+k, kv large) are now
+  // served by the batched paged/varlen/split paths (q padded to 8, one
+  // launch) — far faster than wmma at kv >> q. Single-seq tiny q keeps the
+  // wmma economics.
+  const bool mq_batched_ok =
+      head_size == 512 && num_seqs > 1 && use_paged &&
+      mm_prefix_ranges.numel() == 0 &&
+      cu_seqlens_q.numel() >= num_seqs + 1 && seq_lens.numel() >= num_seqs;
+  if (max_q_len <= 32 && !mq_batched_ok) return false;
+
+  constexpr int kAlignment = 16 / sizeof(T);
+  if (max_q_len == 0) return false;
+
+  const int num_tokens = static_cast<int>(query.size(0));
+  const bool equal_lens = (num_tokens == num_seqs * max_q_len);
+
+  // This launcher performs host-side work per call (Params init, grow-only
+  // cudaMalloc, cuTensorMapEncode): NONE of it is CUDA-graph-capture-safe.
+  // Inside capture, bail to the wmma fallback (plain launch, persistent
+  // state). Keeps captured spec-verify steps correct.
+  {
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(get_current_cuda_stream(), &cap);
+    if (cap != cudaStreamCaptureStatusNone) return false;
+  }
+
+  // Paged KV reads straight from the block_size=16 cache pool: no gather, no
+  // dense scratch, TMA descriptors stable across steps. GEMMA_PREFILL_PAGED=0
+  // reverts to the gather path.
+
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       query.get_device_index());
@@ -653,7 +674,9 @@ bool gemma_prefill_sm90_launcher(
     const int max_q_pad =
         (max_q_len + kAlignment - 1) / kAlignment * kAlignment;
     const int row_elems = num_q_heads * head_size;
-    const size_t sq_bytes = (size_t)V * max_q_pad * row_elems * sizeof(T);
+    // +128 rows: Q TMA whole-tile read slack (see varlen branch note).
+    const size_t sq_bytes =
+        (size_t)(V * max_q_pad + 128) * row_elems * sizeof(T);
     const size_t slse_bytes =
         (size_t)V * max_q_pad * num_q_heads * sizeof(float);
     static int* d_split_meta = nullptr;   // [3][V]: sl, qoff, kvlo
@@ -862,8 +885,11 @@ bool gemma_prefill_sm90_launcher(
     const int max_q_pad =
         (max_q_len + kAlignment - 1) / kAlignment * kAlignment;
     const int row_elems = num_q_heads * head_size;
+    // +128 rows: the Q TMA loads whole M-tiles (up to 128 rows) per seq;
+    // at max_q_pad < TileM the LAST seq's tile read overruns its region
+    // (reads only; stores are seq_q-masked). Slack keeps it in-bounds.
     const size_t vq_bytes =
-        (size_t)num_seqs * max_q_pad * row_elems * sizeof(T);
+        (size_t)(num_seqs * max_q_pad + 128) * row_elems * sizeof(T);
     const size_t vlse_bytes =
         (size_t)num_seqs * max_q_pad * num_q_heads * sizeof(float);
     if (vq_bytes <= ((size_t)512 << 20)) {  // scratch cap; else per-seq loop

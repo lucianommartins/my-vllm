@@ -473,6 +473,7 @@ class GemmaAttentionImpl(AttentionImpl):
         # Pre-allocated empty tensors for the decode hot path (avoids
         # per-layer tensor creation in gemma_paged_attention wrapper).
         self._empty_lse: torch.Tensor | None = None
+        self._mq_expand_cache: dict = {}
         self._empty_sel: torch.Tensor | None = None
         # Cached partition buffers (avoids dict lookup per layer).
         self._cached_part: tuple[torch.Tensor, ...] | None = None
@@ -581,6 +582,51 @@ class GemmaAttentionImpl(AttentionImpl):
             and self.actual_head_size == 256
             and 2 * mqu <= 16
         ):
+            if mqu >= 2 and self.actual_head_size == 512:
+                # hd512 verify: virtual-seq decode via PERSISTENT buffers
+                # (graph-safe: out=/copy_ only, constants cached at warmup;
+                # the decode kernel beats wmma by an order at kv >> q).
+                num_real = attn_metadata.seq_lens.shape[0]
+                n = num_real * mqu
+                key = (n, mqu, query.device)
+                cached = self._mq_expand_cache.get(key)
+                if cached is None:
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError(
+                            "mq expand constants missing during capture")
+                    seq_idx = (
+                        torch.arange(n, device=query.device) // mqu
+                    ).to(torch.int64)
+                    offs = (
+                        torch.arange(n, device=query.device) % mqu
+                    ).to(torch.int32) - (mqu - 1)
+                    mb = attn_metadata.block_table.shape[1]
+                    bt_buf = torch.zeros(
+                        n, mb, dtype=torch.int32, device=query.device)
+                    sl_buf = torch.zeros(
+                        n, dtype=torch.int32, device=query.device)
+                    cached = (seq_idx, offs, bt_buf, sl_buf)
+                    self._mq_expand_cache[key] = cached
+                seq_idx, offs, bt_buf, sl_buf = cached
+                torch.index_select(
+                    attn_metadata.block_table, 0, seq_idx, out=bt_buf)
+                torch.index_select(
+                    attn_metadata.seq_lens, 0, seq_idx, out=sl_buf)
+                sl_buf.add_(offs)
+                exp_sums, max_logits, tmp_out = (
+                    self._ensure_partition_buffers(
+                        n, attn_metadata.max_seq_len,
+                        query.dtype, query.device))
+                torch.ops._C.gemma_paged_attention(
+                    output[:n], exp_sums, max_logits, tmp_out, query[:n],
+                    key_cache, value_cache, self.num_kv_heads, self.scale,
+                    bt_buf, sl_buf, key_cache.shape[1],
+                    attn_metadata.max_seq_len, self.kv_cache_dtype,
+                    layer._k_scale, layer._v_scale, self.actual_head_size,
+                    self.k_eq_v, self.sliding_window,
+                    self._empty_lse, self._empty_sel,
+                )
+                return output
             return self._forward_prefill(
                 query[: attn_metadata.num_actual_tokens],
                 key_cache,
