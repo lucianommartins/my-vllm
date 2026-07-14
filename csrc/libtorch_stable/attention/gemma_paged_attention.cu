@@ -75,21 +75,24 @@ static constexpr int DS_MINCTA_256 = 3;
 // Split-KV combine dispatch: v2 (256-thread, coalesced, bitwise-equal math)
 // unless GEMMA_COMBINE=1 or num_splits exceeds v2's smem stage (256).
 // `combine_v2` is a local in the launcher; all macros expand there.
-#define LAUNCH_GEMMA_COMBINE(HEAD, CG, LSE)                                    \
+#define LAUNCH_GEMMA_COMBINE_T(HEAD, CG, LSE, TPART, TMPPTR)                  \
   do {                                                                         \
     if (combine_v2 && num_splits <= 256) {                                     \
       const dim3 cg3((CG).x, (CG).y, (HEAD) / 128);                            \
-      vllm::gemma::gemma_split_reduce_v2_kernel<T, HEAD>                       \
-          <<<cg3, 64, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr,        \
+      vllm::gemma::gemma_split_reduce_v2_kernel<T, HEAD, TPART>                \
+          <<<cg3, 64, 0, stream>>>(out_ptr, TMPPTR, exp_sums_ptr,             \
                                    max_logits_ptr, num_splits, max_parts,     \
                                    LSE);                                       \
     } else {                                                                   \
-      vllm::gemma::gemma_split_reduce_kernel<T, HEAD>                          \
-          <<<CG, WARP_SIZE, 0, stream>>>(out_ptr, tmp_out_ptr, exp_sums_ptr,  \
+      vllm::gemma::gemma_split_reduce_kernel<T, HEAD, TPART>                   \
+          <<<CG, WARP_SIZE, 0, stream>>>(out_ptr, TMPPTR, exp_sums_ptr,       \
                                          max_logits_ptr, num_splits,          \
                                          max_parts, LSE);                     \
     }                                                                          \
   } while (0)
+// Legacy (bf16-partial) producers: stream/bigtile/simt revert paths.
+#define LAUNCH_GEMMA_COMBINE(HEAD, CG, LSE)                                    \
+  LAUNCH_GEMMA_COMBINE_T(HEAD, CG, LSE, T, tmp_out_ptr)
 
 #define LAUNCH_GEMMA_GQA_SPLIT(HEAD_SIZE, ACTUAL_HEAD_SIZE, GROUP, K_EQ_V,     \
                                USE_SW)                                         \
@@ -256,7 +259,8 @@ static constexpr int DS_MINCTA_256 = 3;
         num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr, mq);          \
     if (SPLITB) {                                                              \
       const dim3 fcg(num_kv_heads * (GROUP), num_seqs * mq);                   \
-      LAUNCH_GEMMA_COMBINE(HEAD, fcg, lse_out_ptr);                            \
+      LAUNCH_GEMMA_COMBINE_T(HEAD, fcg, lse_out_ptr, float,                    \
+                             reinterpret_cast<float*>(tmp_out_ptr));           \
     }                                                                          \
   } while (0)
 
@@ -437,6 +441,10 @@ void gemma_paged_attention_launcher(
   const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
 
   // Partial buffers for split-KV (partition dim == split).
+  // Fused-path split partials are FP32: the buffer must be allocated
+  // float32 (legacy bf16-partial revert paths under-use it harmlessly).
+  STD_TORCH_CHECK(tmp_out.numel() == 0 || tmp_out.element_size() == 4,
+                  "tmp_out must be float32 (fp32 split partials)");
   T* tmp_out_ptr = reinterpret_cast<T*>(tmp_out.data_ptr());
   float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
   float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());

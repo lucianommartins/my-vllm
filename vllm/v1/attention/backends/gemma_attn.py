@@ -102,8 +102,10 @@ def _get_decode_partition_buffers(
         max_logits = torch.zeros(
             ns, num_heads, mp, dtype=torch.float32, device=device
         )
+        # FP32 split partials: bf16 partials turned split-count transitions
+        # into batch-wide greedy-stream forks (killed MTP draft acceptance).
         tmp_out = torch.zeros(
-            ns, num_heads, mp, head_size, dtype=dtype, device=device
+            ns, num_heads, mp, head_size, dtype=torch.float32, device=device
         )
         cached = (exp_sums, max_logits, tmp_out)
         _DECODE_PARTITION_CACHE[key] = cached

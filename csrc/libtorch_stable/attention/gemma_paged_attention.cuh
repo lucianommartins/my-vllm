@@ -1729,13 +1729,17 @@ gemma_decode_fused_kernel(
         max_logits[DFUSED_PART(tok, qh)] = -FLT_MAX;
         exp_sums[DFUSED_PART(tok, qh)] = 0.f;
       }
-    for (int iv = tid; iv < GQA_GROUP * mq * hvps; iv += nthreads) {
-      const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
+    // tmp partials are FP32 (bf16 partials made split-count transitions
+    // visible as batch-wide greedy-stream forks; see SESSION_19 notes)
+    float* tmpf = reinterpret_cast<float*>(out_or_tmp);
+    constexpr int F4 = HEAD_SIZE / 4;
+    for (int iv = tid; iv < GQA_GROUP * mq * F4; iv += nthreads) {
+      const int r = iv / F4, dv = (iv - r * F4) * 4;
       const int tok = seq_idx * mq + r / GQA_GROUP;
       const int qh = kv_head * GQA_GROUP + r % GQA_GROUP;
-      *reinterpret_cast<uint4*>(
-          out_or_tmp + DFUSED_PART(tok, qh) * HEAD_SIZE + dv) =
-          uint4{0, 0, 0, 0};
+      *reinterpret_cast<float4*>(
+          tmpf + DFUSED_PART(tok, qh) * HEAD_SIZE + dv) =
+          float4{0.f, 0.f, 0.f, 0.f};
     }
     return;
   }
@@ -1992,18 +1996,19 @@ gemma_decode_fused_kernel(
         exp_sums[DFUSED_PART(tok1, qh1)] = l_run1;
       }
     }
+    float* tmpf = reinterpret_cast<float*>(out_or_tmp);
 #pragma unroll
     for (int n = 0; n < NPV; n++) {
       const int hd = warp * HDPW + n * 8 + 2 * tg;
       if (group < rows) {
-        scalar_t* go = out_or_tmp + DFUSED_PART(tok0, qh0) * HEAD_SIZE + hd;
-        from_float(go[0], oacc[n][0] * inv0);
-        from_float(go[1], oacc[n][1] * inv0);
+        float* go = tmpf + DFUSED_PART(tok0, qh0) * HEAD_SIZE + hd;
+        go[0] = oacc[n][0] * inv0;
+        go[1] = oacc[n][1] * inv0;
       }
       if (group + 8 < rows) {
-        scalar_t* go = out_or_tmp + DFUSED_PART(tok1, qh1) * HEAD_SIZE + hd;
-        from_float(go[0], oacc[n][2] * inv1);
-        from_float(go[1], oacc[n][3] * inv1);
+        float* go = tmpf + DFUSED_PART(tok1, qh1) * HEAD_SIZE + hd;
+        go[0] = oacc[n][2] * inv1;
+        go[1] = oacc[n][3] * inv1;
       }
     }
   } else {
@@ -2339,10 +2344,10 @@ gemma_decode_simt_kernel(
 // (seq, q_head) via the numerically-stable base-2 LSE recurrence.
 // Grid: (num_q_heads, num_seqs). Block: WARP_SIZE (head dim across lanes).
 // ---------------------------------------------------------------------------
-template <typename scalar_t, int HEAD_SIZE>
+template <typename scalar_t, int HEAD_SIZE, typename tpart_t = scalar_t>
 __global__ void gemma_split_reduce_kernel(
     scalar_t* __restrict__ out,            // [num_seqs, num_q_heads, HEAD_SIZE]
-    const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_q_heads, max_parts, HEAD_SIZE]
+    const tpart_t* __restrict__ tmp_out,   // [num_seqs, num_q_heads, max_parts, HEAD_SIZE]
     const float* __restrict__ exp_sums,    // [num_seqs, num_q_heads, max_parts] (L)
     const float* __restrict__ max_logits,  // [num_seqs, num_q_heads, max_parts] (M)
     const int num_splits,
@@ -2381,12 +2386,12 @@ __global__ void gemma_split_reduce_kernel(
 #pragma unroll
   for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
-  const scalar_t* o_base = tmp_out + base * max_parts * HEAD_SIZE;
+  const tpart_t* o_base = tmp_out + base * max_parts * HEAD_SIZE;
   for (int s = 0; s < num_splits; s++) {
     if (!(m_ptr[s] > -FLT_MAX)) continue;
     const float w = l_ptr[s] * exp2f(m_ptr[s] - M_g) * inv;
     if (w == 0.f) continue;
-    const scalar_t* o = o_base + static_cast<int64_t>(s) * HEAD_SIZE + dim_start;
+    const tpart_t* o = o_base + static_cast<int64_t>(s) * HEAD_SIZE + dim_start;
 #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] += w * static_cast<float>(o[e]);
   }
@@ -2408,10 +2413,10 @@ __global__ void gemma_split_reduce_kernel(
 // to v1 -> bitwise-identical output. Requires num_splits <= 256 (host
 // falls back to v1 otherwise).
 // ---------------------------------------------------------------------------
-template <typename scalar_t, int HEAD_SIZE>
+template <typename scalar_t, int HEAD_SIZE, typename tpart_t = scalar_t>
 __global__ void gemma_split_reduce_v2_kernel(
     scalar_t* __restrict__ out,            // [num_seqs, num_q_heads, HEAD_SIZE]
-    const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_q_heads, max_parts, HEAD_SIZE]
+    const tpart_t* __restrict__ tmp_out,   // [num_seqs, num_q_heads, max_parts, HEAD_SIZE]
     const float* __restrict__ exp_sums,    // [num_seqs, num_q_heads, max_parts] (L)
     const float* __restrict__ max_logits,  // [num_seqs, num_q_heads, max_parts] (M)
     const int num_splits,
@@ -2468,12 +2473,17 @@ __global__ void gemma_split_reduce_v2_kernel(
   __syncthreads();
 
   float acc0 = 0.f, acc1 = 0.f;
-  const scalar_t* o_base = tmp_out + base * max_parts * HEAD_SIZE + 2 * pair;
+  const tpart_t* o_base = tmp_out + base * max_parts * HEAD_SIZE + 2 * pair;
 #pragma unroll 4
   for (int s = 0; s < num_splits; s++) {
-    scalar_t o2[2];
-    *reinterpret_cast<uint32_t*>(o2) = *reinterpret_cast<const uint32_t*>(
-        o_base + static_cast<int64_t>(s) * HEAD_SIZE);
+    tpart_t o2[2];
+    if constexpr (sizeof(tpart_t) == 2) {
+      *reinterpret_cast<uint32_t*>(o2) = *reinterpret_cast<const uint32_t*>(
+          o_base + static_cast<int64_t>(s) * HEAD_SIZE);
+    } else {
+      *reinterpret_cast<float2*>(o2) = *reinterpret_cast<const float2*>(
+          o_base + static_cast<int64_t>(s) * HEAD_SIZE);
+    }
     const float w = s_l[s];
     acc0 += w * static_cast<float>(o2[0]);
     acc1 += w * static_cast<float>(o2[1]);
