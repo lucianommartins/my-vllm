@@ -311,6 +311,10 @@ struct FmhaMainloopTmaWarpSpecialized {
     int gqa_group;
     int max_blocks_per_seq;
     const int* d_seq_lens;
+    // Varlen batch: per-seq q starts (packed Q was padded into
+    // [seq][max_q_pad] scratch); with d_seq_lens gives per-seq
+    // q_offset = seq_k - q_len. Null = uniform batch / decode semantics.
+    const int* d_cu_seqlens_q;
     // GQA-dense CONTIGUOUS KV buffers (prefill de-GQA): q-head -> kv-head
     // divisor for the kK/kV loaders. 1 = legacy expanded buffers.
     int contig_gqa_group;
@@ -445,6 +449,7 @@ struct FmhaMainloopTmaWarpSpecialized {
         1,                       // gqa_group (set by paged launcher)
         0,                       // max_blocks_per_seq
         nullptr,                 // d_seq_lens (null = use problem_size scalar)
+        nullptr,                 // d_cu_seqlens_q (null = uniform batch)
         1                        // contig_gqa_group (set by prefill launcher)
     };
   }

@@ -52,6 +52,39 @@ __global__ void gather_kv_expanded_kernel(
                h_kv * stride_head + d];
 }
 
+// Varlen batch staging: pack ragged Q (rows cu_q[s]..cu_q[s+1]) into padded
+// [seq][max_q_pad] scratch (pad rows zeroed), and scatter real O rows back.
+template <typename Element>
+__global__ void varlen_pad_q_kernel(
+    Element* __restrict__ dst, const Element* __restrict__ src,
+    const int* __restrict__ cu_q, int max_q_pad, int64_t src_stride,
+    int row_elems) {
+  const int s = blockIdx.y;
+  const int r = blockIdx.x;
+  const int q0 = cu_q[s], q1 = cu_q[s + 1];
+  Element* d = dst + ((int64_t)s * max_q_pad + r) * row_elems;
+  if (r < q1 - q0) {
+    const Element* p = src + (int64_t)(q0 + r) * src_stride;
+    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = p[i];
+  } else {
+    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = Element(0);
+  }
+}
+
+template <typename Element>
+__global__ void varlen_scatter_o_kernel(
+    Element* __restrict__ dst, const Element* __restrict__ src,
+    const int* __restrict__ cu_q, int max_q_pad, int64_t dst_stride,
+    int row_elems) {
+  const int s = blockIdx.y;
+  const int r = blockIdx.x;
+  const int q0 = cu_q[s], q1 = cu_q[s + 1];
+  if (r >= q1 - q0) return;
+  const Element* p = src + ((int64_t)s * max_q_pad + r) * row_elems;
+  Element* d = dst + (int64_t)(q0 + r) * dst_stride;
+  for (int i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = p[i];
+}
+
 // Paged-pool descriptor set: non-null enables gather-free KV reads straight
 // from the block_size=16 cache pool (page_table = this launch's block table,
 // row-major [seq][max_blocks] for batched, or a single row for per-seq).
@@ -79,6 +112,7 @@ struct FmhaCachedLauncher {
   int cached_num_seqs = 0;
   int cached_sliding_window = -1;
   bool cached_paged = false;
+  bool cached_varlen = false;
 
   bool launch(
       cutlass::bfloat16_t* q_ptr,
@@ -100,7 +134,9 @@ struct FmhaCachedLauncher {
       int device_id,
       int sm_count,
       cudaStream_t stream,
-      const PagedPool* paged = nullptr) {
+      const PagedPool* paged = nullptr,
+      const int* varlen_seq_lens = nullptr,
+      const int* varlen_cu_q = nullptr) {
     // Key must cover everything baked into Params: seq_q, seq_k (drives the
     // KV extents AND q_offset = seq_k - seq_q for extends/chunked prefill),
     // heads, and the sliding window. Keying on seq_q alone served stale
@@ -111,7 +147,8 @@ struct FmhaCachedLauncher {
          num_q_heads != cached_num_q_heads ||
          num_seqs != cached_num_seqs ||
          sliding_window != cached_sliding_window ||
-         (paged != nullptr) != cached_paged);
+         (paged != nullptr) != cached_paged ||
+         (varlen_seq_lens != nullptr) != cached_varlen);
 
     if (shape_changed) {
       // Batched (uniform) launch: batch mode strides. Q/O rows are packed
@@ -168,6 +205,7 @@ struct FmhaCachedLauncher {
       cached_num_seqs = num_seqs;
       cached_sliding_window = sliding_window;
       cached_paged = (paged != nullptr);
+      cached_varlen = (varlen_seq_lens != nullptr);
     } else {
       // Shape unchanged — update only base pointers in TMA descriptors
       auto& p = const_cast<typename Kernel::Params&>(fmha_op.params());
@@ -225,6 +263,9 @@ struct FmhaCachedLauncher {
       } else {
         p.mainloop.page_table = nullptr;
       }
+      // Varlen batch state: per-seq kv lens + q starts (null = uniform).
+      p.mainloop.d_seq_lens = varlen_seq_lens;
+      p.mainloop.d_cu_seqlens_q = varlen_cu_q;
     }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
@@ -253,12 +294,15 @@ static bool launch_fmha_batched(
     int device_id,
     int sm_count,
     cudaStream_t stream,
-    const PagedPool* paged = nullptr) {
+    const PagedPool* paged = nullptr,
+    const int* varlen_seq_lens = nullptr,
+    const int* varlen_cu_q = nullptr) {
   static FmhaCachedLauncher<HeadDim, KEqV> launcher;
   return launcher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, num_q_heads,
                          gqa_group, num_seqs, seq_q, seq_k, q_offset,
                          q_stride, scale, sliding_window, mm_ranges_ptr,
-                         max_mm_ranges, device_id, sm_count, stream, paged);
+                         max_mm_ranges, device_id, sm_count, stream, paged,
+                         varlen_seq_lens, varlen_cu_q);
 }
 
 template <typename T, typename CACHE_T>
@@ -573,6 +617,80 @@ bool gemma_prefill_sm90_launcher(
               stream);
         }
       }
+    }
+  }
+
+  // ---- Varlen batched paged path: ONE launch per layer for STAGGERED
+  // short-KV steps (ragged q and/or kv). Q is packed into padded
+  // [seq][max_q_pad] scratch; the kernel derives per-seq seq_k/q_offset from
+  // d_seq_lens + d_cu_seqlens_q (per-CTA problem override); padded rows
+  // compute garbage into scratch rows never scattered back. Replaces the
+  // per-seq loop's ~num_seqs x 48 launch storm (26.6us/launch measured).
+  if (use_paged && paged_call && num_seqs > 1 &&
+      mm_prefix_ranges.numel() == 0 &&
+      cu_seqlens_q.numel() >= num_seqs + 1 && seq_lens.numel() >= num_seqs) {
+    const int max_q_pad =
+        (max_q_len + kAlignment - 1) / kAlignment * kAlignment;
+    const int row_elems = num_q_heads * head_size;
+    const size_t vq_bytes =
+        (size_t)num_seqs * max_q_pad * row_elems * sizeof(T);
+    const size_t vlse_bytes =
+        (size_t)num_seqs * max_q_pad * num_q_heads * sizeof(float);
+    if (vq_bytes <= ((size_t)512 << 20)) {  // scratch cap; else per-seq loop
+      if (vq_bytes > s_qo_cap) {
+        if (q_scratch) cudaFree(q_scratch);
+        if (o_scratch) cudaFree(o_scratch);
+        cudaMalloc(&q_scratch, vq_bytes);
+        cudaMalloc(&o_scratch, vq_bytes);
+        s_qo_cap = vq_bytes;
+      }
+      if (vlse_bytes > s_lse_cap) {
+        if (lse_scratch) cudaFree(lse_scratch);
+        cudaMalloc(&lse_scratch, vlse_bytes);
+        s_lse_cap = vlse_bytes;
+      }
+      const int* d_cu_q = cu_seqlens_q.mutable_data_ptr<int>();
+      const int* d_sl = seq_lens.mutable_data_ptr<int>();
+      dim3 vgrid(max_q_pad, num_seqs);
+      varlen_pad_q_kernel<Element><<<vgrid, 256, 0, stream>>>(
+          reinterpret_cast<Element*>(q_scratch), query_ptr, d_cu_q,
+          max_q_pad, q_stride, row_elems);
+
+      PagedPool pool = pool_proto;
+      pool.page_table = block_tables_ptr;  // 2D [seq][max_blocks]
+      Element* kc = reinterpret_cast<Element*>(key_cache_ptr);
+      Element* vc = k_eq_v ? kc : reinterpret_cast<Element*>(value_cache_ptr);
+      Element* qs = reinterpret_cast<Element*>(q_scratch);
+      Element* os = reinterpret_cast<Element*>(o_scratch);
+      // Baked seq_k/q_offset are per-CTA overridden; scalars only size the
+      // (unused in paged mode) contiguous-KV stride math.
+      const int q_off_dummy = max_kv_len > max_q_len ? max_kv_len - max_q_len : 0;
+      bool vok;
+      if (head_size == 256) {
+        vok = launch_fmha_batched<256>(
+            qs, kc, vc, os, lse_scratch, num_q_heads, gqa_group, num_seqs,
+            max_q_pad, max_kv_len, q_off_dummy, row_elems, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool, d_sl, d_cu_q);
+      } else if (k_eq_v) {
+        vok = launch_fmha_batched<512, true>(
+            qs, kc, vc, os, lse_scratch, num_q_heads, gqa_group, num_seqs,
+            max_q_pad, max_kv_len, q_off_dummy, row_elems, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool, d_sl, d_cu_q);
+      } else {
+        vok = launch_fmha_batched<512>(
+            qs, kc, vc, os, lse_scratch, num_q_heads, gqa_group, num_seqs,
+            max_q_pad, max_kv_len, q_off_dummy, row_elems, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool, d_sl, d_cu_q);
+      }
+      if (vok) {
+        varlen_scatter_o_kernel<Element><<<vgrid, 256, 0, stream>>>(
+            out_ptr, os, d_cu_q, max_q_pad, q_stride, row_elems);
+        return true;
+      }
+      // fall through to the per-seq loop on launch failure
     }
   }
 

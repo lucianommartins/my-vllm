@@ -176,7 +176,16 @@ struct FmhaKernelTmaWarpSpecialized {
     if (params.mainloop.d_seq_lens != nullptr) {
       int seq_k = params.mainloop.d_seq_lens[blockIdx.z];
       get<3>(problem_size_local) = seq_k;
-      get<6>(problem_size_local) = seq_k;
+      if (params.mainloop.d_cu_seqlens_q != nullptr) {
+        // Varlen batch: this seq's q rows sit at absolute positions
+        // [seq_k - q_len, seq_k); padded rows past q_len write garbage to
+        // scratch rows the launcher never copies back.
+        int q_len = params.mainloop.d_cu_seqlens_q[blockIdx.z + 1] -
+                    params.mainloop.d_cu_seqlens_q[blockIdx.z];
+        get<6>(problem_size_local) = seq_k - q_len;
+      } else {
+        get<6>(problem_size_local) = seq_k;  // decode-batch semantics
+      }
     }
     const auto& problem_size = problem_size_local;
 
