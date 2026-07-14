@@ -38,6 +38,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+# Multi-query decode threshold: extends with max_query_len <= this run as a
+# single batched paged decode over virtual sequences (MTP/spec-decode verify
+# shapes). Above it, the prefill paths take over.
+_MQ_DECODE_MAX = int(os.environ.get("GEMMA_MQ_DECODE_MAX", "8"))
+
 PARTITION_SIZE = 512
 # Upper bound on split-KV partitions the decode kernel may use. The partition
 # buffers are sized to allow ~256 tokens/split so cross-CTA split-KV can engage
@@ -122,11 +127,12 @@ class GemmaAttentionMetadata:
     # D2H + stream sync in the SM90 launcher.
     seq_lens_cpu: torch.Tensor | None = None
     query_start_loc_cpu: torch.Tensor | None = None
-    # Small-q extend steps (prefix-cache recompute, tiny extends): per-offset
-    # (rows, seq_idx, seq_lens, max_seq_len) decode sub-batches, precomputed
-    # host-side once per step. When set, forward() runs these through the
-    # DECODE kernel (paged, split-KV, no gather) instead of any prefill path.
-    tiny_extend_plan: list | None = None
+    # Multi-query extend steps (MTP/spec-decode verify, tiny extends):
+    # (expanded_block_table, virtual_seq_lens, max_seq_len) — one batched
+    # paged decode over per-token virtual sequences, precomputed once per
+    # step. When set, forward() uses the DECODE kernel (paged, split-KV,
+    # no gather, q/output rows in place) instead of any prefill path.
+    tiny_extend_plan: tuple | None = None
     # Multimodal bidirectional ("mm-prefix") image-token spans. Field names match
     # what Gemma4ForConditionalGeneration._clear_mm_prefix_for_full_attn_layers
     # looks for (it nulls these on full-attention layers so only sliding layers
@@ -240,32 +246,40 @@ class GemmaAttentionMetadataBuilder(
         # Shortest sequence (CPU-side; no GPU sync) for the top-k gate.
         min_seq_len = 0  # only needed for topk (disabled by default)
 
-        # Small-q extend plan: at 1 < max_query_len <= 4 every query token's
-        # KV is already written to the paged cache before attention runs, so
-        # row offset o of seq i is a plain paged decode at context_i + o + 1.
-        # The decode kernel beats both prefill paths by an order of magnitude
-        # on these steps (no gather, split-KV, one launch per offset).
+        # Small-q extend plan (multi-query / MTP-verify shapes): every query
+        # token's KV is already in the paged cache before attention runs, so
+        # token t = (seq i, offset o) is a plain paged decode at
+        # context_i + o + 1. Tokens become VIRTUAL SEQUENCES of one batched
+        # decode call: causal + sliding masks fall out of the per-virtual
+        # seq_len; q/output rows are used in place (varlen order == (i, o));
+        # the expanded block table is built once here. Replaces the old
+        # per-offset loop (up to 4 calls/layer + index_select/index_copy).
         tiny_extend_plan = None
         mql = common_attn_metadata.max_query_len
-        if 1 < mql <= 4 and mm_range_tensor is None:
+        if 1 < mql <= _MQ_DECODE_MAX and mm_range_tensor is None:
             dev = common_attn_metadata.query_start_loc.device
-            cu = common_attn_metadata.query_start_loc_cpu
-            q_lens = (cu[1:] - cu[:-1]).to(torch.int64)
+            cu = common_attn_metadata.query_start_loc_cpu.to(torch.int64)
+            q_lens = cu[1:] - cu[:-1]
             slc = common_attn_metadata.seq_lens_cpu.to(torch.int64)
-            plan = []
-            for o in range(int(mql)):
-                sel = (q_lens > o).nonzero(as_tuple=True)[0]
-                if sel.numel() == 0:
-                    break
-                rows = cu[:-1].to(torch.int64)[sel] + o
-                slens = slc[sel] - (q_lens[sel] - 1) + o
-                plan.append((
-                    rows.to(dev, non_blocking=True),
-                    sel.to(dev, non_blocking=True),
-                    slens.to(torch.int32).to(dev, non_blocking=True),
-                    int(slens.max()),
-                ))
-            tiny_extend_plan = plan
+            # spec-decode steps may pad tokens beyond cu[-1]
+            n = int(cu[-1])
+            seq_idx = torch.repeat_interleave(
+                torch.arange(q_lens.numel(), dtype=torch.int64), q_lens)
+            offs = torch.arange(n, dtype=torch.int64) - cu[:-1][seq_idx]
+            slens_v = slc[seq_idx] - q_lens[seq_idx] + 1 + offs
+            bt_v = common_attn_metadata.block_table_tensor.index_select(
+                0, seq_idx.to(dev, non_blocking=True))
+            # Uniform q across seqs (spec-verify): the hd256 impl PACKS the
+            # positions into the fused kernel's M rows (one KV read serves
+            # all of them) using the REAL per-seq metadata; ragged batches
+            # and hd512 use the virtual expansion.
+            mq_uniform = int(mql) if bool((q_lens == mql).all()) else 0
+            tiny_extend_plan = (
+                bt_v,
+                slens_v.to(torch.int32).to(dev, non_blocking=True),
+                int(slens_v.max()),
+                mq_uniform,
+            )
 
         return GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -558,42 +572,56 @@ class GemmaAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: GemmaAttentionMetadata,
     ) -> torch.Tensor:
-        """Small-q extends as per-offset paged decodes (see builder note)."""
+        """Multi-query extend as ONE batched paged decode over virtual
+        sequences (token t of seq i at offset o == decode at context+o+1
+        with seq i's block table). q/output rows used in place."""
         if self._empty_lse is None:
             self._empty_lse = output.new_empty(0, dtype=torch.float32)
             self._empty_sel = output.new_empty(0, dtype=torch.int32)
-        n = attn_metadata.num_actual_tokens
-        for rows, seq_sel, slens, max_sl in attn_metadata.tiny_extend_plan:
-            q_sub = query[:n].index_select(0, rows)
-            out_sub = torch.empty_like(q_sub)
-            bt_sub = attn_metadata.block_table.index_select(0, seq_sel)
-            exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
-                q_sub.shape[0], max_sl, query.dtype, query.device,
-            )
-            torch.ops._C.gemma_paged_attention(
-                out_sub,
-                exp_sums,
-                max_logits,
-                tmp_out,
-                q_sub,
-                key_cache,
-                value_cache,
-                self.num_kv_heads,
-                self.scale,
-                bt_sub,
-                slens,
-                key_cache.shape[1],
-                max_sl,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-                self.actual_head_size,
-                self.k_eq_v,
-                self.sliding_window,
-                self._empty_lse,
-                self._empty_sel,
-            )
-            output[:n].index_copy_(0, rows, out_sub)
+        bt_v, slens_v, max_sl, mqu = attn_metadata.tiny_extend_plan
+        n = slens_v.shape[0]  # real rows (spec steps pad past cu[-1])
+        num_real = attn_metadata.seq_lens.shape[0]
+        if (
+            mqu >= 2
+            and self.sliding_window > 0
+            and self.actual_head_size == 256
+            and mqu <= 8
+            and num_real * self.num_kv_heads >= 128
+        ):
+            # Packed pays off only with enough CTAs (grid = kv_heads x REAL
+            # seqs); at small grids the virtual expansion's extra parallelism
+            # beats its mq-x KV re-read (window-bounded reads are tiny).
+            # Packed multi-query: q rows = seqs*mqu against REAL per-seq
+            # tables (the kernel maps M row r -> (position r//2, head r%2)).
+            bt_v = attn_metadata.block_table
+            slens_v = attn_metadata.seq_lens
+            max_sl = attn_metadata.max_seq_len
+        exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
+            n, max_sl, query.dtype, query.device,
+        )
+        torch.ops._C.gemma_paged_attention(
+            output[:n],
+            exp_sums,
+            max_logits,
+            tmp_out,
+            query[:n],
+            key_cache,
+            value_cache,
+            self.num_kv_heads,
+            self.scale,
+            bt_v,
+            slens_v,
+            key_cache.shape[1],
+            max_sl,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+            self.actual_head_size,
+            self.k_eq_v,
+            self.sliding_window,
+            self._empty_lse,
+            self._empty_sel,
+        )
         return output
 
     def _forward_prefill(

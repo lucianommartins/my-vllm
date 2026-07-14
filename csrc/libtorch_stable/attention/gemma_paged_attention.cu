@@ -253,9 +253,9 @@ static constexpr int DS_MINCTA_256 = 3;
         value_cache_ptr, num_kv_heads, scale, block_tables_ptr,                \
         seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,            \
         kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,       \
-        num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr);              \
+        num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr, mq);          \
     if (SPLITB) {                                                              \
-      const dim3 fcg(num_kv_heads * (GROUP), num_seqs);                        \
+      const dim3 fcg(num_kv_heads * (GROUP), num_seqs * mq);                   \
       LAUNCH_GEMMA_COMBINE(HEAD, fcg, lse_out_ptr);                            \
     }                                                                          \
   } while (0)
@@ -414,6 +414,14 @@ void gemma_paged_attention_launcher(
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(1);
   int q_stride = query.stride(0);
+  // Packed multi-query (MTP/spec-verify): query rows = seqs * mq while
+  // seq_lens/block_tables stay per-SEQ. One KV read serves all mq positions
+  // (fused kernel M-rows). mq==1 everywhere else.
+  const int num_seqs_kv = static_cast<int>(seq_lens.size(0));
+  const int mq = (num_seqs_kv > 0 && num_seqs % num_seqs_kv == 0)
+                     ? num_seqs / num_seqs_kv
+                     : 1;
+  if (mq > 1) num_seqs = num_seqs_kv;  // grid/heuristics over REAL seqs
 
   int64_t kv_stride_block = key_cache.stride(0);
   int64_t kv_stride_slot = key_cache.stride(1);
@@ -504,6 +512,14 @@ void gemma_paged_attention_launcher(
     if (e == nullptr) return 0;
     return e[0] == '4' ? 4 : (e[0] == '8' ? 8 : 0);
   }();
+  // Packed multi-query is only implemented by the fused kernel and only
+  // where GQA_GROUP*mq fits the M=16 pad (hd256 sliding, GROUP=2, mq<=8).
+  STD_TORCH_CHECK(mq == 1 ||
+                      (decode_fused && head_size == 256 && sliding_window > 0 &&
+                       num_q_heads == 2 * num_kv_heads && mq <= 8),
+                  "packed multi-query decode requires the fused hd256 path "
+                  "(GQA_GROUP*mq <= 16)");
+
   const int fused_nw =
       (fused_nw_env != 0)
           ? fused_nw_env

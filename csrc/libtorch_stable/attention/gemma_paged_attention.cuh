@@ -1673,7 +1673,11 @@ gemma_decode_fused_kernel(
     const int64_t kv_stride_block, const int64_t kv_stride_slot,
     const int64_t kv_stride_head, const int sliding_window,
     const int num_splits, const int max_parts,
-    float* __restrict__ lse_out = nullptr) {
+    float* __restrict__ lse_out = nullptr,
+    const int mq = 1) {
+  // mq: query positions PACKED into the M dim (MTP/spec-verify: one KV read
+  // serves all positions). Row r = (position r/GROUP, gqa head r%GROUP);
+  // requires GQA_GROUP*mq <= 16. mq==1 is the classic decode layout.
   constexpr int NWARP = NWARP_T;            // 8 (BN64) or 4 (BN32, 2-3 CTA/SM)
   constexpr int BLOCK_N = 8 * NWARP;        // one n8 S-slice per warp
   constexpr int KCH = HEAD_SIZE / 16;       // QK k-chunks
@@ -1702,8 +1706,8 @@ gemma_decode_fused_kernel(
   const int seq_len = seq_lens[seq_idx];
   const int nthreads = NWARP * 32;
 
-#define DFUSED_PART(qh) \
-  (((int64_t)(seq_idx) * num_q_heads + (qh)) * max_parts + split_idx)
+#define DFUSED_PART(tok, qh) \
+  (((int64_t)(tok) * num_q_heads + (qh)) * max_parts + split_idx)
 
   int kv_begin = 0;
   if (USE_SLIDING_WINDOW && sliding_window > 0) {
@@ -1718,16 +1722,19 @@ gemma_decode_fused_kernel(
   const int hvps = HEAD_SIZE / VEC;
 
   if (SPLIT && tile_lo >= tile_hi) {
-    for (int g = warp; g < GQA_GROUP; g += NWARP)
+    for (int g = warp; g < GQA_GROUP * mq; g += NWARP)
       if (lane == 0) {
-        const int qh = kv_head * GQA_GROUP + g;
-        max_logits[DFUSED_PART(qh)] = -FLT_MAX;
-        exp_sums[DFUSED_PART(qh)] = 0.f;
+        const int tok = seq_idx * mq + g / GQA_GROUP;
+        const int qh = kv_head * GQA_GROUP + g % GQA_GROUP;
+        max_logits[DFUSED_PART(tok, qh)] = -FLT_MAX;
+        exp_sums[DFUSED_PART(tok, qh)] = 0.f;
       }
-    for (int iv = tid; iv < GQA_GROUP * hvps; iv += nthreads) {
+    for (int iv = tid; iv < GQA_GROUP * mq * hvps; iv += nthreads) {
       const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
-      const int qh = kv_head * GQA_GROUP + r;
-      *reinterpret_cast<uint4*>(out_or_tmp + DFUSED_PART(qh) * HEAD_SIZE + dv) =
+      const int tok = seq_idx * mq + r / GQA_GROUP;
+      const int qh = kv_head * GQA_GROUP + r % GQA_GROUP;
+      *reinterpret_cast<uint4*>(
+          out_or_tmp + DFUSED_PART(tok, qh) * HEAD_SIZE + dv) =
           uint4{0, 0, 0, 0};
     }
     return;
@@ -1742,12 +1749,14 @@ gemma_decode_fused_kernel(
 #define DF_KBUF(s) (sKV + (s) * STAGE)
 #define DF_VBUF(s) (DF_KBUF(s) + KTILE)
 
-  // Q rows 0..GQA_GROUP-1 real, rest zero (M=16 pad).
+  // Q rows 0..GQA_GROUP*mq-1 real (row r = position r/GROUP, head r%GROUP),
+  // rest zero (M=16 pad).
   for (int iv = tid; iv < 16 * hvps; iv += nthreads) {
     const int r = iv / hvps, dv = (iv - r * hvps) * VEC;
-    if (r < GQA_GROUP) {
+    if (r < GQA_GROUP * mq) {
       const scalar_t* gq =
-          q + (int64_t)seq_idx * q_stride + (kv_head * GQA_GROUP + r) * HEAD_SIZE + dv;
+          q + (int64_t)(seq_idx * mq + r / GQA_GROUP) * q_stride +
+          (kv_head * GQA_GROUP + r % GQA_GROUP) * HEAD_SIZE + dv;
       *reinterpret_cast<uint4*>(sQ + r * LDH + dv) =
           *reinterpret_cast<const uint4*>(gq);
     } else {
@@ -1853,16 +1862,29 @@ gemma_decode_fused_kernel(
     }
 
     // ---- masking + slice row-max (registers) ----
+    // Packed rows own different query positions: row r sees columns
+    // [pos_r - sw + 1, pos_r] with pos_r = seq_len - mq + r/GROUP. For
+    // mq==1 both bounds equal q_abs and the causal check is a no-op
+    // (n_tok already limits columns to the KV extent).
     const int col0 = kv0 + warp * 8 + 2 * tg;      // this thread's 2 columns
     const bool v0 = (warp * 8 + 2 * tg) < n_tok;
     const bool v1 = (warp * 8 + 2 * tg + 1) < n_tok;
-    bool s0 = v0, s1 = v1;
+    const int qa0 = q_abs - (mq - 1) + group / GQA_GROUP;
+    const int qa1 = q_abs - (mq - 1) + (group + 8) / GQA_GROUP;
+    bool e00 = v0 && col0 <= qa0;
+    bool e01 = v1 && col0 + 1 <= qa0;
+    bool e10 = v0 && col0 <= qa1;
+    bool e11 = v1 && col0 + 1 <= qa1;
     if (USE_SLIDING_WINDOW && sliding_window > 0) {
-      s0 = s0 && (col0 > q_abs - sliding_window);
-      s1 = s1 && (col0 + 1 > q_abs - sliding_window);
+      e00 = e00 && (col0 > qa0 - sliding_window);
+      e01 = e01 && (col0 + 1 > qa0 - sliding_window);
+      e10 = e10 && (col0 > qa1 - sliding_window);
+      e11 = e11 && (col0 + 1 > qa1 - sliding_window);
     }
-    if (!s0) { sacc[0] = -FLT_MAX; sacc[2] = -FLT_MAX; }
-    if (!s1) { sacc[1] = -FLT_MAX; sacc[3] = -FLT_MAX; }
+    if (!e00) sacc[0] = -FLT_MAX;
+    if (!e01) sacc[1] = -FLT_MAX;
+    if (!e10) sacc[2] = -FLT_MAX;
+    if (!e11) sacc[3] = -FLT_MAX;
     float sm0 = fmaxf(sacc[0], sacc[1]);
     float sm1 = fmaxf(sacc[2], sacc[3]);
 #pragma unroll
@@ -1889,10 +1911,10 @@ gemma_decode_fused_kernel(
         (m_run0 <= -FLT_MAX) ? 0.f : exp2f((m_run0 - mn0) * scale_log2);
     const float al1 =
         (m_run1 <= -FLT_MAX) ? 0.f : exp2f((m_run1 - mn1) * scale_log2);
-    float p0 = s0 && mn0 > -FLT_MAX ? exp2f((sacc[0] - mn0) * scale_log2) : 0.f;
-    float p1 = s1 && mn0 > -FLT_MAX ? exp2f((sacc[1] - mn0) * scale_log2) : 0.f;
-    float p2 = s0 && mn1 > -FLT_MAX ? exp2f((sacc[2] - mn1) * scale_log2) : 0.f;
-    float p3 = s1 && mn1 > -FLT_MAX ? exp2f((sacc[3] - mn1) * scale_log2) : 0.f;
+    float p0 = e00 && mn0 > -FLT_MAX ? exp2f((sacc[0] - mn0) * scale_log2) : 0.f;
+    float p1 = e01 && mn0 > -FLT_MAX ? exp2f((sacc[1] - mn0) * scale_log2) : 0.f;
+    float p2 = e10 && mn1 > -FLT_MAX ? exp2f((sacc[2] - mn1) * scale_log2) : 0.f;
+    float p3 = e11 && mn1 > -FLT_MAX ? exp2f((sacc[3] - mn1) * scale_log2) : 0.f;
     m_run0 = mn0; m_run1 = mn1;
     // P -> smem (bf16 pairs; this warp's 8 columns).
     {
@@ -1954,31 +1976,32 @@ gemma_decode_fused_kernel(
   // ---- epilogue: per-thread c-frag writes (rows group / group+8) ----
   const float inv0 = (l_run0 > 0.f) ? (1.f / l_run0) : 0.f;
   const float inv1 = (l_run1 > 0.f) ? (1.f / l_run1) : 0.f;
+  const int rows = GQA_GROUP * mq;
+  const int tok0 = seq_idx * mq + group / GQA_GROUP;
+  const int qh0 = kv_head * GQA_GROUP + group % GQA_GROUP;
+  const int tok1 = seq_idx * mq + (group + 8) / GQA_GROUP;
+  const int qh1 = kv_head * GQA_GROUP + (group + 8) % GQA_GROUP;
   if (SPLIT) {
     if (warp == 0 && tg == 0) {
-      if (group < GQA_GROUP) {
-        const int qh = kv_head * GQA_GROUP + group;
-        max_logits[DFUSED_PART(qh)] = m_run0 * scale_log2;
-        exp_sums[DFUSED_PART(qh)] = l_run0;
+      if (group < rows) {
+        max_logits[DFUSED_PART(tok0, qh0)] = m_run0 * scale_log2;
+        exp_sums[DFUSED_PART(tok0, qh0)] = l_run0;
       }
-      if (group + 8 < GQA_GROUP) {
-        const int qh = kv_head * GQA_GROUP + group + 8;
-        max_logits[DFUSED_PART(qh)] = m_run1 * scale_log2;
-        exp_sums[DFUSED_PART(qh)] = l_run1;
+      if (group + 8 < rows) {
+        max_logits[DFUSED_PART(tok1, qh1)] = m_run1 * scale_log2;
+        exp_sums[DFUSED_PART(tok1, qh1)] = l_run1;
       }
     }
 #pragma unroll
     for (int n = 0; n < NPV; n++) {
       const int hd = warp * HDPW + n * 8 + 2 * tg;
-      if (group < GQA_GROUP) {
-        const int qh = kv_head * GQA_GROUP + group;
-        scalar_t* go = out_or_tmp + DFUSED_PART(qh) * HEAD_SIZE + hd;
+      if (group < rows) {
+        scalar_t* go = out_or_tmp + DFUSED_PART(tok0, qh0) * HEAD_SIZE + hd;
         from_float(go[0], oacc[n][0] * inv0);
         from_float(go[1], oacc[n][1] * inv0);
       }
-      if (group + 8 < GQA_GROUP) {
-        const int qh = kv_head * GQA_GROUP + group + 8;
-        scalar_t* go = out_or_tmp + DFUSED_PART(qh) * HEAD_SIZE + hd;
+      if (group + 8 < rows) {
+        scalar_t* go = out_or_tmp + DFUSED_PART(tok1, qh1) * HEAD_SIZE + hd;
         from_float(go[0], oacc[n][2] * inv1);
         from_float(go[1], oacc[n][3] * inv1);
       }
@@ -1987,17 +2010,15 @@ gemma_decode_fused_kernel(
 #pragma unroll
     for (int n = 0; n < NPV; n++) {
       const int hd = warp * HDPW + n * 8 + 2 * tg;
-      if (group < GQA_GROUP) {
-        const int qh = kv_head * GQA_GROUP + group;
-        scalar_t* go = out_or_tmp + (int64_t)seq_idx * num_q_heads * HEAD_SIZE +
-                       qh * HEAD_SIZE + hd;
+      if (group < rows) {
+        scalar_t* go = out_or_tmp + (int64_t)tok0 * num_q_heads * HEAD_SIZE +
+                       qh0 * HEAD_SIZE + hd;
         from_float(go[0], oacc[n][0] * inv0);
         from_float(go[1], oacc[n][1] * inv0);
       }
-      if (group + 8 < GQA_GROUP) {
-        const int qh = kv_head * GQA_GROUP + group + 8;
-        scalar_t* go = out_or_tmp + (int64_t)seq_idx * num_q_heads * HEAD_SIZE +
-                       qh * HEAD_SIZE + hd;
+      if (group + 8 < rows) {
+        scalar_t* go = out_or_tmp + (int64_t)tok1 * num_q_heads * HEAD_SIZE +
+                       qh1 * HEAD_SIZE + hd;
         from_float(go[0], oacc[n][2] * inv1);
         from_float(go[1], oacc[n][3] * inv1);
       }
