@@ -262,24 +262,12 @@ class GemmaAttentionMetadataBuilder(
             q_lens = cu[1:] - cu[:-1]
             slc = common_attn_metadata.seq_lens_cpu.to(torch.int64)
             # spec-decode steps may pad tokens beyond cu[-1]
-            n = int(cu[-1])
-            seq_idx = torch.repeat_interleave(
-                torch.arange(q_lens.numel(), dtype=torch.int64), q_lens)
-            offs = torch.arange(n, dtype=torch.int64) - cu[:-1][seq_idx]
-            slens_v = slc[seq_idx] - q_lens[seq_idx] + 1 + offs
-            bt_v = common_attn_metadata.block_table_tensor.index_select(
-                0, seq_idx.to(dev, non_blocking=True))
-            # Uniform q across seqs (spec-verify): the hd256 impl PACKS the
-            # positions into the fused kernel's M rows (one KV read serves
-            # all of them) using the REAL per-seq metadata; ragged batches
-            # and hd512 use the virtual expansion.
+            # Graph-safe: the plan is just the uniform mq (an int). The
+            # forward derives everything from PERSISTENT metadata
+            # (block_table/seq_lens) so captured graphs replay correctly.
+            # Ragged batches (mq_uniform==0) run eager -> prefill fallback.
             mq_uniform = int(mql) if bool((q_lens == mql).all()) else 0
-            tiny_extend_plan = (
-                bt_v,
-                slens_v.to(torch.int32).to(dev, non_blocking=True),
-                int(slens_v.max()),
-                mq_uniform,
-            )
+            tiny_extend_plan = mq_uniform if mq_uniform > 1 else None
 
         return GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -578,26 +566,30 @@ class GemmaAttentionImpl(AttentionImpl):
         if self._empty_lse is None:
             self._empty_lse = output.new_empty(0, dtype=torch.float32)
             self._empty_sel = output.new_empty(0, dtype=torch.int32)
-        bt_v, slens_v, max_sl, mqu = attn_metadata.tiny_extend_plan
-        n = slens_v.shape[0]  # real rows (spec steps pad past cu[-1])
-        num_real = attn_metadata.seq_lens.shape[0]
-        if (
+        mqu = attn_metadata.tiny_extend_plan
+        # Packed multi-query decode is graph-safe ONLY where it reads
+        # persistent metadata: hd256 sliding, GQA_GROUP(2)*mqu <= 16. The
+        # kernel maps M row r -> (position r//2, head r%2) over the REAL
+        # per-seq block_table/seq_lens; q/output rows are used in place.
+        # Everything else (hd512 verify, mqu>8) uses the graph-safe prefill
+        # path -- the fresh-tensor virtual expansion was NOT graph-safe.
+        if not (
             mqu >= 2
             and self.sliding_window > 0
             and self.actual_head_size == 256
-            and mqu <= 8
-            and num_real * self.num_kv_heads >= 128
+            and 2 * mqu <= 16
         ):
-            # Packed pays off only with enough CTAs (grid = kv_heads x REAL
-            # seqs); at small grids the virtual expansion's extra parallelism
-            # beats its mq-x KV re-read (window-bounded reads are tiny).
-            # Packed multi-query: q rows = seqs*mqu against REAL per-seq
-            # tables (the kernel maps M row r -> (position r//2, head r%2)).
-            bt_v = attn_metadata.block_table
-            slens_v = attn_metadata.seq_lens
-            max_sl = attn_metadata.max_seq_len
+            return self._forward_prefill(
+                query[: attn_metadata.num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[: attn_metadata.num_actual_tokens],
+                attn_metadata,
+            )
+        num_real = attn_metadata.seq_lens.shape[0]
+        n = num_real * mqu  # uniform: query rows = seqs * mq
         exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
-            n, max_sl, query.dtype, query.device,
+            n, attn_metadata.max_seq_len, query.dtype, query.device,
         )
         torch.ops._C.gemma_paged_attention(
             output[:n],
@@ -609,10 +601,10 @@ class GemmaAttentionImpl(AttentionImpl):
             value_cache,
             self.num_kv_heads,
             self.scale,
-            bt_v,
-            slens_v,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
             key_cache.shape[1],
-            max_sl,
+            attn_metadata.max_seq_len,
             self.kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
