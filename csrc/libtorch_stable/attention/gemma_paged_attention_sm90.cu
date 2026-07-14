@@ -79,7 +79,7 @@ struct DecodeFmhaLauncher {
     // Init with max_kv_len so TMA descriptors cover the full buffer
     int q_offset = max_kv_len > seq_q ? max_kv_len : 0;
     auto problem = cute::make_tuple(
-        num_q_heads, 1, seq_q, max_kv_len, HeadDim, sliding_window, q_offset, 0);
+        num_q_heads, 1, seq_q, max_kv_len, HeadDim, sliding_window, q_offset, 0, 0);
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = device_id;
@@ -166,7 +166,7 @@ struct PagedDecodeFmhaLauncher {
     int q_offset = max_kv_len;
     auto problem = cute::make_tuple(
         num_q_heads, max_num_seqs, seq_q, max_kv_len, HeadDim,
-        sliding_window, q_offset, num_total_blocks);
+        sliding_window, q_offset, num_total_blocks, 0);
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = device_id;

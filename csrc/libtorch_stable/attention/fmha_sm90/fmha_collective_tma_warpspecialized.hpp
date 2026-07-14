@@ -262,6 +262,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     int64_t pool_stride_head = 0;
     int pool_num_blocks = 0;
     int pool_num_kv_heads = 0;
+    int pool_page_size = 16;   // 16 (page-sliced) or 64 (whole-tile)
   };
 
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -307,6 +308,11 @@ struct FmhaMainloopTmaWarpSpecialized {
     // page_table: device ptr to block table(s) (logical→physical).
     TMA_K16 tma_load_k_paged;
     TMA_V16 tma_load_v_paged;
+    // 64-token-page pool (page == KV tile): whole-tile descriptors,
+    // same types as contiguous K/V; pages_per_tile picks the loader.
+    TMA_K tma_load_k_paged64;
+    TMA_V tma_load_v_paged64;
+    int pages_per_tile;
     const int* page_table;
     int gqa_group;
     int max_blocks_per_seq;
@@ -315,6 +321,11 @@ struct FmhaMainloopTmaWarpSpecialized {
     // [seq][max_q_pad] scratch); with d_seq_lens gives per-seq
     // q_offset = seq_k - q_len. Null = uniform batch / decode semantics.
     const int* d_cu_seqlens_q;
+    // KV-split virtual sequences: explicit per-seq q_offset (absolute; the
+    // seq_k - q_len derivation is wrong for non-final splits) and per-seq
+    // TILE-ALIGNED kv lower bound (problem slot 8). Null = disabled.
+    const int* d_q_offsets;
+    const int* d_kv_lo;
     // GQA-dense CONTIGUOUS KV buffers (prefill de-GQA): q-head -> kv-head
     // divisor for the kK/kV loaders. 1 = legacy expanded buffers.
     int contig_gqa_group;
@@ -358,6 +369,22 @@ struct FmhaMainloopTmaWarpSpecialized {
     Element,
     SmemLayoutVPaged,
     TMA_V16
+  >;
+
+  using LoadPaged64K = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPaged64K,
+    MainloopPipeline,
+    Element,
+    SmemLayoutK,
+    TMA_K
+  >;
+
+  using LoadPaged64V = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPaged64V,
+    MainloopPipeline,
+    Element,
+    SmemLayoutV,
+    TMA_V
   >;
 
   // For non-chunked/non-split: QK and PV MMA sizes must match.
@@ -405,7 +432,44 @@ struct FmhaMainloopTmaWarpSpecialized {
     // depend only on pool geometry — stable across steps, cache-friendly.
     TMA_K16 tma_k_paged{};
     TMA_V16 tma_v_paged{};
-    if (args.kv_pool_k != nullptr) {
+    TMA_K tma_k_paged64 = params_qk.tma_load_b;
+    TMA_V tma_v_paged64 = params_pv.tma_load_b;
+    constexpr int kTileN = int(get<1>(TileShapeQK{}));
+    int pages_per_tile = kTileN / cutlass::fmha::collective::kPagedPageSize;
+    // 64-token pools (hd512 hybrid group: page BYTES unified across
+    // groups => 64 tokens/page) get whole-tile descriptors.
+    if (args.kv_pool_k != nullptr && args.pool_page_size == kTileN) {
+      pages_per_tile = 1;
+      auto gK64 = make_tensor(
+          make_gmem_ptr(args.kv_pool_k),
+          make_layout(
+              make_shape(int(kTileN), int(get<4>(problem_size)),
+                         make_shape(args.pool_num_blocks, args.pool_num_kv_heads)),
+              make_stride(int(args.pool_stride_slot), _1{},
+                          make_stride(int(args.pool_stride_block),
+                                      int(args.pool_stride_head)))));
+      // Same box/rank as the contiguous descriptor -> patch raw bytes
+      // (the builder's TiledCopy type cannot be constructed from the
+      // 3-arg make_tma_copy; the spike validated this byte-patch).
+      auto tk64 = make_tma_copy(SM90_TMA_LOAD{}, gK64,
+                                SmemLayoutK{}(_, _, _0{}));
+      memcpy(const_cast<CUtensorMap*>(tma_k_paged64.get_tma_descriptor()),
+             tk64.get_tma_descriptor(), sizeof(CUtensorMap));
+      if (args.kv_pool_v != nullptr) {
+        auto gV64 = make_tensor(
+            make_gmem_ptr(args.kv_pool_v),
+            make_layout(
+                make_shape(int(get<4>(problem_size)), int(kTileN),
+                           make_shape(args.pool_num_blocks, args.pool_num_kv_heads)),
+                make_stride(_1{}, int(args.pool_stride_slot),
+                            make_stride(int(args.pool_stride_block),
+                                        int(args.pool_stride_head)))));
+        auto tv64 = make_tma_copy(SM90_TMA_LOAD{}, gV64,
+                                  SmemLayoutV{}(_, _, _0{}));
+        memcpy(const_cast<CUtensorMap*>(tma_v_paged64.get_tma_descriptor()),
+               tv64.get_tma_descriptor(), sizeof(CUtensorMap));
+      }
+    } else if (args.kv_pool_k != nullptr) {
       auto gK = make_tensor(
           make_gmem_ptr(args.kv_pool_k),
           make_layout(
@@ -445,11 +509,16 @@ struct FmhaMainloopTmaWarpSpecialized {
         args.dV,
         tma_k_paged,
         tma_v_paged,
+        tma_k_paged64,
+        tma_v_paged64,
+        pages_per_tile,
         nullptr,                 // page_table (null = contiguous mode; set by launcher)
         1,                       // gqa_group (set by paged launcher)
         0,                       // max_blocks_per_seq
         nullptr,                 // d_seq_lens (null = use problem_size scalar)
         nullptr,                 // d_cu_seqlens_q (null = uniform batch)
+        nullptr,                 // d_q_offsets (null = derive/scalar)
+        nullptr,                 // d_kv_lo (null = kv_lo 0 / scalar)
         1                        // contig_gqa_group (set by prefill launcher)
     };
   }
@@ -459,7 +528,11 @@ struct FmhaMainloopTmaWarpSpecialized {
     cute::prefetch_tma_descriptor(params.tma_load_q.get_tma_descriptor());
     if (params.page_table != nullptr) {
       cute::prefetch_tma_descriptor(params.tma_load_k_paged.get_tma_descriptor());
-      if constexpr (!kKEqV) cute::prefetch_tma_descriptor(params.tma_load_v_paged.get_tma_descriptor());
+      cute::prefetch_tma_descriptor(params.tma_load_k_paged64.get_tma_descriptor());
+      if constexpr (!kKEqV) {
+        cute::prefetch_tma_descriptor(params.tma_load_v_paged.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(params.tma_load_v_paged64.get_tma_descriptor());
+      }
     } else {
       cute::prefetch_tma_descriptor(params.tma_load_k.get_tma_descriptor());
       if constexpr (!kKEqV) cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
@@ -583,64 +656,76 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     }
 
-    auto q_tile_iter = cute::make_coord_iterator(Int<NumQKWarpGroups>{});
-    [[maybe_unused]] int q_tile_count = NumQKWarpGroups;
-
     int fusion_tile_start = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
-    auto k_tile_iter = cute::make_coord_iterator(fusion_tile_count);
-    for (int i = 0; i < fusion_tile_start; ++i) { ++k_tile_iter; }
-    // kKEqV: one pipeline slot per k-tile (K only); else two (K then V).
-    int k_tile_count = (kKEqV ? 1 : 2) * (fusion_tile_count - fusion_tile_start);
 
     LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
     auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
-
-    LoadPagedK load_k{params.tma_load_k_paged, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
-    auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
-
-    LoadPagedV load_v{params.tma_load_v_paged, pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
     using TileShapePV_Load = cute::conditional_t<kSplitDPV, TileShapePV, TileShapePV_Eff>;
-    auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
 
-    if constexpr (kLoadQ) {
-      load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
-    }
+    // Runtime page-size dispatch: 64-token pools (page == KV tile) use
+    // whole-tile descriptors; 16-token pools use page-sliced ones. Both
+    // loader sets share the pipeline/state discipline.
+    auto run_kv_loads = [&](auto& load_k, auto& load_v) {
+      auto q_tile_iter = cute::make_coord_iterator(Int<NumQKWarpGroups>{});
+      [[maybe_unused]] int q_tile_count = NumQKWarpGroups;
+      auto k_tile_iter = cute::make_coord_iterator(fusion_tile_count);
+      for (int i = 0; i < fusion_tile_start; ++i) { ++k_tile_iter; }
+      // kKEqV: one pipeline slot per k-tile (K only); else two (K then V).
+      int k_tile_count = (kKEqV ? 1 : 2) * (fusion_tile_count - fusion_tile_start);
 
-    if constexpr (kKEqV) {
-      load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
-    } else {
-      load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
-    }
+      auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
+      auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
 
-    if constexpr (kLoadQ) {
-      load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
-    }
-
-    if constexpr (! kLoadQ) {
-      if (do_barrier) {
-        load_warp_barrier.arrive();
-        load_warp_barrier.wait(/*phase=*/ 0);
-        do_barrier = false;
-      }
-    }
-
-    if constexpr (!kKEqV)
-      load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
-
-    if constexpr (kLoadQ) {
-      while (q_tile_count > 0) {
+      if constexpr (kLoadQ) {
         load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
       }
-    }
 
-    CUTLASS_PRAGMA_NO_UNROLL
-    while (k_tile_count > 0) {
       if constexpr (kKEqV) {
         load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
       } else {
         load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
-        load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
       }
+
+      if constexpr (kLoadQ) {
+        load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
+      }
+
+      if constexpr (! kLoadQ) {
+        if (do_barrier) {
+          load_warp_barrier.arrive();
+          load_warp_barrier.wait(/*phase=*/ 0);
+          do_barrier = false;
+        }
+      }
+
+      if constexpr (!kKEqV)
+        load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+
+      if constexpr (kLoadQ) {
+        while (q_tile_count > 0) {
+          load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
+        }
+      }
+
+      CUTLASS_PRAGMA_NO_UNROLL
+      while (k_tile_count > 0) {
+        if constexpr (kKEqV) {
+          load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+        } else {
+          load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+          load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+        }
+      }
+    };
+
+    if (params.pages_per_tile == 1) {
+      LoadPaged64K load_k64{params.tma_load_k_paged64, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      LoadPaged64V load_v64{params.tma_load_v_paged64, pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      run_kv_loads(load_k64, load_v64);
+    } else {
+      LoadPagedK load_k{params.tma_load_k_paged, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      LoadPagedV load_v{params.tma_load_v_paged, pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      run_kv_loads(load_k, load_v);
     }
   }
 
@@ -1185,16 +1270,19 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     }
 
-    // Write LSE
+    // Write LSE (same swapped-name/batch-term convention as compute_ncoop)
     if (params.ptr_LSE != nullptr) {
       auto acc_mn = make_tensor(tOcO.data(), layout_acc_mn(tiled_mma_pv, tOcO.layout()));
       if (get<1>(acc_mn(_0{}, _0{})) == 0) {
+        const int64_t lse_base =
+            (int64_t)batch_idx * seqlen_q +
+            (int64_t)head_idx * seqlen_q * get<0>(problem_size);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size<0>(acc_mn); i++) {
           int m = get<0>(acc_mn(i, _0{}));
           int abs_m = m + m_block * MPerWG;
           if (abs_m < seqlen_q) {
-            params.ptr_LSE[batch_idx * seqlen_q + abs_m] = lse(i);
+            params.ptr_LSE[lse_base + abs_m] = lse(i);
           }
         }
       }
@@ -1522,14 +1610,21 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     }
 
-    // LSE write
+    // LSE write. NOTE the swapped local names: batch_idx = q-head coord
+    // (blockIdx.y), head_idx = REAL batch (blockIdx.z). Layout matches the
+    // launcher's stride_lse (1, (seq_q, seq_q*num_heads)); omitting the
+    // real-batch term made every batch entry overwrite z=0's rows (latent
+    // until KV-split combine became the first reader of batched LSE).
     if (params.ptr_LSE != nullptr) {
       if (get<1>(tOcO(pv_mn(_0{}, _0{}))) == 0) {
+        const int64_t lse_base =
+            (int64_t)batch_idx * seqlen_q +
+            (int64_t)head_idx * seqlen_q * get<0>(problem_size);
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size<0>(pv_mn); mi++) {
           int m = get<0>(tOcO(pv_mn(mi, _0{})));
           if (m + m_block * MPerWG < seqlen_q) {
-            params.ptr_LSE[batch_idx * seqlen_q + m + m_block * MPerWG] = lse(mi);
+            params.ptr_LSE[lse_base + m + m_block * MPerWG] = lse(mi);
           }
         }
       }
@@ -1804,13 +1899,21 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     }
 
+    // LSE write. Swapped local names: batch_idx = q-head (blockIdx.y),
+    // head_idx = REAL batch (blockIdx.z). Layout = launcher stride_lse
+    // (1, (seq_q, seq_q*num_heads)); the missing real-batch term made every
+    // batch entry overwrite z=0's rows (latent until KV-split combine
+    // became the first reader of batched LSE).
     if (params.ptr_LSE != nullptr) {
       if (get<1>(tOcO(pv_mn(_0{}, _0{}))) == 0) {
+        const int64_t lse_base =
+            (int64_t)batch_idx * seqlen_q +
+            (int64_t)head_idx * seqlen_q * get<0>(problem_size);
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size<0>(pv_mn); mi++) {
           int m = get<0>(tOcO(pv_mn(mi, _0{})));
           if (m + m_block * MPerWG < seqlen_q) {
-            params.ptr_LSE[batch_idx * seqlen_q + m + m_block * MPerWG] = lse(mi);
+            params.ptr_LSE[lse_base + m + m_block * MPerWG] = lse(mi);
           }
         }
       }

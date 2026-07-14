@@ -38,7 +38,8 @@ namespace cutlass::fmha::collective {
 
 enum class LoadKind {
   kQ, kK, kV,
-  kPagedK, kPagedV,
+  kPagedK, kPagedV,        // 16-token pages: pages_per_tile copies per tile
+  kPaged64K, kPaged64V,    // 64-token pages: one whole-tile copy (page==tile)
   kBwdN, kBwdM, kBwdScalar
 };
 
@@ -127,6 +128,24 @@ struct CollectiveLoadTma {
           make_shape(get<4>(problem_size), Int<kPagedPageSize>{},
                      make_shape(num_blocks, num_kv_heads)));
       return mV(_, _, make_coord(_, kv_head));
+    } else if constexpr (kKind == LoadKind::kPaged64K) {
+      // 64-token pages: one page == one KV tile, whole-tile copies (dense
+      // 128KB boxes; none of the 16-page scatter latency).
+      int num_blocks = get<7>(problem_size);
+      int num_kv_heads = get<0>(problem_size) / gqa_group;
+      int kv_head = int(get<0>(get<2>(blk_coord))) / gqa_group;
+      Tensor mK = params.get_tma_tensor(
+          make_shape(int(get<0>(tile_shape)), get<4>(problem_size),
+                     make_shape(num_blocks, num_kv_heads)));
+      return mK(_, _, make_coord(_, kv_head));
+    } else if constexpr (kKind == LoadKind::kPaged64V) {
+      int num_blocks = get<7>(problem_size);
+      int num_kv_heads = get<0>(problem_size) / gqa_group;
+      int kv_head = int(get<0>(get<2>(blk_coord))) / gqa_group;
+      Tensor mV = params.get_tma_tensor(
+          make_shape(get<4>(problem_size), int(get<0>(tile_shape)),
+                     make_shape(num_blocks, num_kv_heads)));
+      return mV(_, _, make_coord(_, kv_head));
     } else if constexpr (kKind == LoadKind::kBwdN) {
       Tensor m_full = params.get_tma_tensor(make_shape(get<3>(problem_size), get<4>(problem_size), select<0,1>(problem_size)));
       Tensor g_full = local_tile(m_full, tile_shape, make_coord(_, _, _), Step<_1, X, _1>{});
@@ -153,6 +172,11 @@ struct CollectiveLoadTma {
     if constexpr (kKind == LoadKind::kPagedK || kKind == LoadKind::kPagedV) {
       batch_idx = int(get<1>(get<2>(block_coord)));
       num_pages = (int(get<3>(problem_size)) + kPagedPageSize - 1) / kPagedPageSize;
+    }
+    if constexpr (kKind == LoadKind::kPaged64K || kKind == LoadKind::kPaged64V) {
+      batch_idx = int(get<1>(get<2>(block_coord)));
+      num_pages = (int(get<3>(problem_size)) + int(get<0>(tile_shape)) - 1) /
+                  int(get<0>(tile_shape));
     }
     Tensor g = init_g(problem_size, tile_shape, block_coord, loop_count);
     Tensor s = make_tensor(make_smem_ptr(storage.data()), SmemLayout{});
@@ -195,6 +219,22 @@ struct CollectiveLoadTma {
                get<0>(state)(_,_,_,phys_block),
                get<1>(state)(_,_,_,pg,stage));
         }
+        if constexpr (kAdvancePipe) ++smem_pipe_write;
+        if constexpr (kAdvanceIterator) ++tile_iter;
+      }
+      --tile_count;
+    } else if constexpr (kKind == LoadKind::kPaged64K ||
+                         kKind == LoadKind::kPaged64V) {
+      if ((lane_predicate == 1) && (tile_count > 0)) {
+        if constexpr (kAcquireBarrier) pipeline.producer_acquire(smem_pipe_write);
+        using BarrierType = typename Pipeline::ProducerBarrierType;
+        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+        int logical = int(*tile_iter);
+        if (logical >= num_pages) logical = num_pages - 1;  // tail clamp
+        int phys_block = page_table[batch_idx * max_blocks_per_seq + logical];
+        copy(params.with(*tma_barrier, mcast_mask),
+             get<0>(state)(_,_,_,phys_block),
+             get<1>(state)(_,_,_,smem_pipe_write.index()));
         if constexpr (kAdvancePipe) ++smem_pipe_write;
         if constexpr (kAdvanceIterator) ++tile_iter;
       }

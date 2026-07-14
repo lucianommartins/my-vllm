@@ -85,6 +85,109 @@ __global__ void varlen_scatter_o_kernel(
   for (int i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = p[i];
 }
 
+// ---- KV-split staging (skinny-q long-KV chunks; hd512 global layers) ----
+// Real seq s becomes S virtual batch entries, each owning a TILE-ALIGNED kv
+// slice; the final split owns the whole causal-frontier region
+// [q_offset/64*64, kv) so every split has l>0 for every real q row (no
+// empty-softmax rows). Combine merges via LSE weights.
+__global__ void split_params_build_kernel(
+    int* __restrict__ d_sl_v, int* __restrict__ d_qoff_v,
+    int* __restrict__ d_kvlo_v, int* __restrict__ vtable,
+    const int* __restrict__ seq_lens, const int* __restrict__ cu_q,
+    const int* __restrict__ block_tables, int num_seqs, int S,
+    int uniform_q_len, int max_blocks, int tile) {
+  const int v = blockIdx.x;
+  if (v >= num_seqs * S) return;
+  const int s = v / S, j = v % S;
+  const int kv = seq_lens[s];
+  const int qlen = cu_q != nullptr ? cu_q[s + 1] - cu_q[s] : uniform_q_len;
+  const int qoff = kv - qlen;
+  if (threadIdx.x == 0) {
+    const int frontier_t = qoff / tile;      // dense region = [0, frontier_t)
+    // Balanced partition of the dense region over S-1 splits: slice j =
+    // [j*F/(S-1), (j+1)*F/(S-1)) tiles — never empty while F >= S-1
+    // (launcher guarantees min_kv; combine still skips empty-LSE entries).
+    int lo_t;
+    if (j == S - 1) {
+      lo_t = frontier_t;
+      d_sl_v[v] = kv;                        // final split: frontier .. end
+    } else {
+      lo_t = (int)(((int64_t)j * frontier_t) / (S - 1));
+      const int hi_t = (int)(((int64_t)(j + 1) * frontier_t) / (S - 1));
+      d_sl_v[v] = hi_t * tile;
+    }
+    d_kvlo_v[v] = lo_t * tile;
+    d_qoff_v[v] = qoff;
+  }
+  // replicate this real seq's block-table row for the virtual entry
+  for (int i = threadIdx.x; i < max_blocks; i += blockDim.x)
+    vtable[(int64_t)v * max_blocks + i] = block_tables[(int64_t)s * max_blocks + i];
+}
+
+// Q replication: virtual entry v=(s,j) gets a copy of seq s's q rows.
+template <typename Element>
+__global__ void split_replicate_q_kernel(
+    Element* __restrict__ dst, const Element* __restrict__ src,
+    const int* __restrict__ cu_q, int S, int max_q_pad, int uniform_q_len,
+    int64_t src_stride, int row_elems) {
+  const int v = blockIdx.y;
+  const int s = v / S;
+  const int r = blockIdx.x;
+  const int q0 = cu_q != nullptr ? cu_q[s] : s * uniform_q_len;
+  const int qlen = cu_q != nullptr ? cu_q[s + 1] - q0 : uniform_q_len;
+  Element* d = dst + ((int64_t)v * max_q_pad + r) * row_elems;
+  if (r < qlen) {
+    const Element* p = src + (int64_t)(q0 + r) * src_stride;
+    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = p[i];
+  } else {
+    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = Element(0);
+  }
+}
+
+// LSE-weighted merge of S partials per real seq; writes final rows directly.
+template <typename Element>
+__global__ void split_combine_o_kernel(
+    Element* __restrict__ out, const Element* __restrict__ o_v,
+    const float* __restrict__ lse_v, const int* __restrict__ cu_q,
+    int S, int max_q_pad, int uniform_q_len, int num_q_heads, int head_size,
+    int64_t out_stride, int row_elems) {
+  const int s = blockIdx.z;
+  const int r = blockIdx.x;
+  const int q0 = cu_q != nullptr ? cu_q[s] : s * uniform_q_len;
+  const int qlen = cu_q != nullptr ? cu_q[s + 1] - q0 : uniform_q_len;
+  if (r >= qlen) return;
+  Element* dst = out + (int64_t)(q0 + r) * out_stride;
+  const int64_t lse_batch = (int64_t)max_q_pad * num_q_heads;
+  {
+    const int h = blockIdx.y;
+    // The kernel writes lse = +INF for zero-mass rows (its empty sentinel):
+    // treat those splits as absent.
+    float m = -INFINITY;
+    for (int j = 0; j < S; j++) {
+      float l = lse_v[(int64_t)(s * S + j) * lse_batch + h * max_q_pad + r];
+      if (isfinite(l) && l > m) m = l;
+    }
+    float den = 0.f;
+    for (int j = 0; j < S; j++) {
+      float l = lse_v[(int64_t)(s * S + j) * lse_batch + h * max_q_pad + r];
+      if (isfinite(l)) den += expf(l - m);
+    }
+    const float inv_den = den > 0.f ? 1.f / den : 0.f;
+    for (int d = threadIdx.x; d < head_size; d += blockDim.x) {
+      float acc = 0.f;
+      for (int j = 0; j < S; j++) {
+        float l = lse_v[(int64_t)(s * S + j) * lse_batch + h * max_q_pad + r];
+        if (!isfinite(l)) continue;
+        float w = expf(l - m) * inv_den;
+        acc += w * float(o_v[((int64_t)(s * S + j) * max_q_pad + r) *
+                             row_elems + h * head_size + d]);
+      }
+      dst[h * head_size + d] = Element(acc);
+    }
+  }
+}
+
+
 // Paged-pool descriptor set: non-null enables gather-free KV reads straight
 // from the block_size=16 cache pool (page_table = this launch's block table,
 // row-major [seq][max_blocks] for batched, or a single row for per-seq).
@@ -96,6 +199,7 @@ struct PagedPool {
   int num_kv_heads;
   const int* page_table;
   int max_blocks_per_seq;
+  int page_size;        // 16 (page-sliced TMA) or 64 (whole-tile TMA)
 };
 
 template <int HeadDim, bool KEqV = false>
@@ -136,7 +240,9 @@ struct FmhaCachedLauncher {
       cudaStream_t stream,
       const PagedPool* paged = nullptr,
       const int* varlen_seq_lens = nullptr,
-      const int* varlen_cu_q = nullptr) {
+      const int* varlen_cu_q = nullptr,
+      const int* varlen_q_offsets = nullptr,
+      const int* varlen_kv_lo = nullptr) {
     // Key must cover everything baked into Params: seq_q, seq_k (drives the
     // KV extents AND q_offset = seq_k - seq_q for extends/chunked prefill),
     // heads, and the sliding window. Keying on seq_q alone served stale
@@ -170,7 +276,7 @@ struct FmhaCachedLauncher {
       // of-8 lengths, so the caller passes it explicitly.
       auto problem = cute::make_tuple(
           num_q_heads, num_seqs, seq_q, seq_k, HeadDim, sliding_window,
-          q_offset, 0);
+          q_offset, 0, 0);  // trailing: num_blocks (dead spike), kv_lo
 
       cutlass::KernelHardwareInfo hw_info;
       hw_info.device_id = device_id;
@@ -190,6 +296,7 @@ struct FmhaCachedLauncher {
         args.mainloop.pool_stride_head = paged->stride_head;
         args.mainloop.pool_num_blocks = paged->num_blocks;
         args.mainloop.pool_num_kv_heads = paged->num_kv_heads;
+        args.mainloop.pool_page_size = paged->page_size;
       }
 
       if (FmhaOp::can_implement(args) != cutlass::Status::kSuccess)
@@ -225,15 +332,19 @@ struct FmhaCachedLauncher {
         // shared by every layer of the (HeadDim,KEqV) type: same-shape
         // calls from different layers MUST repatch the descriptor base or
         // they silently read the first layer's pool.
+        CUtensorMap* kd = const_cast<CUtensorMap*>(
+            paged->page_size == 64
+                ? p.mainloop.tma_load_k_paged64.get_tma_descriptor()
+                : p.mainloop.tma_load_k_paged.get_tma_descriptor());
         cuTensorMapReplaceAddress(
-            const_cast<CUtensorMap*>(
-                p.mainloop.tma_load_k_paged.get_tma_descriptor()),
-            const_cast<cutlass::bfloat16_t*>(paged->pool_k));
+            kd, const_cast<cutlass::bfloat16_t*>(paged->pool_k));
         if (!KEqV && paged->pool_v != nullptr) {
+          CUtensorMap* vd = const_cast<CUtensorMap*>(
+              paged->page_size == 64
+                  ? p.mainloop.tma_load_v_paged64.get_tma_descriptor()
+                  : p.mainloop.tma_load_v_paged.get_tma_descriptor());
           cuTensorMapReplaceAddress(
-              const_cast<CUtensorMap*>(
-                  p.mainloop.tma_load_v_paged.get_tma_descriptor()),
-              const_cast<cutlass::bfloat16_t*>(paged->pool_v));
+              vd, const_cast<cutlass::bfloat16_t*>(paged->pool_v));
         }
       }
       // Per-seq multimodal ranges: pointer varies per call (pre-existing
@@ -266,6 +377,8 @@ struct FmhaCachedLauncher {
       // Varlen batch state: per-seq kv lens + q starts (null = uniform).
       p.mainloop.d_seq_lens = varlen_seq_lens;
       p.mainloop.d_cu_seqlens_q = varlen_cu_q;
+      p.mainloop.d_q_offsets = varlen_q_offsets;
+      p.mainloop.d_kv_lo = varlen_kv_lo;
     }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
@@ -296,13 +409,16 @@ static bool launch_fmha_batched(
     cudaStream_t stream,
     const PagedPool* paged = nullptr,
     const int* varlen_seq_lens = nullptr,
-    const int* varlen_cu_q = nullptr) {
+    const int* varlen_cu_q = nullptr,
+    const int* varlen_q_offsets = nullptr,
+    const int* varlen_kv_lo = nullptr) {
   static FmhaCachedLauncher<HeadDim, KEqV> launcher;
   return launcher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, num_q_heads,
                          gqa_group, num_seqs, seq_q, seq_k, q_offset,
                          q_stride, scale, sliding_window, mm_ranges_ptr,
                          max_mm_ranges, device_id, sm_count, stream, paged,
-                         varlen_seq_lens, varlen_cu_q);
+                         varlen_seq_lens, varlen_cu_q,
+                         varlen_q_offsets, varlen_kv_lo);
 }
 
 template <typename T, typename CACHE_T>
@@ -357,7 +473,12 @@ bool gemma_prefill_sm90_launcher(
     const char* e = getenv("GEMMA_PREFILL_PAGED");
     return e == nullptr || e[0] != '0';
   }();
-  const bool use_paged = paged_enabled && page_size == 16 &&
+  // 16-token pools (hd256 sliding group) use page-sliced TMA; 64-token
+  // pools (hd512 global group: hybrid manager unifies page BYTES across
+  // groups => 64 tokens/page) use whole-tile TMA (dense boxes, no scatter
+  // latency => no long-KV threshold needed).
+  const bool use_paged = paged_enabled &&
+                         (page_size == 16 || page_size == 64) &&
                          sizeof(CACHE_T) == sizeof(T);
   if (prefill_debug)
     fprintf(stderr, "[sm90-prefill] use_paged=%d page_size=%d\n",
@@ -475,7 +596,12 @@ bool gemma_prefill_sm90_launcher(
     const char* e = getenv("GEMMA_PREFILL_PAGED_MAXKV");
     return e != nullptr ? atoi(e) : 1024;
   }();
-  const bool paged_call = use_paged && max_kv_len <= paged_maxkv;
+  // Long-KV paged only for SKINNY q: big-q prefills re-read every KV
+  // tile per q-tile, and the gathered dense buffer wins on L2/TLB
+  // locality (TTFT-16k regressed ~5% routing full prefills paged).
+  const bool paged_call =
+      use_paged && (max_kv_len <= paged_maxkv ||
+                    (page_size == 64 && max_q_len <= 128));
   // Re-grow the expanded-KV scratch for the KV extent (sized for q above).
   const size_t kv_needed =
       (size_t)max_kv_len * num_kv_heads * head_size * sizeof(CACHE_T);
@@ -497,10 +623,114 @@ bool gemma_prefill_sm90_launcher(
       k_eq_v ? nullptr : reinterpret_cast<const Element*>(value_cache_ptr),
       kv_stride_block, kv_stride_slot, kv_stride_head,
       pool_num_blocks, num_kv_heads,
-      /*page_table=*/nullptr, max_num_blocks_per_seq};
+      /*page_table=*/nullptr, max_num_blocks_per_seq, page_size};
 
   bool ok = true;
   const int padded_qo_stride = num_q_heads * head_size;
+
+  // ---- KV-split paged path (hd512 skinny-q over long KV) ----
+  // FA4's remaining structural edge on re-prefill chunks: at q<=128 our
+  // launch has ~num_q_heads CTAs of parallelism while the KV range is huge.
+  // Split each seq into S tile-aligned kv slices as VIRTUAL batch entries
+  // (per-CTA seq_k/q_offset/kv_lo overrides), one paged batched launch, then
+  // an LSE-weighted combine. Splits also shrink each CTA's serial tile
+  // stream, curing the paged long-KV latency wall (692us) as a side effect.
+  static const bool splitkv_enabled = []() {
+    const char* e = getenv("GEMMA_PREFILL_SPLITKV");
+    return e == nullptr || e[0] != '0';
+  }();
+  int min_kv_len = max_kv_len;
+  for (int s2 = 0; s2 < num_seqs; s2++)
+    min_kv_len = std::min(min_kv_len, h_seq_lens[s2]);
+  if (prefill_debug)
+    fprintf(stderr,
+            "[sm90-prefill] splitkv gate: hd=%d max_q=%d min_kv=%d paged=%d ps=%d\n",
+            head_size, max_q_len, min_kv_len, int(use_paged), page_size);
+  if (splitkv_enabled && use_paged && head_size == 512 && max_q_len <= 128 &&
+      min_kv_len >= 2048 && mm_prefix_ranges.numel() == 0) {
+    const int S = std::min(32, std::max(2, max_kv_len / 512));
+    const int V = num_seqs * S;
+    const int max_q_pad =
+        (max_q_len + kAlignment - 1) / kAlignment * kAlignment;
+    const int row_elems = num_q_heads * head_size;
+    const size_t sq_bytes = (size_t)V * max_q_pad * row_elems * sizeof(T);
+    const size_t slse_bytes =
+        (size_t)V * max_q_pad * num_q_heads * sizeof(float);
+    static int* d_split_meta = nullptr;   // [3][V]: sl, qoff, kvlo
+    static int* d_vtable = nullptr;
+    static size_t s_meta_cap = 0, s_vtable_cap = 0;
+    const size_t meta_need = (size_t)3 * V * sizeof(int);
+    const size_t vt_need = (size_t)V * max_num_blocks_per_seq * sizeof(int);
+    if (sq_bytes <= ((size_t)512 << 20)) {
+      if (meta_need > s_meta_cap) {
+        if (d_split_meta) cudaFree(d_split_meta);
+        cudaMalloc(&d_split_meta, meta_need);
+        s_meta_cap = meta_need;
+      }
+      if (vt_need > s_vtable_cap) {
+        if (d_vtable) cudaFree(d_vtable);
+        cudaMalloc(&d_vtable, vt_need);
+        s_vtable_cap = vt_need;
+      }
+      if (sq_bytes > s_qo_cap) {
+        if (q_scratch) cudaFree(q_scratch);
+        if (o_scratch) cudaFree(o_scratch);
+        cudaMalloc(&q_scratch, sq_bytes);
+        cudaMalloc(&o_scratch, sq_bytes);
+        s_qo_cap = sq_bytes;
+      }
+      if (slse_bytes > s_lse_cap) {
+        if (lse_scratch) cudaFree(lse_scratch);
+        cudaMalloc(&lse_scratch, slse_bytes);
+        s_lse_cap = slse_bytes;
+      }
+      int* d_sl_v = d_split_meta;
+      int* d_qoff_v = d_split_meta + V;
+      int* d_kvlo_v = d_split_meta + 2 * V;
+      const int* d_cu_q = (!equal_lens && cu_seqlens_q.numel() >= num_seqs + 1)
+                              ? cu_seqlens_q.mutable_data_ptr<int>()
+                              : nullptr;
+      const int* d_sl_real = seq_lens.mutable_data_ptr<int>();
+      split_params_build_kernel<<<V, 128, 0, stream>>>(
+          d_sl_v, d_qoff_v, d_kvlo_v, d_vtable, d_sl_real, d_cu_q,
+          block_tables_ptr, num_seqs, S, seq_len, max_num_blocks_per_seq, 64);
+      dim3 sgrid(max_q_pad, V);
+      split_replicate_q_kernel<Element><<<sgrid, 256, 0, stream>>>(
+          reinterpret_cast<Element*>(q_scratch), query_ptr, d_cu_q, S,
+          max_q_pad, seq_len, q_stride, row_elems);
+
+      PagedPool pool = pool_proto;
+      pool.page_table = d_vtable;
+      Element* kc = reinterpret_cast<Element*>(key_cache_ptr);
+      Element* vc = k_eq_v ? kc : reinterpret_cast<Element*>(value_cache_ptr);
+      Element* qs = reinterpret_cast<Element*>(q_scratch);
+      Element* os = reinterpret_cast<Element*>(o_scratch);
+      const int q_off_dummy =
+          max_kv_len > max_q_len ? max_kv_len - max_q_len : 0;
+      bool sok;
+      if (k_eq_v) {
+        sok = launch_fmha_batched<512, true>(
+            qs, kc, vc, os, lse_scratch, num_q_heads, gqa_group, V,
+            max_q_pad, max_kv_len, q_off_dummy, row_elems, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool, d_sl_v, nullptr, d_qoff_v, d_kvlo_v);
+      } else {
+        sok = launch_fmha_batched<512>(
+            qs, kc, vc, os, lse_scratch, num_q_heads, gqa_group, V,
+            max_q_pad, max_kv_len, q_off_dummy, row_elems, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool, d_sl_v, nullptr, d_qoff_v, d_kvlo_v);
+      }
+      if (sok) {
+        dim3 cgrid(max_q_pad, num_q_heads, num_seqs);
+        split_combine_o_kernel<Element><<<cgrid, 128, 0, stream>>>(
+            out_ptr, os, lse_scratch, d_cu_q, S, max_q_pad, seq_len,
+            num_q_heads, head_size, q_stride, row_elems);
+        return true;
+      }
+      // launch failure: fall through to the standard paths
+    }
+  }
 
   // ---- Uniform-batch fast path: ONE fmha launch per layer call ----
   // (equal q_len and kv_len across seqs, TMA-aligned q_len, no mm ranges).

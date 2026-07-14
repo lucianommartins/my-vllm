@@ -105,10 +105,13 @@ struct FmhaKernelTmaWarpSpecialized {
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-  // (num_heads, batch, seq_q, seq_k, head_dim, sliding_window, q_offset, num_kv_blocks)
+  // (num_heads, batch, seq_q, seq_k, head_dim, sliding_window, q_offset,
+  //  num_kv_blocks, kv_lo)
   // q_offset: global position of Q[0] in the sequence (for decode: seq_k - seq_q)
   // num_kv_blocks: total blocks in KV cache pool (0 = contiguous mode, >0 = paged TMA mode)
-  using ProblemShape = cute::tuple<int, int, int, int, int, int, int, int>;
+  // kv_lo: TILE-ALIGNED absolute KV lower bound (KV-split virtual seqs; 0 =
+  //        full range; per-CTA override via Mainloop d_kv_lo)
+  using ProblemShape = cute::tuple<int, int, int, int, int, int, int, int, int>;
 
   struct Arguments {
     ProblemShape problem_size;
@@ -176,7 +179,11 @@ struct FmhaKernelTmaWarpSpecialized {
     if (params.mainloop.d_seq_lens != nullptr) {
       int seq_k = params.mainloop.d_seq_lens[blockIdx.z];
       get<3>(problem_size_local) = seq_k;
-      if (params.mainloop.d_cu_seqlens_q != nullptr) {
+      if (params.mainloop.d_q_offsets != nullptr) {
+        // KV-split virtual seqs: explicit absolute q_offset (the
+        // seq_k - q_len derivation is wrong for non-final splits).
+        get<6>(problem_size_local) = params.mainloop.d_q_offsets[blockIdx.z];
+      } else if (params.mainloop.d_cu_seqlens_q != nullptr) {
         // Varlen batch: this seq's q rows sit at absolute positions
         // [seq_k - q_len, seq_k); padded rows past q_len write garbage to
         // scratch rows the launcher never copies back.
@@ -185,6 +192,9 @@ struct FmhaKernelTmaWarpSpecialized {
         get<6>(problem_size_local) = seq_k - q_len;
       } else {
         get<6>(problem_size_local) = seq_k;  // decode-batch semantics
+      }
+      if (params.mainloop.d_kv_lo != nullptr) {
+        get<8>(problem_size_local) = params.mainloop.d_kv_lo[blockIdx.z];
       }
     }
     const auto& problem_size = problem_size_local;

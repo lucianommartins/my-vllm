@@ -249,11 +249,16 @@ struct SlidingWindowCausalFusion : DefaultFusion {
     TileShape const& tile_shape,
     ProblemSize const& problem_size
   ) {
+    // Slot 8: kv_lo (TILE-ALIGNED absolute lower bound; KV-split virtual
+    // sequences start mid-context). Tile alignment means no element-level
+    // lower-bound masking is needed — the slice boundary is a tile boundary.
+    int start = get<8>(problem_size) / get<1>(tile_shape);
     int sw = get<5>(problem_size);
-    if (sw <= 0) return 0;
+    if (sw <= 0) return start;
     int q_min = get<0>(blk_coord) * get<0>(tile_shape) + get<6>(problem_size);
     int k_lo = q_min - sw + 1;
-    return k_lo > 0 ? k_lo / get<1>(tile_shape) : 0;
+    int sw_start = k_lo > 0 ? k_lo / get<1>(tile_shape) : 0;
+    return sw_start > start ? sw_start : start;
   }
 
   template<class BlkCoord, class TileShape, class ProblemSize>
