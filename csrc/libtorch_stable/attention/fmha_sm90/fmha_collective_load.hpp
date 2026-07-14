@@ -42,6 +42,12 @@ enum class LoadKind {
   kBwdN, kBwdM, kBwdScalar
 };
 
+// vLLM KV cache page size (tokens). Paged loads issue kPagesPerTile
+// per-page TMA copies per KV tile (tile_n / kPageSize), each landing in a
+// page-slice of the stage; the pipeline's per-stage transaction-byte count
+// is unchanged (the copies sum to one full stage).
+static constexpr int kPagedPageSize = 16;
+
 template<
   LoadKind kKind,
   class Pipeline,
@@ -62,6 +68,7 @@ struct CollectiveLoadTma {
   int gqa_group;
   int max_blocks_per_seq;
   int batch_idx;
+  int num_pages;  // valid pages this seq (paged tail clamp)
 
   CUTLASS_DEVICE
   CollectiveLoadTma(Params const& params, Pipeline& pipeline, SharedStorage& storage,
@@ -69,7 +76,7 @@ struct CollectiveLoadTma {
                     int max_blocks_per_seq = 0)
     : params(params), pipeline(pipeline), storage(storage),
       page_table(page_table), gqa_group(gqa_group),
-      max_blocks_per_seq(max_blocks_per_seq), batch_idx(0) {}
+      max_blocks_per_seq(max_blocks_per_seq), batch_idx(0), num_pages(0) {}
 
   template<class ProblemSize, class TileShape, class BlockCoord>
   CUTLASS_DEVICE auto init_g(ProblemSize const& problem_size, TileShape const& tile_shape,
@@ -101,15 +108,15 @@ struct CollectiveLoadTma {
       Tensor gV = gV_full(_, _, _0{}, _, kv_coord_v);
       return gV;
     } else if constexpr (kKind == LoadKind::kPagedK) {
-      // Paged K: TMA covers (block_size, head_dim, (num_blocks, num_kv_heads)).
-      // 4D flat rank matches contiguous K's TMA type. The batch tuple encodes
-      // (num_blocks, num_kv_heads) instead of contiguous's (num_q_heads, 1).
-      // kv_head is derived from the batch coord via GQA mapping.
+      // Paged K: TMA covers (page_size, head_dim, (num_blocks, num_kv_heads))
+      // over the KV cache pool. One KV tile = kPagesPerTile pages; step()
+      // issues one copy per page into a page-slice of the stage. kv_head is
+      // derived from the q-head block coord via GQA mapping.
       int num_blocks = get<7>(problem_size);
       int num_kv_heads = get<0>(problem_size) / gqa_group;
       int kv_head = int(get<0>(get<2>(blk_coord))) / gqa_group;
       Tensor mK = params.get_tma_tensor(
-          make_shape(int(get<0>(tile_shape)), get<4>(problem_size),
+          make_shape(Int<kPagedPageSize>{}, get<4>(problem_size),
                      make_shape(num_blocks, num_kv_heads)));
       return mK(_, _, make_coord(_, kv_head));
     } else if constexpr (kKind == LoadKind::kPagedV) {
@@ -117,7 +124,7 @@ struct CollectiveLoadTma {
       int num_kv_heads = get<0>(problem_size) / gqa_group;
       int kv_head = int(get<0>(get<2>(blk_coord))) / gqa_group;
       Tensor mV = params.get_tma_tensor(
-          make_shape(get<4>(problem_size), int(get<0>(tile_shape)),
+          make_shape(get<4>(problem_size), Int<kPagedPageSize>{},
                      make_shape(num_blocks, num_kv_heads)));
       return mV(_, _, make_coord(_, kv_head));
     } else if constexpr (kKind == LoadKind::kBwdN) {
@@ -145,6 +152,7 @@ struct CollectiveLoadTma {
   ) {
     if constexpr (kKind == LoadKind::kPagedK || kKind == LoadKind::kPagedV) {
       batch_idx = int(get<1>(get<2>(block_coord)));
+      num_pages = (int(get<3>(problem_size)) + kPagedPageSize - 1) / kPagedPageSize;
     }
     Tensor g = init_g(problem_size, tile_shape, block_coord, loop_count);
     Tensor s = make_tensor(make_smem_ptr(storage.data()), SmemLayout{});
@@ -161,23 +169,52 @@ struct CollectiveLoadTma {
       PipelineState& smem_pipe_write,
       int lane_predicate, int& tile_count, uint16_t mcast_mask = 0
   ) {
-    if ((lane_predicate == 1) && (tile_count > 0)) {
-      if constexpr (kAcquireBarrier) pipeline.producer_acquire(smem_pipe_write);
-      using BarrierType = typename Pipeline::ProducerBarrierType;
-      BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
-
-      if constexpr (kKind == LoadKind::kBwdScalar) {
-        copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,*tile_iter), get<1>(state)(_,_,smem_pipe_write.index()));
-      } else if constexpr (kKind == LoadKind::kPagedK || kKind == LoadKind::kPagedV) {
-        int phys_block = page_table[batch_idx * max_blocks_per_seq + *tile_iter];
-        copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,_,phys_block), get<1>(state)(_,_,_,smem_pipe_write.index()));
-      } else {
-        copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,_,*tile_iter), get<1>(state)(_,_,_,smem_pipe_write.index()));
+    if constexpr (kKind == LoadKind::kPagedK || kKind == LoadKind::kPagedV) {
+      // Warp-cooperative paged issue: one copy per 16-token page, issued
+      // from DIFFERENT lanes in parallel (single-thread issue of
+      // pages_per_tile x hd/64 sub-boxes was the bottleneck: 32 serialized
+      // TMA instructions/tile at hd512). The leader owns the pipeline slot;
+      // every lane advances its local pipe/iter state to stay uniform. All
+      // copies arrive on the SAME stage barrier (tx bytes = one full
+      // stage). Tail pages are clamped to the last valid page (duplicate
+      // data, masked by the softmax).
+      if ((lane_predicate == 1) && (tile_count > 0)) {
+        if constexpr (kAcquireBarrier) pipeline.producer_acquire(smem_pipe_write);
+        using BarrierType = typename Pipeline::ProducerBarrierType;
+        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+        constexpr int kPages = decltype(size<3>(get<1>(state)))::value;
+        const int* seq_pt = page_table + batch_idx * max_blocks_per_seq;
+        const int base = int(*tile_iter) * kPages;
+        const int stage = smem_pipe_write.index();
+        CUTLASS_PRAGMA_UNROLL
+        for (int pg = 0; pg < kPages; ++pg) {
+          int logical = base + pg;
+          if (logical >= num_pages) logical = num_pages - 1;
+          int phys_block = seq_pt[logical];
+          copy(params.with(*tma_barrier, mcast_mask),
+               get<0>(state)(_,_,_,phys_block),
+               get<1>(state)(_,_,_,pg,stage));
+        }
+        if constexpr (kAdvancePipe) ++smem_pipe_write;
+        if constexpr (kAdvanceIterator) ++tile_iter;
       }
-      if constexpr (kAdvancePipe) ++smem_pipe_write;
-      if constexpr (kAdvanceIterator) ++tile_iter;
+      --tile_count;
+    } else {
+      if ((lane_predicate == 1) && (tile_count > 0)) {
+        if constexpr (kAcquireBarrier) pipeline.producer_acquire(smem_pipe_write);
+        using BarrierType = typename Pipeline::ProducerBarrierType;
+        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+
+        if constexpr (kKind == LoadKind::kBwdScalar) {
+          copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,*tile_iter), get<1>(state)(_,_,smem_pipe_write.index()));
+        } else {
+          copy(params.with(*tma_barrier, mcast_mask), get<0>(state)(_,_,_,*tile_iter), get<1>(state)(_,_,_,smem_pipe_write.index()));
+        }
+        if constexpr (kAdvancePipe) ++smem_pipe_write;
+        if constexpr (kAdvanceIterator) ++tile_iter;
+      }
+      --tile_count;
     }
-    --tile_count;
   }
 };
 

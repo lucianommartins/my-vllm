@@ -52,6 +52,19 @@ __global__ void gather_kv_expanded_kernel(
                h_kv * stride_head + d];
 }
 
+// Paged-pool descriptor set: non-null enables gather-free KV reads straight
+// from the block_size=16 cache pool (page_table = this launch's block table,
+// row-major [seq][max_blocks] for batched, or a single row for per-seq).
+struct PagedPool {
+  const cutlass::bfloat16_t* pool_k;
+  const cutlass::bfloat16_t* pool_v;  // null for k_eq_v
+  int64_t stride_block, stride_slot, stride_head;
+  int num_blocks;       // pool capacity (TMA extent)
+  int num_kv_heads;
+  const int* page_table;
+  int max_blocks_per_seq;
+};
+
 template <int HeadDim, bool KEqV = false>
 struct FmhaCachedLauncher {
   using FmhaTypes = vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV>;
@@ -65,6 +78,7 @@ struct FmhaCachedLauncher {
   int cached_num_q_heads = 0;
   int cached_num_seqs = 0;
   int cached_sliding_window = -1;
+  bool cached_paged = false;
 
   bool launch(
       cutlass::bfloat16_t* q_ptr,
@@ -85,7 +99,8 @@ struct FmhaCachedLauncher {
       int max_mm_ranges,
       int device_id,
       int sm_count,
-      cudaStream_t stream) {
+      cudaStream_t stream,
+      const PagedPool* paged = nullptr) {
     // Key must cover everything baked into Params: seq_q, seq_k (drives the
     // KV extents AND q_offset = seq_k - seq_q for extends/chunked prefill),
     // heads, and the sliding window. Keying on seq_q alone served stale
@@ -95,7 +110,8 @@ struct FmhaCachedLauncher {
          q_offset != cached_q_offset ||
          num_q_heads != cached_num_q_heads ||
          num_seqs != cached_num_seqs ||
-         sliding_window != cached_sliding_window);
+         sliding_window != cached_sliding_window ||
+         (paged != nullptr) != cached_paged);
 
     if (shape_changed) {
       // Batched (uniform) launch: batch mode strides. Q/O rows are packed
@@ -129,6 +145,15 @@ struct FmhaCachedLauncher {
            o_ptr, stride_qo, lse_ptr, mm_ranges_ptr, max_mm_ranges},
           {o_ptr, stride_qo, lse_ptr, stride_lse},
           hw_info};
+      if (paged != nullptr) {
+        args.mainloop.kv_pool_k = paged->pool_k;
+        args.mainloop.kv_pool_v = KEqV ? nullptr : paged->pool_v;
+        args.mainloop.pool_stride_block = paged->stride_block;
+        args.mainloop.pool_stride_slot = paged->stride_slot;
+        args.mainloop.pool_stride_head = paged->stride_head;
+        args.mainloop.pool_num_blocks = paged->num_blocks;
+        args.mainloop.pool_num_kv_heads = paged->num_kv_heads;
+      }
 
       if (FmhaOp::can_implement(args) != cutlass::Status::kSuccess)
         return false;
@@ -142,18 +167,40 @@ struct FmhaCachedLauncher {
       cached_num_q_heads = num_q_heads;
       cached_num_seqs = num_seqs;
       cached_sliding_window = sliding_window;
+      cached_paged = (paged != nullptr);
     } else {
       // Shape unchanged — update only base pointers in TMA descriptors
       auto& p = const_cast<typename Kernel::Params&>(fmha_op.params());
       cuTensorMapReplaceAddress(
           const_cast<CUtensorMap*>(p.mainloop.tma_load_q.get_tma_descriptor()),
           q_ptr);
-      cuTensorMapReplaceAddress(
-          const_cast<CUtensorMap*>(p.mainloop.tma_load_k.get_tma_descriptor()),
-          k_ptr);
-      cuTensorMapReplaceAddress(
-          const_cast<CUtensorMap*>(p.mainloop.tma_load_v.get_tma_descriptor()),
-          v_ptr);
+      if (paged == nullptr) {
+        cuTensorMapReplaceAddress(
+            const_cast<CUtensorMap*>(p.mainloop.tma_load_k.get_tma_descriptor()),
+            k_ptr);
+        cuTensorMapReplaceAddress(
+            const_cast<CUtensorMap*>(p.mainloop.tma_load_v.get_tma_descriptor()),
+            v_ptr);
+      } else {
+        // Pool GEOMETRY is stable, but the pool BASE is PER LAYER (vLLM
+        // allocates a distinct KV tensor per layer) and this launcher is
+        // shared by every layer of the (HeadDim,KEqV) type: same-shape
+        // calls from different layers MUST repatch the descriptor base or
+        // they silently read the first layer's pool.
+        cuTensorMapReplaceAddress(
+            const_cast<CUtensorMap*>(
+                p.mainloop.tma_load_k_paged.get_tma_descriptor()),
+            const_cast<cutlass::bfloat16_t*>(paged->pool_k));
+        if (!KEqV && paged->pool_v != nullptr) {
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_v_paged.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_v));
+        }
+      }
+      // Per-seq multimodal ranges: pointer varies per call (pre-existing
+      // staleness for equal-shaped mm sequences; fixed alongside).
+      p.mainloop.mm_prefix_ranges = mm_ranges_ptr;
       // Epilogue O TMA store descriptor
       cuTensorMapReplaceAddress(
           const_cast<CUtensorMap*>(
@@ -167,9 +214,17 @@ struct FmhaCachedLauncher {
     }
 
     {
-      // GQA-dense KV buffers: loaders divide the q-head coord by this.
       auto& p = const_cast<typename Kernel::Params&>(fmha_op.params());
+      // GQA-dense KV buffers: loaders divide the q-head coord by this.
       p.mainloop.contig_gqa_group = gqa_group;
+      // Paged runtime state (page_table varies per call; descriptors don't).
+      if (paged != nullptr) {
+        p.mainloop.page_table = paged->page_table;
+        p.mainloop.gqa_group = gqa_group;
+        p.mainloop.max_blocks_per_seq = paged->max_blocks_per_seq;
+      } else {
+        p.mainloop.page_table = nullptr;
+      }
     }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
@@ -197,12 +252,13 @@ static bool launch_fmha_batched(
     int max_mm_ranges,
     int device_id,
     int sm_count,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const PagedPool* paged = nullptr) {
   static FmhaCachedLauncher<HeadDim, KEqV> launcher;
   return launcher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, num_q_heads,
                          gqa_group, num_seqs, seq_q, seq_k, q_offset,
                          q_stride, scale, sliding_window, mm_ranges_ptr,
-                         max_mm_ranges, device_id, sm_count, stream);
+                         max_mm_ranges, device_id, sm_count, stream, paged);
 }
 
 template <typename T, typename CACHE_T>
@@ -237,7 +293,8 @@ bool gemma_prefill_sm90_launcher(
   // attention itself; the wmma kernel reads paged KV directly (no gather)
   // and is decode-like at small q. Real prefills (chunked q>=64 or full)
   // stay here.
-  if (getenv("GEMMA_PREFILL_DEBUG") != nullptr) {
+  const bool prefill_debug = getenv("GEMMA_PREFILL_DEBUG") != nullptr;
+  if (prefill_debug) {
     fprintf(stderr, "[sm90-prefill] num_seqs=%d max_q_len=%d num_tokens=%d\n",
             num_seqs, max_q_len, static_cast<int>(query.size(0)));
   }
@@ -248,6 +305,19 @@ bool gemma_prefill_sm90_launcher(
 
   const int num_tokens = static_cast<int>(query.size(0));
   const bool equal_lens = (num_tokens == num_seqs * max_q_len);
+
+  // Paged KV reads straight from the block_size=16 cache pool: no gather, no
+  // dense scratch, TMA descriptors stable across steps. GEMMA_PREFILL_PAGED=0
+  // reverts to the gather path.
+  static const bool paged_enabled = []() {
+    const char* e = getenv("GEMMA_PREFILL_PAGED");
+    return e == nullptr || e[0] != '0';
+  }();
+  const bool use_paged = paged_enabled && page_size == 16 &&
+                         sizeof(CACHE_T) == sizeof(T);
+  if (prefill_debug)
+    fprintf(stderr, "[sm90-prefill] use_paged=%d page_size=%d\n",
+            int(use_paged), page_size);
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       query.get_device_index());
@@ -291,12 +361,12 @@ bool gemma_prefill_sm90_launcher(
   static T* o_scratch = nullptr;
   static size_t s_kv_cap = 0, s_v_cap = 0, s_lse_cap = 0, s_qo_cap = 0;
 
-  if (kv_expanded_bytes > s_kv_cap) {
+  if (!use_paged && kv_expanded_bytes > s_kv_cap) {
     if (k_expanded) cudaFree(k_expanded);
     cudaMalloc(&k_expanded, kv_expanded_bytes);
     s_kv_cap = kv_expanded_bytes;
   }
-  if (!k_eq_v && kv_expanded_bytes > s_v_cap) {
+  if (!use_paged && !k_eq_v && kv_expanded_bytes > s_v_cap) {
     if (v_expanded) cudaFree(v_expanded);
     cudaMalloc(&v_expanded, kv_expanded_bytes);
     s_v_cap = kv_expanded_bytes;
@@ -350,19 +420,40 @@ bool gemma_prefill_sm90_launcher(
   int max_kv_len = 0;
   for (int s2 = 0; s2 < num_seqs; s2++)
     max_kv_len = std::max(max_kv_len, h_seq_lens[s2]);
+  // Long-KV chunks stay on the gather path: scattered per-page boxes are
+  // latency-bound under the 2-stage KV pipeline (hd512 16k chunk 692us paged
+  // vs 151us gathered; hd256 window chunks ~46us vs ~25us). Short-KV steps
+  // (APC extends / short-prompt chunks) win big on paged: no gather kernels,
+  // no scratch, pool-stable descriptors. GEMMA_PREFILL_PAGED_MAXKV tunes the
+  // crossover; the deep fix (multi-lane issue / consecutive-page wide boxes)
+  // is future work.
+  static const int paged_maxkv = []() {
+    const char* e = getenv("GEMMA_PREFILL_PAGED_MAXKV");
+    return e != nullptr ? atoi(e) : 1024;
+  }();
+  const bool paged_call = use_paged && max_kv_len <= paged_maxkv;
   // Re-grow the expanded-KV scratch for the KV extent (sized for q above).
   const size_t kv_needed =
       (size_t)max_kv_len * num_kv_heads * head_size * sizeof(CACHE_T);
-  if (kv_needed > s_kv_cap) {
+  if (!paged_call && kv_needed > s_kv_cap) {
     if (k_expanded) cudaFree(k_expanded);
     cudaMalloc(&k_expanded, kv_needed);
     s_kv_cap = kv_needed;
   }
-  if (!k_eq_v && kv_needed > s_v_cap) {
+  if (!paged_call && !k_eq_v && kv_needed > s_v_cap) {
     if (v_expanded) cudaFree(v_expanded);
     cudaMalloc(&v_expanded, kv_needed);
     s_v_cap = kv_needed;
   }
+
+  // Paged pool geometry (shared by both launch paths below).
+  const int pool_num_blocks = static_cast<int>(key_cache.size(0));
+  PagedPool pool_proto{
+      reinterpret_cast<const Element*>(key_cache_ptr),
+      k_eq_v ? nullptr : reinterpret_cast<const Element*>(value_cache_ptr),
+      kv_stride_block, kv_stride_slot, kv_stride_head,
+      pool_num_blocks, num_kv_heads,
+      /*page_table=*/nullptr, max_num_blocks_per_seq};
 
   bool ok = true;
   const int padded_qo_stride = num_q_heads * head_size;
@@ -377,6 +468,44 @@ bool gemma_prefill_sm90_launcher(
     bool kv_uniform = true;
     for (int s2 = 1; s2 < num_seqs; s2++)
       kv_uniform &= (h_seq_lens[s2] == h_seq_lens[0]);
+    if (kv_uniform && paged_call) {
+      // Batched paged: ONE launch, block_tables is already the row-major 2D
+      // page table ([seq][max_blocks]); loaders index it via the batch coord.
+      // Absolute coords (no gather slice): trip_start skips out-of-window
+      // tiles, so sliding layers never touch pre-window pages.
+      const int kv_len_full = h_seq_lens[0];
+      const int q_off_abs = kv_len_full - seq_len;
+      const size_t batch_lse_bytes =
+          (size_t)num_seqs * seq_len * num_q_heads * sizeof(float);
+      if (batch_lse_bytes > s_lse_cap) {
+        if (lse_scratch) cudaFree(lse_scratch);
+        cudaMalloc(&lse_scratch, batch_lse_bytes);
+        s_lse_cap = batch_lse_bytes;
+      }
+      PagedPool pool = pool_proto;
+      pool.page_table = block_tables_ptr;
+      Element* kc = reinterpret_cast<Element*>(key_cache_ptr);
+      Element* vc = k_eq_v ? kc : reinterpret_cast<Element*>(value_cache_ptr);
+      if (head_size == 256) {
+        return launch_fmha_batched<256>(
+            query_ptr, kc, vc, out_ptr, lse_scratch, num_q_heads, gqa_group,
+            num_seqs, seq_len, kv_len_full, q_off_abs, q_stride, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool);
+      } else if (k_eq_v) {
+        return launch_fmha_batched<512, true>(
+            query_ptr, kc, vc, out_ptr, lse_scratch, num_q_heads, gqa_group,
+            num_seqs, seq_len, kv_len_full, q_off_abs, q_stride, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool);
+      } else {
+        return launch_fmha_batched<512>(
+            query_ptr, kc, vc, out_ptr, lse_scratch, num_q_heads, gqa_group,
+            num_seqs, seq_len, kv_len_full, q_off_abs, q_stride, scale,
+            sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
+            &pool);
+      }
+    }
     if (kv_uniform) {
       const int kv_len_full = h_seq_lens[0];
       int kv_lo = 0;
@@ -460,42 +589,53 @@ bool gemma_prefill_sm90_launcher(
     // reads). kv_lo is the absolute token of gathered index 0; the kernel's
     // masks are shift-invariant (q_offset shifted consistently).
     int kv_lo = 0;
-    if (sliding_window > 0) {
+    if (!paged_call && sliding_window > 0) {
       kv_lo = kv_len_full - seq_len_s - sliding_window + 1;
       if (kv_lo < 0) kv_lo = 0;
     }
-    const int kv_len_s = kv_len_full - kv_lo;
-    const int q_off_s = kv_len_s - seq_len_s;  // context length (shifted)
+    const int kv_len_s = kv_len_full - kv_lo;  // paged: full absolute extent
+    const int q_off_s = kv_len_s - seq_len_s;  // context length
     const int padded_sl_s = (seq_len_s + kAlignment - 1) / kAlignment * kAlignment;
     const bool needs_pad_s = (padded_sl_s != seq_len_s);
-
-    // Gather the FULL kv range [0, kv_len) DENSE PER KV HEAD ([kv_len, hd]
-    // x num_kv_heads — no GQA expansion; the kernel-side loaders map q-head
-    // -> kv-head via contig_gqa_group). Extends need the whole context.
-    const int total_elems = num_kv_heads * kv_len_s * head_size;
-    constexpr int kThreads = 256;
-    const int gather_blocks = (total_elems + kThreads - 1) / kThreads;
     const int* seq_block_table =
         block_tables_ptr + s * max_num_blocks_per_seq;
 
-    gather_kv_expanded_kernel<CACHE_T><<<gather_blocks, kThreads, 0, stream>>>(
-        k_expanded, key_cache_ptr, seq_block_table, kv_len_s, kv_len_s,
-        num_kv_heads, num_kv_heads, head_size, /*gqa_group=*/1, page_size,
-        kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
+    Element* k;
+    Element* v;
+    PagedPool pool = pool_proto;
+    if (paged_call) {
+      // No gather: the kernel reads pages straight from the cache pool.
+      // Sliding layers skip pre-window tiles via trip_start, so the paged
+      // path never touches pages the gather-slice used to exclude.
+      pool.page_table = seq_block_table;
+      k = reinterpret_cast<Element*>(key_cache_ptr);
+      v = k_eq_v ? k : reinterpret_cast<Element*>(value_cache_ptr);
+    } else {
+      // Gather the kv range DENSE PER KV HEAD ([kv_len, hd] x num_kv_heads —
+      // no GQA expansion; loaders map q-head -> kv-head via contig_gqa_group).
+      const int total_elems = num_kv_heads * kv_len_s * head_size;
+      constexpr int kThreads = 256;
+      const int gather_blocks = (total_elems + kThreads - 1) / kThreads;
 
-    if (!k_eq_v) {
-      gather_kv_expanded_kernel<CACHE_T>
-          <<<gather_blocks, kThreads, 0, stream>>>(
-              v_expanded, value_cache_ptr, seq_block_table, kv_len_s,
-              kv_len_s, num_kv_heads, num_kv_heads, head_size,
-              /*gqa_group=*/1, page_size,
-              kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
+      gather_kv_expanded_kernel<CACHE_T><<<gather_blocks, kThreads, 0, stream>>>(
+          k_expanded, key_cache_ptr, seq_block_table, kv_len_s, kv_len_s,
+          num_kv_heads, num_kv_heads, head_size, /*gqa_group=*/1, page_size,
+          kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
+
+      if (!k_eq_v) {
+        gather_kv_expanded_kernel<CACHE_T>
+            <<<gather_blocks, kThreads, 0, stream>>>(
+                v_expanded, value_cache_ptr, seq_block_table, kv_len_s,
+                kv_len_s, num_kv_heads, num_kv_heads, head_size,
+                /*gqa_group=*/1, page_size,
+                kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
+      }
+      k = reinterpret_cast<Element*>(k_expanded);
+      v = k_eq_v ? k : reinterpret_cast<Element*>(v_expanded);
     }
 
     Element* q_src = query_ptr + token_offset * q_stride;
     Element* o_dst = out_ptr + token_offset * q_stride;
-    Element* k = reinterpret_cast<Element*>(k_expanded);
-    Element* v = k_eq_v ? k : reinterpret_cast<Element*>(v_expanded);
 
     Element* q_fmha = q_src;
     Element* o_fmha = o_dst;
@@ -521,25 +661,26 @@ bool gemma_prefill_sm90_launcher(
                       s * seq_max_mm * 2;
     }
 
+    const PagedPool* pp = paged_call ? &pool : nullptr;
     if (head_size == 256) {
       ok = launch_fmha_batched<256>(q_fmha, k, v, o_fmha, lse_scratch,
                                     num_q_heads, gqa_group, 1, padded_sl_s,
                                     kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
-                                    s_device_id, s_sm_count, stream);
+                                    s_device_id, s_sm_count, stream, pp);
     } else if (k_eq_v) {
       // Gemma global layers: V == K -> single-slot pipeline, no V TMA loads.
       ok = launch_fmha_batched<512, true>(q_fmha, k, v, o_fmha, lse_scratch,
                                     num_q_heads, gqa_group, 1, padded_sl_s,
                                     kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
-                                    s_device_id, s_sm_count, stream);
+                                    s_device_id, s_sm_count, stream, pp);
     } else {
       ok = launch_fmha_batched<512>(q_fmha, k, v, o_fmha, lse_scratch,
                                     num_q_heads, gqa_group, 1, padded_sl_s,
                                     kv_len_s, q_off_s, fmha_q_stride, scale,
                                     sliding_window, seq_mm_ranges, seq_max_mm,
-                                    s_device_id, s_sm_count, stream);
+                                    s_device_id, s_sm_count, stream, pp);
     }
 
     if (needs_pad_s && ok) {

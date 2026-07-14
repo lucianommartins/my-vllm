@@ -146,6 +146,12 @@ struct PagedDecodeFmhaLauncher {
       int max_num_seqs, int max_blocks_per_seq,
       int device_id, int sm_count, cudaStream_t stream) {
 
+    // SUPERSEDED: kPagedK/kPagedV now issue block16 page-sliced copies
+    // (4/tile); this spike's whole-tile (block==tile_n=64) descriptor patch
+    // no longer matches the device loop. Falsified experiment, disabled.
+    const bool superseded = true;
+    if (superseded) return false;
+
     int q_batch_stride = seq_q * q_stride;
     cached_q_batch_stride = q_batch_stride;
     auto stride_qo = cute::make_tuple(

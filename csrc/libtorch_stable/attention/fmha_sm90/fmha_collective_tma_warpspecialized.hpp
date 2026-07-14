@@ -169,6 +169,36 @@ struct FmhaMainloopTmaWarpSpecialized {
   using SmemLayoutK = typename CollectiveMmaQK::SmemLayoutB;
   using SmemLayoutV = typename CollectiveMmaPV::SmemLayoutB;
 
+  // ---- Paged KV (block_size=16 cache pool, no gather) ----
+  // Page-sliced views of the K/V stages: K (64,hd,stg) -> (16,hd,pages,stg)
+  // on the token mode; V (hd,64,stg) -> (hd,16,pages,stg). Each page slice
+  // keeps the parent stage's strides (TMA decomposes the copy into
+  // swizzle-coherent boxes automatically). The consumer-side GMMA layouts
+  // are untouched — only the producer's TMA partitioning changes.
+  static constexpr int kPagedPageSize = cutlass::fmha::collective::kPagedPageSize;
+  // The stage layouts are Swizzle-composed; divide/regroup the INNER plain
+  // layout, then re-compose with the swizzle.
+  using SmemInnerK = decltype(SmemLayoutK{}.layout_b());
+  using SmemInnerKDiv = decltype(logical_divide(
+      SmemInnerK{}, make_tile(Layout<Int<kPagedPageSize>>{})));
+  using SmemInnerKQuart = decltype(make_layout(
+      cute::layout<0, 0>(SmemInnerKDiv{}), cute::layout<1>(SmemInnerKDiv{}),
+      cute::layout<0, 1>(SmemInnerKDiv{}), cute::layout<2>(SmemInnerKDiv{})));
+  using SmemLayoutKPaged =
+      decltype(composition(SmemLayoutK{}.layout_a(), SmemInnerKQuart{}));
+  using SmemLayoutKPage =
+      decltype(SmemLayoutKPaged{}(_, _, _0{}, _0{}));  // one (16,hd) page slice
+  using SmemInnerV = decltype(SmemLayoutV{}.layout_b());
+  using SmemInnerVDiv = decltype(logical_divide(
+      SmemInnerV{}, make_tile(_, Layout<Int<kPagedPageSize>>{})));
+  using SmemInnerVQuart = decltype(make_layout(
+      cute::layout<0>(SmemInnerVDiv{}), cute::layout<1, 0>(SmemInnerVDiv{}),
+      cute::layout<1, 1>(SmemInnerVDiv{}), cute::layout<2>(SmemInnerVDiv{})));
+  using SmemLayoutVPaged =
+      decltype(composition(SmemLayoutV{}.layout_a(), SmemInnerVQuart{}));
+  using SmemLayoutVPage =
+      decltype(SmemLayoutVPaged{}(_, _, _0{}, _0{}));  // one (hd,16) page slice
+
   using MainloopPipeline = cutlass::PipelineTmaAsync<Stages::value>;
   using MainloopPipelineQ = cutlass::PipelineTmaAsync<StagesQ::value>;
 
@@ -222,11 +252,38 @@ struct FmhaMainloopTmaWarpSpecialized {
     ElementAccumulatorPV* ptr_LSE;
     const int* mm_prefix_ranges;
     int max_mm_ranges;
+    // Paged KV pool (block_size=16). Non-null kv_pool_k enables building the
+    // paged TMA descriptors; the kernel still selects paged vs contiguous at
+    // runtime via Params::page_table.
+    const Element* kv_pool_k = nullptr;
+    const Element* kv_pool_v = nullptr;
+    int64_t pool_stride_block = 0;
+    int64_t pool_stride_slot = 0;
+    int64_t pool_stride_head = 0;
+    int pool_num_blocks = 0;
+    int pool_num_kv_heads = 0;
   };
 
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
   using TMA_K = typename CollectiveMmaQK::Params::TMA_B;
   using TMA_V = typename CollectiveMmaPV::Params::TMA_B;
+
+  // Paged TMA copy types: one 16-token page per copy, page-sliced smem.
+  // K pool gmem view: (16, hd, (blocks, kv_heads)); V transposed.
+  using GmemPagedKTensor = decltype(make_tensor(
+      make_gmem_ptr(static_cast<Element const*>(nullptr)),
+      make_layout(
+          make_shape(Int<kPagedPageSize>{}, int(0), make_shape(int(0), int(0))),
+          make_stride(int64_t(0), _1{}, make_stride(int64_t(0), int64_t(0))))));
+  using GmemPagedVTensor = decltype(make_tensor(
+      make_gmem_ptr(static_cast<Element const*>(nullptr)),
+      make_layout(
+          make_shape(int(0), Int<kPagedPageSize>{}, make_shape(int(0), int(0))),
+          make_stride(_1{}, int64_t(0), make_stride(int64_t(0), int64_t(0))))));
+  using TMA_K16 = decltype(make_tma_copy(
+      SM90_TMA_LOAD{}, GmemPagedKTensor{}, SmemLayoutKPage{}));
+  using TMA_V16 = decltype(make_tma_copy(
+      SM90_TMA_LOAD{}, GmemPagedVTensor{}, SmemLayoutVPage{}));
 
   struct Params {
     TMA_Q tma_load_q;
@@ -245,11 +302,11 @@ struct FmhaMainloopTmaWarpSpecialized {
     const Element* ptr_V;
     LayoutV dV;
 
-    // Paged KV: TMA descriptors for paged K/V (same type as contiguous — raw
-    // CUtensorMap bytes overwritten in launcher for paged layout).
-    // page_table: device ptr to this sequence's block table (logical→physical).
-    TMA_K tma_load_k_paged;
-    TMA_V tma_load_v_paged;
+    // Paged KV (block_size=16 pool): per-page TMA descriptors, built in
+    // to_underlying_arguments when Arguments::kv_pool_k is set.
+    // page_table: device ptr to block table(s) (logical→physical).
+    TMA_K16 tma_load_k_paged;
+    TMA_V16 tma_load_v_paged;
     const int* page_table;
     int gqa_group;
     int max_blocks_per_seq;
@@ -287,16 +344,16 @@ struct FmhaMainloopTmaWarpSpecialized {
     cutlass::fmha::collective::LoadKind::kPagedK,
     MainloopPipeline,
     Element,
-    SmemLayoutK,
-    TMA_K
+    SmemLayoutKPaged,
+    TMA_K16
   >;
 
   using LoadPagedV = cutlass::fmha::collective::CollectiveLoadTma<
     cutlass::fmha::collective::LoadKind::kPagedV,
     MainloopPipeline,
     Element,
-    SmemLayoutV,
-    TMA_V
+    SmemLayoutVPaged,
+    TMA_V16
   >;
 
   // For non-chunked/non-split: QK and PV MMA sizes must match.
@@ -340,6 +397,33 @@ struct FmhaMainloopTmaWarpSpecialized {
       tma_v_hi = params_pv_hi.tma_load_b;
     }
 
+    // Paged descriptors over the KV cache pool (block_size=16). Descriptors
+    // depend only on pool geometry — stable across steps, cache-friendly.
+    TMA_K16 tma_k_paged{};
+    TMA_V16 tma_v_paged{};
+    if (args.kv_pool_k != nullptr) {
+      auto gK = make_tensor(
+          make_gmem_ptr(args.kv_pool_k),
+          make_layout(
+              make_shape(Int<kPagedPageSize>{}, int(get<4>(problem_size)),
+                         make_shape(args.pool_num_blocks, args.pool_num_kv_heads)),
+              make_stride(args.pool_stride_slot, _1{},
+                          make_stride(args.pool_stride_block,
+                                      args.pool_stride_head))));
+      tma_k_paged = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutKPage{});
+      if (args.kv_pool_v != nullptr) {
+        auto gV = make_tensor(
+            make_gmem_ptr(args.kv_pool_v),
+            make_layout(
+                make_shape(int(get<4>(problem_size)), Int<kPagedPageSize>{},
+                           make_shape(args.pool_num_blocks, args.pool_num_kv_heads)),
+                make_stride(_1{}, args.pool_stride_slot,
+                            make_stride(args.pool_stride_block,
+                                        args.pool_stride_head))));
+        tma_v_paged = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutVPage{});
+      }
+    }
+
     return Params{
         params_qk.tma_load_a,
         params_qk.tma_load_b,
@@ -355,9 +439,9 @@ struct FmhaMainloopTmaWarpSpecialized {
         args.max_mm_ranges,
         args.ptr_V,
         args.dV,
-        params_qk.tma_load_b,   // tma_load_k_paged (placeholder, overwritten for paged)
-        params_pv.tma_load_b,   // tma_load_v_paged (placeholder, overwritten for paged)
-        nullptr,                 // page_table (null = contiguous mode)
+        tma_k_paged,
+        tma_v_paged,
+        nullptr,                 // page_table (null = contiguous mode; set by launcher)
         1,                       // gqa_group (set by paged launcher)
         0,                       // max_blocks_per_seq
         nullptr,                 // d_seq_lens (null = use problem_size scalar)
