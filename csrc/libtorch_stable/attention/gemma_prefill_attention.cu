@@ -146,6 +146,21 @@ void gemma_prefill_launcher(
   }
 #endif  // ENABLE_GEMMA_ATTN_SM90
 
+  // Correct-mode hole fix: the wmma fallback (cascade prefix passes with
+  // LSE, tiny-q extends, GEMMA_SM90_PREFILL=0) has no V-reconstruction.
+  // When correct mode is active, read the TRUE V plane here instead of
+  // aliasing V:=K — correct function at 2x bytes on these infrequent
+  // shapes. (Long-MTP acceptance collapsed to the aliased 0.803 because
+  // the shared-prefix cascade pass computed the aliased function over
+  // the whole context.)
+  static const bool correct_mode = []() {
+    const char* r = getenv("GEMMA_V_RECON");
+    const char* f = getenv("GEMMA_V_FILL");
+    return (r != nullptr && r[0] == '1') ||
+           (f != nullptr && f[0] != '0' && f[0] != '\0');
+  }();
+  if (correct_mode) k_eq_v = false;
+
 #define PF_DISPATCH(HEAD, NW, MINCTA, MMPF)                          \
   do {                                                               \
     if (k_eq_v && use_sw) {                                          \
