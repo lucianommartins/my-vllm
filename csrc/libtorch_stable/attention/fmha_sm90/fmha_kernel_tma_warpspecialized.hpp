@@ -91,6 +91,10 @@ struct FmhaKernelTmaWarpSpecialized {
     using PipelineStorageReducer = typename MainloopPipelineReducer::SharedStorage;
 
     alignas(16) PipelineStorageInner pipeline_storage_inner;
+    // k_eq_v TMA V-overwrite (GEMMA_V_FILL=2): producer refills the dead K
+    // slot with the true V tile after consumers' QK. consumer_release =
+    // "QK drained, slot fillable"; TMA tx barrier = "V ready".
+    alignas(16) PipelineStorageInner pipeline_storage_vfill;
     alignas(16) PipelineStorageOuter pipeline_storage_outer;
     alignas(16) PipelineStorageReducer pipeline_storage_reducer;
 
@@ -279,6 +283,7 @@ struct FmhaKernelTmaWarpSpecialized {
 
     MainloopPipelineOuter pipeline_outer(storage.pipeline_storage_outer, pipeline_params_outer, Shape<_1, _1, _1>{});
     MainloopPipelineInner pipeline_inner(storage.pipeline_storage_inner, pipeline_params_inner, ClusterShape{});
+    MainloopPipelineInner pipeline_vfill(storage.pipeline_storage_vfill, pipeline_params_inner, ClusterShape{});
     MainloopPipelineReducer pipeline_reducer(storage.pipeline_storage_reducer, pipeline_params_reducer);
 
     // State variables used for iterating the circular buffer
@@ -286,6 +291,10 @@ struct FmhaKernelTmaWarpSpecialized {
     // smem_pipe_write is used by the producer of SMEM data - i.e TMA
     PipelineStateInner smem_pipe_read_inner;
     PipelineStateInner smem_pipe_write_inner = cutlass::make_producer_start_state<MainloopPipelineInner>();
+    // vfill: producer starts at phase 0 (default) -> producer_acquire
+    // BLOCKS until the consumers' first release (QK-done inversion).
+    PipelineStateInner smem_pipe_read_vfill;
+    PipelineStateInner smem_pipe_write_vfill;
 
     PipelineStateOuter smem_pipe_read_outer;
     PipelineStateOuter smem_pipe_write_outer = cutlass::make_producer_start_state<MainloopPipelineOuter>();
@@ -342,7 +351,8 @@ struct FmhaKernelTmaWarpSpecialized {
               pipeline_inner, smem_pipe_write_inner,
               pipeline_outer, smem_pipe_write_outer,
               storage.tensors.mainloop,
-              storage.load_warp_barrier, do_barrier
+              storage.load_warp_barrier, do_barrier,
+              pipeline_vfill, smem_pipe_write_vfill
             );
           } else {
             collective_mainloop.template load_kv_maybe_q<!kLoadsQSeparately>(
@@ -351,7 +361,8 @@ struct FmhaKernelTmaWarpSpecialized {
               pipeline_inner, smem_pipe_write_inner,
               pipeline_outer, smem_pipe_write_outer,
               storage.tensors.mainloop,
-              storage.load_warp_barrier, do_barrier
+              storage.load_warp_barrier, do_barrier,
+              pipeline_vfill, smem_pipe_write_vfill
             );
           }
           do_barrier = false;
@@ -443,7 +454,8 @@ struct FmhaKernelTmaWarpSpecialized {
             pipeline_outer, smem_pipe_read_outer,
             pipeline_reducer, smem_pipe_write_reducer,
             storage.tensors.mainloop,
-            math_wg_order_barrier);
+            math_wg_order_barrier,
+            pipeline_vfill, smem_pipe_read_vfill);
         } else {
           auto result = [&]() {
             if constexpr (kHeadChunkedPV) {

@@ -210,6 +210,7 @@ static float g_recon_inv_w = 1.f;
 // V plane over the dead K tile (bytes free in compute-bound prefill).
 // Supersedes the recon transform for prefill when both are enabled.
 static bool g_v_fill = false;
+static bool g_v_fill_tma = false;   // GEMMA_V_FILL=2: producer-TMA overwrite
 static const cutlass::bfloat16_t* g_v_fill_pool = nullptr;
 static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0;
 
@@ -301,7 +302,8 @@ struct FmhaCachedLauncher {
           hw_info};
       if (paged != nullptr) {
         args.mainloop.kv_pool_k = paged->pool_k;
-        args.mainloop.kv_pool_v = KEqV ? nullptr : paged->pool_v;
+        args.mainloop.kv_pool_v =
+            (KEqV && !g_v_fill_tma) ? nullptr : paged->pool_v;
         args.mainloop.pool_stride_block = paged->stride_block;
         args.mainloop.pool_stride_slot = paged->stride_slot;
         args.mainloop.pool_stride_head = paged->stride_head;
@@ -349,7 +351,7 @@ struct FmhaCachedLauncher {
                 : p.mainloop.tma_load_k_paged.get_tma_descriptor());
         cuTensorMapReplaceAddress(
             kd, const_cast<cutlass::bfloat16_t*>(paged->pool_k));
-        if (!KEqV && paged->pool_v != nullptr) {
+        if ((!KEqV || g_v_fill_tma) && paged->pool_v != nullptr) {
           CUtensorMap* vd = const_cast<CUtensorMap*>(
               paged->page_size == 64
                   ? p.mainloop.tma_load_v_paged64.get_tma_descriptor()
@@ -396,6 +398,7 @@ struct FmhaCachedLauncher {
       // k_eq_v exact V-fill: refresh the raw V source every call (ptr_V is
       // only baked at initialize; layer pools change per call).
       p.mainloop.v_fill = g_v_fill;
+      p.mainloop.v_fill_tma = g_v_fill_tma;
       p.mainloop.ptr_V = v_ptr;
       p.mainloop.v_fill_pool =
           (paged != nullptr && g_v_fill) ? g_v_fill_pool : nullptr;
@@ -461,11 +464,12 @@ bool gemma_prefill_sm90_launcher(
                         ? recon_invfreq.mutable_data_ptr<float>()
                         : nullptr;
   g_recon_inv_w = static_cast<float>(recon_inv_w);
-  static const bool v_fill_env = []() {
+  static const int v_fill_env = []() {
     const char* e = getenv("GEMMA_V_FILL");
-    return e != nullptr && e[0] == '1';
+    return e != nullptr ? atoi(e) : 0;
   }();
-  g_v_fill = v_fill_env && k_eq_v;
+  g_v_fill = (v_fill_env == 1) && k_eq_v;
+  g_v_fill_tma = (v_fill_env == 2) && k_eq_v;
   g_v_fill_pool = g_v_fill ? reinterpret_cast<const cutlass::bfloat16_t*>(
                                  value_cache.data_ptr())
                            : nullptr;
@@ -592,7 +596,7 @@ bool gemma_prefill_sm90_launcher(
     cudaMalloc(&k_expanded, kv_expanded_bytes);
     s_kv_cap = kv_expanded_bytes;
   }
-  if (!use_paged && (!k_eq_v || g_v_fill) && kv_expanded_bytes > s_v_cap) {
+  if (!use_paged && (!k_eq_v || g_v_fill || g_v_fill_tma) && kv_expanded_bytes > s_v_cap) {
     if (v_expanded) cudaFree(v_expanded);
     cudaMalloc(&v_expanded, kv_expanded_bytes);
     s_v_cap = kv_expanded_bytes;
@@ -676,7 +680,7 @@ bool gemma_prefill_sm90_launcher(
     cudaMalloc(&k_expanded, kv_needed);
     s_kv_cap = kv_needed;
   }
-  if (!paged_call && (!k_eq_v || g_v_fill) && kv_needed > s_v_cap) {
+  if (!paged_call && (!k_eq_v || g_v_fill || g_v_fill_tma) && kv_needed > s_v_cap) {
     if (v_expanded) cudaFree(v_expanded);
     cudaMalloc(&v_expanded, kv_needed);
     s_v_cap = kv_needed;
@@ -686,7 +690,9 @@ bool gemma_prefill_sm90_launcher(
   const int pool_num_blocks = static_cast<int>(key_cache.size(0));
   PagedPool pool_proto{
       reinterpret_cast<const Element*>(key_cache_ptr),
-      k_eq_v ? nullptr : reinterpret_cast<const Element*>(value_cache_ptr),
+      (k_eq_v && !g_v_fill_tma)
+          ? nullptr
+          : reinterpret_cast<const Element*>(value_cache_ptr),
       kv_stride_block, kv_stride_slot, kv_stride_head,
       pool_num_blocks, num_kv_heads,
       /*page_table=*/nullptr, max_num_blocks_per_seq, page_size};
@@ -776,7 +782,8 @@ bool gemma_prefill_sm90_launcher(
       PagedPool pool = pool_proto;
       pool.page_table = d_vtable;
       Element* kc = reinterpret_cast<Element*>(key_cache_ptr);
-      Element* vc = k_eq_v ? kc : reinterpret_cast<Element*>(value_cache_ptr);
+      Element* vc = (k_eq_v && !g_v_fill_tma)
+          ? kc : reinterpret_cast<Element*>(value_cache_ptr);
       Element* qs = reinterpret_cast<Element*>(q_scratch);
       Element* os = reinterpret_cast<Element*>(o_scratch);
       const int q_off_dummy =
@@ -833,7 +840,8 @@ bool gemma_prefill_sm90_launcher(
       PagedPool pool = pool_proto;
       pool.page_table = block_tables_ptr;
       Element* kc = reinterpret_cast<Element*>(key_cache_ptr);
-      Element* vc = k_eq_v ? kc : reinterpret_cast<Element*>(value_cache_ptr);
+      Element* vc = (k_eq_v && !g_v_fill_tma)
+          ? kc : reinterpret_cast<Element*>(value_cache_ptr);
       if (head_size == 256) {
         return launch_fmha_batched<256>(
             query_ptr, kc, vc, out_ptr, lse_scratch, num_q_heads, gqa_group,
@@ -874,7 +882,7 @@ bool gemma_prefill_sm90_launcher(
           cudaMalloc(&k_expanded, batch_kv_bytes);
           s_kv_cap = batch_kv_bytes;
         }
-        if ((!k_eq_v || g_v_fill) && batch_kv_bytes > s_v_cap) {
+        if ((!k_eq_v || g_v_fill || g_v_fill_tma) && batch_kv_bytes > s_v_cap) {
           if (v_expanded) cudaFree(v_expanded);
           cudaMalloc(&v_expanded, batch_kv_bytes);
           s_v_cap = batch_kv_bytes;
@@ -893,14 +901,14 @@ bool gemma_prefill_sm90_launcher(
               k_expanded + s2 * seq_slot, key_cache_ptr, bt_s, kv_len_s,
               kv_len_s, num_kv_heads, num_kv_heads, head_size, 1, page_size,
               kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
-          if (!k_eq_v || g_v_fill)
+          if (!k_eq_v || g_v_fill || g_v_fill_tma)
             gather_kv_expanded_kernel<CACHE_T><<<gb, kThreads, 0, stream>>>(
                 v_expanded + s2 * seq_slot, value_cache_ptr, bt_s, kv_len_s,
                 kv_len_s, num_kv_heads, num_kv_heads, head_size, 1, page_size,
                 kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
         }
         Element* kb = reinterpret_cast<Element*>(k_expanded);
-        Element* vb = (k_eq_v && !g_v_fill)
+        Element* vb = (k_eq_v && !g_v_fill && !g_v_fill_tma)
                           ? kb : reinterpret_cast<Element*>(v_expanded);
         if (head_size == 256) {
           return launch_fmha_batched<256>(
@@ -967,7 +975,8 @@ bool gemma_prefill_sm90_launcher(
       PagedPool pool = pool_proto;
       pool.page_table = block_tables_ptr;  // 2D [seq][max_blocks]
       Element* kc = reinterpret_cast<Element*>(key_cache_ptr);
-      Element* vc = k_eq_v ? kc : reinterpret_cast<Element*>(value_cache_ptr);
+      Element* vc = (k_eq_v && !g_v_fill_tma)
+          ? kc : reinterpret_cast<Element*>(value_cache_ptr);
       Element* qs = reinterpret_cast<Element*>(q_scratch);
       Element* os = reinterpret_cast<Element*>(o_scratch);
       // Baked seq_k/q_offset are per-CTA overridden; scalars only size the
@@ -1035,7 +1044,7 @@ bool gemma_prefill_sm90_launcher(
       // path never touches pages the gather-slice used to exclude.
       pool.page_table = seq_block_table;
       k = reinterpret_cast<Element*>(key_cache_ptr);
-      v = (k_eq_v && !g_v_fill)
+      v = (k_eq_v && !g_v_fill && !g_v_fill_tma)
               ? k : reinterpret_cast<Element*>(value_cache_ptr);
     } else {
       // Gather the kv range DENSE PER KV HEAD ([kv_len, hd] x num_kv_heads —
@@ -1049,7 +1058,7 @@ bool gemma_prefill_sm90_launcher(
           num_kv_heads, num_kv_heads, head_size, /*gqa_group=*/1, page_size,
           kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
 
-      if (!k_eq_v || g_v_fill) {
+      if (!k_eq_v || g_v_fill || g_v_fill_tma) {
         gather_kv_expanded_kernel<CACHE_T>
             <<<gather_blocks, kThreads, 0, stream>>>(
                 v_expanded, value_cache_ptr, seq_block_table, kv_len_s,
@@ -1058,7 +1067,8 @@ bool gemma_prefill_sm90_launcher(
                 kv_stride_block, kv_stride_slot, kv_stride_head, kv_lo);
       }
       k = reinterpret_cast<Element*>(k_expanded);
-      v = (k_eq_v && !g_v_fill) ? k : reinterpret_cast<Element*>(v_expanded);
+      v = (k_eq_v && !g_v_fill && !g_v_fill_tma)
+              ? k : reinterpret_cast<Element*>(v_expanded);
     }
 
     Element* q_src = query_ptr + token_offset * q_stride;

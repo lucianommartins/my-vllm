@@ -338,6 +338,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     // compute-bound prefill; re-visits hit L2). Preferred over recon for
     // prefill. Paged source when v_fill_pool set, else ptr_V/dV.
     bool v_fill = false;
+    bool v_fill_tma = false;   // producer-TMA V overwrite (GEMMA_V_FILL=2)
     const Element* v_fill_pool = nullptr;
     int64_t v_fill_stride_block = 0;
     int64_t v_fill_stride_slot = 0;
@@ -562,7 +563,8 @@ struct FmhaMainloopTmaWarpSpecialized {
       MainloopPipeline& pipeline, PipelineState& smem_pipe_write, 
       MainloopPipelineQ& pipeline_q, PipelineStateQ& smem_pipe_write_q, 
       SharedStorage& storage,
-      LoadWarpBarrier& load_warp_barrier, bool do_barrier)
+      LoadWarpBarrier& load_warp_barrier, bool do_barrier,
+      MainloopPipeline& pipeline_vfill, PipelineState& smem_pipe_write_vfill)
   {
     int fusion_tile_count = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size);
 
@@ -595,11 +597,23 @@ struct FmhaMainloopTmaWarpSpecialized {
                  params.contig_gqa_group};
     auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
 
-    LoadV load_v{params.tma_load_v, pipeline, storage.smem_v, nullptr,
+    // kKEqV fill mode: V refills ride their own pipeline (QK-done gated).
+    MainloopPipeline& v_pipe = kKEqV ? pipeline_vfill : pipeline;
+    LoadV load_v{params.tma_load_v, v_pipe, storage.smem_v, nullptr,
                  params.contig_gqa_group};
     // split-D: load full 512-col V (both N-tiles), not TileShapePV_Eff (256 cols)
     using TileShapePV_Load = cute::conditional_t<kSplitDPV, TileShapePV, TileShapePV_Eff>;
     auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
+    // TMA V-overwrite bookkeeping (kKEqV fill mode): V tiles walk the same
+    // trip range, gated on consumers' QK-done via pipeline_vfill.
+    [[maybe_unused]] int vfill_count = 0;
+    [[maybe_unused]] auto v_fill_iter = cute::make_coord_iterator(fusion_tile_count);
+    if constexpr (kKEqV) {
+      if (params.v_fill_tma) {
+        vfill_count = fusion_tile_count - fusion_tile_start;
+        for (int i = 0; i < fusion_tile_start; ++i) { ++v_fill_iter; }
+      }
+    }
 
     if constexpr (kLoadQ) {
       load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
@@ -633,9 +647,14 @@ struct FmhaMainloopTmaWarpSpecialized {
     }
 
     CUTLASS_PRAGMA_NO_UNROLL
-    while (k_tile_count > 0) {
+    while (k_tile_count > 0 || vfill_count > 0) {
       if constexpr (kKEqV) {
-        load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+        // K first (prefetch depth), then V_t (waits consumers' QK_t release)
+        if (k_tile_count > 0)
+          load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+        if (vfill_count > 0)
+          load_v.template step<true>(v_fill_iter, load_state_v,
+              smem_pipe_write_vfill, lane_predicate, vfill_count, mcast_mask_b);
       } else {
         load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
         load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
@@ -653,7 +672,8 @@ struct FmhaMainloopTmaWarpSpecialized {
       MainloopPipeline& pipeline, PipelineState& smem_pipe_write,
       MainloopPipelineQ& pipeline_q, PipelineStateQ& smem_pipe_write_q,
       SharedStorage& storage,
-      LoadWarpBarrier& load_warp_barrier, bool do_barrier)
+      LoadWarpBarrier& load_warp_barrier, bool do_barrier,
+      MainloopPipeline& pipeline_vfill, PipelineState& smem_pipe_write_vfill)
   {
     int fusion_tile_count = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size);
     int lane_predicate = cute::elect_one_sync();
@@ -687,6 +707,15 @@ struct FmhaMainloopTmaWarpSpecialized {
 
       auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
       auto load_state_v = load_v.init_state(block_rank_in_cluster, problem_size, TileShapePV_Load{}, blk_coord, fusion_tile_count);
+      // TMA V-overwrite bookkeeping (kKEqV fill mode).
+      [[maybe_unused]] int vfill_count = 0;
+      [[maybe_unused]] auto v_fill_iter = cute::make_coord_iterator(fusion_tile_count);
+      if constexpr (kKEqV) {
+        if (params.v_fill_tma) {
+          vfill_count = fusion_tile_count - fusion_tile_start;
+          for (int i = 0; i < fusion_tile_start; ++i) { ++v_fill_iter; }
+        }
+      }
 
       if constexpr (kLoadQ) {
         load_q.step(q_tile_iter, load_state_q, smem_pipe_write_q, lane_predicate, q_tile_count);
@@ -720,9 +749,14 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
 
       CUTLASS_PRAGMA_NO_UNROLL
-      while (k_tile_count > 0) {
+      while (k_tile_count > 0 || vfill_count > 0) {
         if constexpr (kKEqV) {
-          load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+          if (k_tile_count > 0)
+            load_k.template step<true>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
+          if (vfill_count > 0)
+            load_v.template step<true>(v_fill_iter, load_state_v,
+                smem_pipe_write_vfill, lane_predicate, vfill_count,
+                mcast_mask_b);
         } else {
           load_k.template step<false>(k_tile_iter, load_state_k, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
           load_v.template step<true>(k_tile_iter, load_state_v, smem_pipe_write, lane_predicate, k_tile_count, mcast_mask_b);
@@ -732,11 +766,11 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     if (params.pages_per_tile == 1) {
       LoadPaged64K load_k64{params.tma_load_k_paged64, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
-      LoadPaged64V load_v64{params.tma_load_v_paged64, pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      LoadPaged64V load_v64{params.tma_load_v_paged64, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
       run_kv_loads(load_k64, load_v64);
     } else {
       LoadPagedK load_k{params.tma_load_k_paged, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
-      LoadPagedV load_v{params.tma_load_v_paged, pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      LoadPagedV load_v{params.tma_load_v_paged, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
       run_kv_loads(load_k, load_v);
     }
   }
@@ -1318,7 +1352,8 @@ struct FmhaMainloopTmaWarpSpecialized {
       MainloopPipelineQ& pipeline_q, PipelineStateQ& smem_pipe_read_q,
       MainloopPipelineReducer&, PipelineStateReducer&,
       SharedStorage& storage,
-      MathWgOrderBarrier& math_wg_order_barrier)
+      MathWgOrderBarrier& math_wg_order_barrier,
+      MainloopPipeline& pipeline_vfill, PipelineState& smem_pipe_read_vfill)
   {
     static_assert(kSplitDPV);
     int thread_idx = int(threadIdx.x);
@@ -1478,7 +1513,9 @@ struct FmhaMainloopTmaWarpSpecialized {
               (int64_t)fill_batch * (int64_t)get<1>(get<2>(params.dV));
           fill_tok_stride = (int64_t)get<0>(params.dV);
         }
-      } else if (params.recon_invfreq != nullptr) {
+      } else if (!params.v_fill_tma && params.recon_invfreq != nullptr) {
+        // mode 2 (TMA overwrite): neither transform nor cp.async fill —
+        // the producer delivers exact V; transforming it would corrupt.
         do_recon = true;
         recon_f = params.recon_invfreq[pv_thread_idx];
         recon_iw = params.recon_inv_w;
@@ -1553,6 +1590,25 @@ struct FmhaMainloopTmaWarpSpecialized {
           asm volatile("cp.async.wait_group 0;\n" ::);
       }
     };
+    // TMA V-overwrite (fill mode 2): release = QK drained (producer may
+    // refill the slot with true V); wait = V tile landed, PV may read.
+    PipelineState vfill_release_state = smem_pipe_read_vfill;
+    auto vfill_qk_done = [&]() {
+      if constexpr (kKEqV) {
+        if (params.v_fill_tma) {
+          pipeline_vfill.consumer_release(vfill_release_state);
+          ++vfill_release_state;
+        }
+      }
+    };
+    auto vfill_wait_v = [&]() {
+      if constexpr (kKEqV) {
+        if (params.v_fill_tma) {
+          pipeline_vfill.consumer_wait(smem_pipe_read_vfill);
+          ++smem_pipe_read_vfill;
+        }
+      }
+    };
 
     // ===== First KV tile =====
     {
@@ -1576,6 +1632,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       // First tile: use subsequent-step version (acc_pv=0 → rescale is no-op)
       // pre_step sets s_max = global_max → step uses it directly, no post-correction
       pre_step_max_exchange(acc_qk);
+      vfill_qk_done();
       recon_tile(smem_pipe_read.index());
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
                    acc_pv, tiled_mma_pv, problem_size);
@@ -1591,6 +1648,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPFull);
 
       pipeline.consumer_wait(smem_pipe_read);
+      vfill_wait_v();
       warpgroup_fence_operand(acc_pv);
       warpgroup_arrive();
       gemm_zero_acc(tiled_mma_pv, tOsP(_,_,_,_0{}), tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
@@ -1634,6 +1692,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
 
       pre_step_max_exchange(acc_qk);
+      vfill_qk_done();
       recon_tile(smem_pipe_read.index());
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
                    acc_pv, tiled_mma_pv, problem_size,
@@ -1650,6 +1709,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPFull);
 
       pipeline.consumer_wait(smem_pipe_read, tok);
+      vfill_wait_v();
       warpgroup_fence_operand(acc_pv);
       warpgroup_arrive();
       tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
