@@ -65,6 +65,24 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+def _fa4_alias_v(backend) -> bool:
+    """P2 probe (env FA4_ALIAS_V=1): on k_eq_v global layers, read V from the
+    key_cache pointer so V loads L2-hit the just-fetched K lines. Numerics
+    then equal GEMMA_ATTN's aliased function (post-RoPE K as V)."""
+    flag = getattr(backend, "_alias_v_flag", None)
+    if flag is None:
+        import os as _os
+        flag = False
+        if _os.environ.get("FA4_ALIAS_V") == "1":
+            # only global (non-sliding) hd512 layers of gemma-4
+            flag = getattr(backend, "sliding_window", (-1, -1))[0] in (-1, None) \
+                and getattr(backend, "head_size", 0) == 512
+            print(f"[P0] FA4_ALIAS_V active={flag} hs={backend.head_size}",
+                  flush=True)
+        backend._alias_v_flag = flag
+    return flag
+
+
 class FlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -870,7 +888,7 @@ class FlashAttentionImpl(AttentionImpl):
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
-                    v=value_cache,
+                    v=key_cache if _fa4_alias_v(self) else value_cache,
                     out=output[:num_actual_tokens],
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,

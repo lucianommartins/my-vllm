@@ -620,9 +620,14 @@ bool gemma_prefill_sm90_launcher(
   // Long-KV paged only for SKINNY q: big-q prefills re-read every KV
   // tile per q-tile, and the gathered dense buffer wins on L2/TLB
   // locality (TTFT-16k regressed ~5% routing full prefills paged).
+  // Session 20: hd256 sliding paged is ~2x gather at ALL KV (window-bounded
+  // reads), but the multi-seq batched-paged path hangs at b>1 long-KV
+  // (unresolved). Widen for single-seq only — validated -2.7% TTFT-16k;
+  // b>1 stays on the proven gather path until the hang is root-caused.
   const bool paged_call =
       use_paged && (max_kv_len <= paged_maxkv ||
-                    (page_size == 64 && max_q_len <= 128));
+                    (page_size == 64 && max_q_len <= 128) ||
+                    (page_size == 16 && sliding_window > 0 && num_seqs == 1));
   // Re-grow the expanded-KV scratch for the KV extent (sized for q above).
   const size_t kv_needed =
       (size_t)max_kv_len * num_kv_heads * head_size * sizeof(CACHE_T);
@@ -684,7 +689,13 @@ bool gemma_prefill_sm90_launcher(
     static size_t s_meta_cap = 0, s_vtable_cap = 0;
     const size_t meta_need = (size_t)3 * V * sizeof(int);
     const size_t vt_need = (size_t)V * max_num_blocks_per_seq * sizeof(int);
-    if (sq_bytes <= ((size_t)512 << 20)) {
+    // Cap env-tunable (P2): b>=8 skinny-q at long KV can exceed 512MB and
+    // silently lose splits; GEMMA_SPLIT_SCRATCH_MB raises the ceiling.
+    static const size_t s_scratch_cap_mb = [] {
+      const char* e = getenv("GEMMA_SPLIT_SCRATCH_MB");
+      return (size_t)(e ? atol(e) : 512);
+    }();
+    if (sq_bytes <= (s_scratch_cap_mb << 20)) {
       if (meta_need > s_meta_cap) {
         if (d_split_meta) cudaFree(d_split_meta);
         cudaMalloc(&d_split_meta, meta_need);

@@ -431,7 +431,9 @@ class GemmaAttentionImpl(AttentionImpl):
         local_head_dim = getattr(text_config, "head_dim", head_size)
 
         if sliding_window is None and config_k_eq_v and global_head_dim > 0:
-            self.k_eq_v = True
+            # P0 numerics experiment: GEMMA_TRUE_V=1 disables V-elision so the
+            # kernels read the true (v_norm'd, un-RoPE'd) V plane.
+            self.k_eq_v = os.environ.get("GEMMA_TRUE_V") != "1"
             self.actual_head_size = global_head_dim
         elif sliding_window is not None and local_head_dim < head_size:
             self.actual_head_size = local_head_dim
@@ -442,7 +444,6 @@ class GemmaAttentionImpl(AttentionImpl):
         # decode only. Experimentation knobs (env), OFF (k=0) by default ->
         # full attention (lossless). k = adaptive tiles beyond the forced sink
         # + recent window. Only valid on the SIMT decode path (group<=2).
-        import os
         self.topk_k = int(os.environ.get("GEMMA_TOPK_K", "0"))
         self.topk_sink = int(os.environ.get("GEMMA_TOPK_SINK", "0"))
         self.topk_window = int(os.environ.get("GEMMA_TOPK_WINDOW", "0"))
