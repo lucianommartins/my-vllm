@@ -501,6 +501,12 @@ class Gemma4Attention(nn.Module):
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
             prefix=f"{prefix}.attn",
         )
+        if use_k_eq_v:
+            # Expose for GEMMA_ATTN's in-kernel V reconstruction
+            # (plain attributes; other backends ignore them).
+            self.attn._gemma_k_norm_weight = self.k_norm.weight
+            self.attn._gemma_rope_base = float(
+                rope_parameters.get("rope_theta", 1_000_000.0))
 
     def forward(
         self,

@@ -475,6 +475,13 @@ class GemmaAttentionImpl(AttentionImpl):
         # per-layer tensor creation in gemma_paged_attention wrapper).
         self._empty_lse: torch.Tensor | None = None
         self._mq_expand_cache: dict = {}
+        # In-kernel V reconstruction (k_eq_v layers): V = unRoPE(K) * inv_w.
+        # Env-gated; tensors derived lazily at first forward (pre-capture).
+        self._vrecon_on = (os.environ.get("GEMMA_V_RECON") == "1"
+                           and self.k_eq_v)
+        self._vrecon_if: torch.Tensor | None = None
+        self._vrecon_inv_w: float = 1.0
+        self._empty_f32: torch.Tensor | None = None
         self._empty_sel: torch.Tensor | None = None
         # Cached partition buffers (avoids dict lookup per layer).
         self._cached_part: tuple[torch.Tensor, ...] | None = None
@@ -626,6 +633,7 @@ class GemmaAttentionImpl(AttentionImpl):
                     layer._k_scale, layer._v_scale, self.actual_head_size,
                     self.k_eq_v, self.sliding_window,
                     self._empty_lse, self._empty_sel,
+                    *self._vrecon_args(layer, query.device),
                 )
                 return output
             return self._forward_prefill(
@@ -662,6 +670,7 @@ class GemmaAttentionImpl(AttentionImpl):
             self.sliding_window,
             self._empty_lse,
             self._empty_sel,
+            *self._vrecon_args(layer, query.device),
         )
         return output
 
@@ -834,8 +843,27 @@ class GemmaAttentionImpl(AttentionImpl):
             self.sliding_window,
             self._empty_lse,
             selected_tiles,
+            *self._vrecon_args(layer, query.device),
         )
         return output
+
+    def _vrecon_args(self, layer, dev):
+        if self._empty_f32 is None:
+            self._empty_f32 = torch.empty(0, dtype=torch.float32, device=dev)
+        if not self._vrecon_on:
+            return self._empty_f32, 1.0
+        if self._vrecon_if is None:
+            w = getattr(layer, "_gemma_k_norm_weight", None)
+            base = getattr(layer, "_gemma_rope_base", None)
+            if w is None or base is None:
+                self._vrecon_on = False
+                return self._empty_f32, 1.0
+            hd = self.actual_head_size
+            self._vrecon_inv_w = 1.0 / float(w[0].item())
+            self._vrecon_if = (1.0 / (base ** (
+                torch.arange(0, hd, 2, dtype=torch.float32, device=dev)
+                / hd))).contiguous()
+        return self._vrecon_if, self._vrecon_inv_w
 
     def _maybe_select_tiles(
         self, query: torch.Tensor, key_cache: torch.Tensor,

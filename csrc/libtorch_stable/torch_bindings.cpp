@@ -636,7 +636,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    str kv_cache_dtype, Tensor k_scale, Tensor v_scale,"
       "    int actual_head_size, bool k_eq_v,"
       "    int sliding_window, Tensor! lse_out,"
-      "    Tensor selected_tiles) -> ()");
+      "    Tensor selected_tiles,"
+      "    Tensor recon_invfreq, float recon_inv_w) -> ()");
 
   // Lossy top-k block selection (produces selected_tiles for the decode op).
   // block_bounds empty -> exact (read-K) scoring; non-empty -> bounds scoring.

@@ -236,7 +236,8 @@ static constexpr int DS_MINCTA_256 = 3;
     constexpr int FNSTG = 2;                                                   \
     size_t fsmem = (size_t)(16 * FLDH + FNSTG * FSTAGE + 16 * FLDN)            \
                        * sizeof(CACHE_T)                                       \
-                   + (size_t)(2 * (NW) * 16) * sizeof(float);                  \
+                   + (size_t)(2 * (NW) * 16 + ((KEQV) ? (HEAD) / 2 : 0))       \
+                       * sizeof(float);                                        \
     auto fk = vllm::gemma::gemma_decode_fused_kernel<                          \
         T, CACHE_T, HEAD, GROUP, KEQV, USW, SPLITB, NW>;                       \
     {                                                                          \
@@ -256,7 +257,8 @@ static constexpr int DS_MINCTA_256 = 3;
         value_cache_ptr, num_kv_heads, scale, block_tables_ptr,                \
         seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,            \
         kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,       \
-        num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr, mq);          \
+        num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr, mq,          \
+        recon_invfreq_ptr, recon_inv_w_f);                                     \
     if (SPLITB) {                                                              \
       const dim3 fcg(num_kv_heads * (GROUP), num_seqs * mq);                   \
       LAUNCH_GEMMA_COMBINE_T(HEAD, fcg, lse_out_ptr, float,                    \
@@ -411,8 +413,15 @@ void gemma_paged_attention_launcher(
     bool k_eq_v,
     int sliding_window,
     torch::stable::Tensor& lse_out,   // [num_q_heads,num_seqs] or empty
-    torch::stable::Tensor& selected_tiles) {  // [seqs,kv_heads,num_sel] or empty
+    torch::stable::Tensor& selected_tiles,  // [seqs,kv_heads,num_sel] or empty
+    torch::stable::Tensor& recon_invfreq,   // [head/2] f32 or empty (off)
+    double recon_inv_w) {
 
+  const float* recon_invfreq_ptr =
+      recon_invfreq.numel() > 0
+          ? recon_invfreq.mutable_data_ptr<float>()
+          : nullptr;
+  const float recon_inv_w_f = static_cast<float>(recon_inv_w);
   int num_seqs = query.size(0);
   int num_q_heads = query.size(1);
   int head_size = query.size(2);
@@ -822,7 +831,7 @@ void gemma_paged_attention_launcher(
       out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,       \
       num_kv_heads, scale, block_tables, seq_lens, max_seq_len,                \
       k_scale, v_scale, actual_head_size, k_eq_v, sliding_window, lse_out,     \
-      selected_tiles);
+      selected_tiles, recon_invfreq, recon_inv_w);
 
 #define CALL_GEMMA_LAUNCHER_BLOCK_SIZE(T, CACHE_T, KV_DTYPE)             \
   switch (block_size) {                                                  \
@@ -861,7 +870,9 @@ void gemma_paged_attention(
     bool k_eq_v,
     int64_t sliding_window,
     torch::stable::Tensor& lse_out,
-    torch::stable::Tensor& selected_tiles) {
+    torch::stable::Tensor& selected_tiles,
+    torch::stable::Tensor& recon_invfreq,
+    double recon_inv_w) {
   DISPATCH_BY_KV_CACHE_DTYPE(query.scalar_type(), kv_cache_dtype,
                              CALL_GEMMA_LAUNCHER_BLOCK_SIZE)
 }

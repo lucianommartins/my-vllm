@@ -1674,7 +1674,9 @@ gemma_decode_fused_kernel(
     const int64_t kv_stride_head, const int sliding_window,
     const int num_splits, const int max_parts,
     float* __restrict__ lse_out = nullptr,
-    const int mq = 1) {
+    const int mq = 1,
+    const float* __restrict__ recon_invfreq = nullptr,
+    const float recon_inv_w = 1.f) {
   // mq: query positions PACKED into the M dim (MTP/spec-verify: one KV read
   // serves all positions). Row r = (position r/GROUP, gqa head r%GROUP);
   // requires GQA_GROUP*mq <= 16. mq==1 is the classic decode layout.
@@ -1750,6 +1752,7 @@ gemma_decode_fused_kernel(
   cache_t* sP = sKV + NSTG * STAGE;                         // [16, LDN] bf16
   float* sWm = reinterpret_cast<float*>(sP + 16 * LDN);     // [NWARP, 16]
   float* sWl = sWm + NWARP * 16;                            // [NWARP, 16]
+  float* sIF = sWl + NWARP * 16;    // [HEAD_SIZE/2] recon invfreq (KEQV only)
 #define DF_KBUF(s) (sKV + (s) * STAGE)
 #define DF_VBUF(s) (DF_KBUF(s) + KTILE)
 
@@ -1826,6 +1829,10 @@ gemma_decode_fused_kernel(
     __pipeline_commit();                                                       \
   } while (0)
 
+  if (!V_SMEM && recon_invfreq != nullptr) {
+    for (int i = tid; i < HEAD_SIZE / 2; i += nthreads)
+      sIF[i] = recon_invfreq[i];
+  }
   __syncthreads();
   DF_STAGE(tile_lo, 0);
   if (NSTG >= 3 && ntiles_local > 1) DF_STAGE(tile_lo + 1, 1);
@@ -1901,6 +1908,35 @@ gemma_decode_fused_kernel(
       sWm[warp * 16 + group + 8] = sm1;
     }
     __syncthreads();  // B2: stats visible
+
+    // ---- V-recon (k_eq_v): rebuild TRUE V in place from the cached K
+    // tile: V = unRoPE_neox(K) * inv_w (k_norm weight is channel-constant
+    // per layer, so inv_w is a scalar). All QK ldmatrix reads of this tile
+    // completed before B2; B3 below publishes the transform for PV.
+    if (!V_SMEM && recon_invfreq != nullptr) {
+      if constexpr (sizeof(cache_t) == 2) {
+        // Rotation recurrence: thread owns channel pair(s) j and walks the
+        // tile's tokens; theta advances by invfreq[j] per token, so ONE
+        // sincos seeds the tile and each step is a 4-FMA rotation update.
+        constexpr int RHALF = HEAD_SIZE / 2;
+        for (int j = tid; j < RHALF; j += nthreads) {
+          const float f = sIF[j];
+          float sn, cs, dsn, dcs;
+          __sincosf((float)kv0 * f, &sn, &cs);
+          __sincosf(f, &dsn, &dcs);
+          cache_t* row = kbuf + j;
+          for (int n = 0; n < n_tok; n++, row += LDH) {
+            const float k0 = (float)row[0];
+            const float k1 = (float)row[RHALF];
+            from_float(row[0], (cs * k0 + sn * k1) * recon_inv_w);
+            from_float(row[RHALF], (cs * k1 - sn * k0) * recon_inv_w);
+            const float c2 = cs * dcs - sn * dsn;
+            sn = sn * dcs + cs * dsn;
+            cs = c2;
+          }
+        }
+      }
+    }
 
     // ---- global row stats + exp + P + O rescale (registers) ----
     float tm0 = -FLT_MAX, tm1 = -FLT_MAX;

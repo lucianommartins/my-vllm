@@ -486,7 +486,8 @@ void gemma_paged_attention(
     const std::string& kv_cache_dtype, torch::stable::Tensor& k_scale,
     torch::stable::Tensor& v_scale, int64_t actual_head_size, bool k_eq_v,
     int64_t sliding_window, torch::stable::Tensor& lse_out,
-    torch::stable::Tensor& selected_tiles);
+    torch::stable::Tensor& selected_tiles,
+    torch::stable::Tensor& recon_invfreq, double recon_inv_w);
 
 void gemma_topk_select(
     torch::stable::Tensor& selected_tiles, torch::stable::Tensor& query,
