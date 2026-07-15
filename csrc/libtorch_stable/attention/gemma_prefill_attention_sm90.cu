@@ -202,6 +202,11 @@ struct PagedPool {
   int page_size;        // 16 (page-sliced TMA) or 64 (whole-tile TMA)
 };
 
+// k_eq_v V-reconstruction state for the CURRENT op call (host-side,
+// single-threaded launch path; set at gemma_prefill_sm90_launcher entry).
+static const float* g_recon_invfreq = nullptr;
+static float g_recon_inv_w = 1.f;
+
 template <int HeadDim, bool KEqV = false>
 struct FmhaCachedLauncher {
   using FmhaTypes = vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV>;
@@ -379,6 +384,9 @@ struct FmhaCachedLauncher {
       p.mainloop.d_cu_seqlens_q = varlen_cu_q;
       p.mainloop.d_q_offsets = varlen_q_offsets;
       p.mainloop.d_kv_lo = varlen_kv_lo;
+      // k_eq_v V-recon (set per op call at sm90_launcher entry).
+      p.mainloop.recon_invfreq = g_recon_invfreq;
+      p.mainloop.recon_inv_w = g_recon_inv_w;
     }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
@@ -430,7 +438,15 @@ bool gemma_prefill_sm90_launcher(
     int max_q_len, int page_size, bool k_eq_v, int sliding_window,
     torch::stable::Tensor& mm_prefix_ranges, bool non_causal,
     torch::stable::Tensor& lse_out, torch::stable::Tensor& seq_lens_cpu,
-    torch::stable::Tensor& cu_seqlens_q_cpu) {
+    torch::stable::Tensor& cu_seqlens_q_cpu,
+    torch::stable::Tensor& recon_invfreq, double recon_inv_w) {
+
+  // k_eq_v V-recon: publish this call's transform state for the cached
+  // launchers (host path is single-threaded; reset every call).
+  g_recon_invfreq = (k_eq_v && recon_invfreq.numel() > 0)
+                        ? recon_invfreq.mutable_data_ptr<float>()
+                        : nullptr;
+  g_recon_inv_w = static_cast<float>(recon_inv_w);
 
   // Default ON (P7): the CUTLASS warp-spec path is the production prefill on
   // Hopper (TTFT 28.5/180.6/783ms at 512/4k/16k b=1 vs FA4's 34.4/177.4/773).
@@ -1082,4 +1098,4 @@ template bool gemma_prefill_sm90_launcher<__nv_bfloat16, __nv_bfloat16>(
     torch::stable::Tensor&, torch::stable::Tensor&, torch::stable::Tensor&,
     torch::stable::Tensor&, int, float, torch::stable::Tensor&,
     torch::stable::Tensor&, torch::stable::Tensor&, int, int, bool, int,
-    torch::stable::Tensor&, bool, torch::stable::Tensor&, torch::stable::Tensor&, torch::stable::Tensor&);
+    torch::stable::Tensor&, bool, torch::stable::Tensor&, torch::stable::Tensor&, torch::stable::Tensor&, torch::stable::Tensor&, double);

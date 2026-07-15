@@ -662,7 +662,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int num_kv_heads, float scale, Tensor block_tables, Tensor seq_lens,"
       "    Tensor cu_seqlens_q, int max_q_len, int block_size, bool k_eq_v,"
       "    int sliding_window, Tensor mm_prefix_ranges, bool non_causal,"
-      "    Tensor! lse_out, Tensor seq_lens_cpu, Tensor cu_seqlens_q_cpu)"
+      "    Tensor! lse_out, Tensor seq_lens_cpu, Tensor cu_seqlens_q_cpu,"
+      "    Tensor recon_invfreq, float recon_inv_w)"
       " -> ()");
 }
 

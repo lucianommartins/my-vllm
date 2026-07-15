@@ -329,6 +329,10 @@ struct FmhaMainloopTmaWarpSpecialized {
     // GQA-dense CONTIGUOUS KV buffers (prefill de-GQA): q-head -> kv-head
     // divisor for the kK/kV loaders. 1 = legacy expanded buffers.
     int contig_gqa_group;
+    // k_eq_v V-reconstruction: rebuild TRUE V in smem from the cached K
+    // tile (V = unRoPE_neox(K) * recon_inv_w). Null = aliased V (legacy).
+    const float* recon_invfreq = nullptr;
+    float recon_inv_w = 1.f;
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
@@ -1431,6 +1435,51 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     };
 
+    // ---- k_eq_v V-recon setup: 256 consumer threads <-> 256 rope pair
+    // channels; each thread rebuilds its pair in place per KV tile.
+    // Placement: after pre_step_max_exchange (its NamedBarrier guarantees
+    // BOTH WGs' QK wgmmas on the tile are drained) and before softmax; the
+    // existing P-publish fence+kBarrierPFull then covers visibility for
+    // both WGs' SS PV reads. Zero extra barriers.
+    [[maybe_unused]] float recon_f = 0.f;
+    [[maybe_unused]] float recon_iw = 1.f;
+    [[maybe_unused]] int recon_t = 0;
+    [[maybe_unused]] bool do_recon = false;
+    if constexpr (kKEqV) {
+      static_assert(kNumMmaThreads == kHeadDim / 2,
+                    "V-recon assumes one consumer thread per rope pair");
+      if (params.recon_invfreq != nullptr) {
+        do_recon = true;
+        recon_f = params.recon_invfreq[pv_thread_idx];
+        recon_iw = params.recon_inv_w;
+        recon_t = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
+      }
+    }
+    auto recon_tile = [&](int stage_idx) {
+      if constexpr (kKEqV) {
+        if (do_recon) {
+          constexpr int kTileKV = int(get<1>(TileShapeQK{}));
+          constexpr int kRHalf = kHeadDim / 2;
+          const int j = pv_thread_idx;
+          float sn, cs, dsn, dcs;
+          __sincosf((float)(recon_t * kTileKV) * recon_f, &sn, &cs);
+          __sincosf(recon_f, &dsn, &dcs);
+          CUTLASS_PRAGMA_NO_UNROLL
+          for (int n = 0; n < kTileKV; n++) {
+            const float k0 = float(sK_full(n, j, stage_idx));
+            const float k1 = float(sK_full(n, j + kRHalf, stage_idx));
+            sK_full(n, j, stage_idx) = Element((cs * k0 + sn * k1) * recon_iw);
+            sK_full(n, j + kRHalf, stage_idx) =
+                Element((cs * k1 - sn * k0) * recon_iw);
+            const float c2 = cs * dcs - sn * dsn;
+            sn = sn * dcs + cs * dsn;
+            cs = c2;
+          }
+        }
+        recon_t++;
+      }
+    };
+
     // ===== First KV tile =====
     {
       --k_tile_count;
@@ -1453,6 +1502,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       // First tile: use subsequent-step version (acc_pv=0 → rescale is no-op)
       // pre_step sets s_max = global_max → step uses it directly, no post-correction
       pre_step_max_exchange(acc_qk);
+      recon_tile(smem_pipe_read.index());
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
                    acc_pv, tiled_mma_pv, problem_size);
 
@@ -1509,6 +1559,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
 
       pre_step_max_exchange(acc_qk);
+      recon_tile(smem_pipe_read.index());
       softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
                    acc_pv, tiled_mma_pv, problem_size,
                    Fusion{}.tile_needs_mask(mask_t_abs++, blk_coord,

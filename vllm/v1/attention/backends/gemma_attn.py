@@ -479,6 +479,11 @@ class GemmaAttentionImpl(AttentionImpl):
         # Env-gated; tensors derived lazily at first forward (pre-capture).
         self._vrecon_on = (os.environ.get("GEMMA_V_RECON") == "1"
                            and self.k_eq_v)
+        # layer-name -> Attention module registry, for resolving KV-sharing
+        # targets (MTP drafter layers and the target's shared tail read a
+        # cache WRITTEN by their sharing target -> must use ITS w/rope).
+        self._static_fwd_ctx = getattr(
+            vllm_config.compilation_config, "static_forward_context", None)
         self._vrecon_if: torch.Tensor | None = None
         self._vrecon_inv_w: float = 1.0
         self._empty_f32: torch.Tensor | None = None
@@ -517,6 +522,7 @@ class GemmaAttentionImpl(AttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self._layer_ref = layer
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -757,6 +763,7 @@ class GemmaAttentionImpl(AttentionImpl):
             torch.empty(0, dtype=torch.float32, device=query.device),
             seq_lens_cpu if seq_lens_cpu is not None else empty_i32,
             q_start_cpu if q_start_cpu is not None else empty_i32,
+            *self._vrecon_args(self._layer_ref, query.device),
         )
         return output
 
@@ -853,8 +860,14 @@ class GemmaAttentionImpl(AttentionImpl):
         if not self._vrecon_on:
             return self._empty_f32, 1.0
         if self._vrecon_if is None:
-            w = getattr(layer, "_gemma_k_norm_weight", None)
-            base = getattr(layer, "_gemma_rope_base", None)
+            src = layer
+            tname = getattr(layer, "kv_sharing_target_layer_name", None)
+            if tname and self._static_fwd_ctx is not None:
+                tgt = self._static_fwd_ctx.get(tname)
+                if tgt is not None:
+                    src = tgt  # cache written by the sharing target
+            w = getattr(src, "_gemma_k_norm_weight", None)
+            base = getattr(src, "_gemma_rope_base", None)
             if w is None or base is None:
                 self._vrecon_on = False
                 return self._empty_f32, 1.0
@@ -965,6 +978,7 @@ class GemmaAttentionImpl(AttentionImpl):
                 [attn_metadata.common_prefix_len], dtype=torch.int32
             ),
             torch.tensor([0, num_seqs], dtype=torch.int32),
+            *self._vrecon_args(self._layer_ref, query.device),
         )
 
         # Suffix pass: per-request causal decode over the post-prefix KV.
