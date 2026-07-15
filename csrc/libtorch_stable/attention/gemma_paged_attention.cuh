@@ -1915,6 +1915,23 @@ gemma_decode_fused_kernel(
     // completed before B2; B3 below publishes the transform for PV.
     if (!V_SMEM && recon_invfreq != nullptr) {
       if constexpr (sizeof(cache_t) == 2) {
+        // Tile 0 = attention-sink tokens (bos): their V outlier channels
+        // are where the 1/w-amplified bf16 recon noise bites hardest.
+        // Load their TRUE V rows from the (otherwise unread) V plane
+        // instead — once per CTA, plain loads, pipeline-neutral.
+        if (kv0 == 0) {
+          constexpr int VEC16 = 16 / (int)sizeof(cache_t);
+          constexpr int CH16 = HEAD_SIZE / VEC16;
+          for (int i = tid; i < n_tok * CH16; i += nthreads) {
+            const int n = i / CH16, dv = (i - n * CH16) * VEC16;
+            const int64_t phys = block_table[n / page_size];
+            const int64_t off = phys * kv_stride_block +
+                                (n % page_size) * kv_stride_slot +
+                                kv_head * kv_stride_head + dv;
+            *reinterpret_cast<uint4*>(kbuf + n * LDH + dv) =
+                *reinterpret_cast<const uint4*>(v_cache + off);
+          }
+        } else {
         // Rotation recurrence: thread owns channel pair(s) j and walks the
         // tile's tokens; theta advances by invfreq[j] per token, so ONE
         // sincos seeds the tile and each step is a 4-FMA rotation update.
@@ -1934,6 +1951,7 @@ gemma_decode_fused_kernel(
             sn = sn * dcs + cs * dsn;
             cs = c2;
           }
+        }
         }
       }
     }

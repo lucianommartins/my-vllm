@@ -333,6 +333,14 @@ struct FmhaMainloopTmaWarpSpecialized {
     // tile (V = unRoPE_neox(K) * recon_inv_w). Null = aliased V (legacy).
     const float* recon_invfreq = nullptr;
     float recon_inv_w = 1.f;
+    // k_eq_v V-FILL (exact): consumers cp.async the TRUE V tile from the
+    // V plane over the dead K tile after QK (bytes are free in the
+    // compute-bound prefill; re-visits hit L2). Preferred over recon for
+    // prefill. Paged source when v_fill_pool set, else ptr_V/dV.
+    bool v_fill = false;
+    const Element* v_fill_pool = nullptr;
+    int64_t v_fill_stride_block = 0;
+    int64_t v_fill_stride_slot = 0;
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
@@ -1445,10 +1453,32 @@ struct FmhaMainloopTmaWarpSpecialized {
     [[maybe_unused]] float recon_iw = 1.f;
     [[maybe_unused]] int recon_t = 0;
     [[maybe_unused]] bool do_recon = false;
+    [[maybe_unused]] bool do_fill = false;
+    [[maybe_unused]] bool fill_paged = false;
+    [[maybe_unused]] const Element* fill_vbase = nullptr;
+    [[maybe_unused]] int64_t fill_tok_stride = 0;
+    [[maybe_unused]] int fill_batch = 0;
+    [[maybe_unused]] int fill_ps = 64;
     if constexpr (kKEqV) {
       static_assert(kNumMmaThreads == kHeadDim / 2,
                     "V-recon assumes one consumer thread per rope pair");
-      if (params.recon_invfreq != nullptr) {
+      if (params.v_fill) {
+        do_fill = true;
+        recon_t = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
+        fill_paged = params.v_fill_pool != nullptr;
+        fill_batch = int(get<1>(get<2>(blk_coord)));
+        if (fill_paged) {
+          fill_ps = int(get<1>(TileShapeQK{})) /
+                    (params.pages_per_tile > 0 ? params.pages_per_tile : 1);
+        } else {
+          const int v_head = int(get<0>(get<2>(blk_coord))) /
+              (params.contig_gqa_group > 0 ? params.contig_gqa_group : 1);
+          fill_vbase = params.ptr_V +
+              (int64_t)v_head * (int64_t)get<0>(get<2>(params.dV)) +
+              (int64_t)fill_batch * (int64_t)get<1>(get<2>(params.dV));
+          fill_tok_stride = (int64_t)get<0>(params.dV);
+        }
+      } else if (params.recon_invfreq != nullptr) {
         do_recon = true;
         recon_f = params.recon_invfreq[pv_thread_idx];
         recon_iw = params.recon_inv_w;
@@ -1457,6 +1487,44 @@ struct FmhaMainloopTmaWarpSpecialized {
     }
     auto recon_tile = [&](int stage_idx) {
       if constexpr (kKEqV) {
+        if (do_fill) {
+          // Exact V: overwrite the dead K tile with the true V tile.
+          // QK of this tile is drained (post max-exchange barrier); the
+          // P-publish fence+barrier covers visibility for both WGs' PV.
+          constexpr int kTileKV = int(get<1>(TileShapeQK{}));
+          constexpr int kVecE = 16 / int(sizeof(Element));
+          constexpr int CH16 = kHeadDim / kVecE;   // 16B chunks per row
+          const int kv0 = recon_t * kTileKV;
+          const int seq_k = int(get<3>(problem_size));
+          CUTLASS_PRAGMA_NO_UNROLL
+          for (int i = pv_thread_idx; i < kTileKV * CH16;
+               i += kNumMmaThreads) {
+            const int n = i / CH16, c = i - n * CH16;
+            int tok = kv0 + n;
+            if (tok >= seq_k) tok = seq_k - 1;   // masked tail: any valid src
+            const Element* src;
+            if (fill_paged) {
+              const int phys = params.page_table[
+                  fill_batch * params.max_blocks_per_seq + tok / fill_ps];
+              src = params.v_fill_pool +
+                    (int64_t)phys * params.v_fill_stride_block +
+                    (int64_t)(tok % fill_ps) * params.v_fill_stride_slot +
+                    c * kVecE;
+            } else {
+              src = fill_vbase + (int64_t)tok * fill_tok_stride + c * kVecE;
+            }
+            const uint32_t dst = cute::cast_smem_ptr_to_uint(
+                &sK_full(n, c * kVecE, stage_idx));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                         :: "r"(dst), "l"(src));
+          }
+          asm volatile("cp.async.commit_group;\n" ::);
+          // wait deferred to recon_fill_wait() — hides the copy latency
+          // under softmax + P stores (the kBarrierPFull sync after the
+          // wait publishes the filled tile to both WGs' PV).
+          recon_t++;
+          return;
+        }
         if (do_recon) {
           constexpr int kTileKV = int(get<1>(TileShapeQK{}));
           constexpr int kRHalf = kHeadDim / 2;
@@ -1477,6 +1545,12 @@ struct FmhaMainloopTmaWarpSpecialized {
           }
         }
         recon_t++;
+      }
+    };
+    auto recon_fill_wait = [&]() {
+      if constexpr (kKEqV) {
+        if (do_fill)
+          asm volatile("cp.async.wait_group 0;\n" ::);
       }
     };
 
@@ -1512,6 +1586,7 @@ struct FmhaMainloopTmaWarpSpecialized {
         sP(get<0>(tPcP_local(i)), get<1>(tPcP_local(i)) + p_n_offset, _0{}) =
             static_cast<Element>(acc_qk(i));
       }
+      recon_fill_wait();
       cutlass::arch::fence_view_async_shared();
       cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPFull);
 
@@ -1570,6 +1645,7 @@ struct FmhaMainloopTmaWarpSpecialized {
         sP(get<0>(tPcP_local(i)), get<1>(tPcP_local(i)) + p_n_offset, _0{}) =
             static_cast<Element>(acc_qk(i));
       }
+      recon_fill_wait();
       cutlass::arch::fence_view_async_shared();
       cutlass::arch::NamedBarrier::sync(kNumMmaThreads, kBarrierPFull);
 
