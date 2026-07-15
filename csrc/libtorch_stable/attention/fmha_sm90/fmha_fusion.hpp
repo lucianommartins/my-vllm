@@ -258,7 +258,15 @@ struct SlidingWindowCausalFusion : DefaultFusion {
     int q_min = get<0>(blk_coord) * get<0>(tile_shape) + get<6>(problem_size);
     int k_lo = q_min - sw + 1;
     int sw_start = k_lo > 0 ? k_lo / get<1>(tile_shape) : 0;
-    return sw_start > start ? sw_start : start;
+    int ret = sw_start > start ? sw_start : start;
+    // Varlen batched: a tiny-q seq padded to another seq's q_pad gets
+    // M-tiles whose window start passes the causal/kv end (empty trip
+    // range) -> producer loads nothing while consumers wait = DEADLOCK.
+    // Clamp to keep >=1 (fully masked) tile; garbage lands only in pad
+    // scratch rows that are never scattered back.
+    int cnt = get_trip_count(blk_coord, tile_shape, problem_size);
+    if (ret > cnt - 1) ret = cnt - 1;
+    return ret < 0 ? 0 : ret;
   }
 
   template<class BlkCoord, class TileShape, class ProblemSize>

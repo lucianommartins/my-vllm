@@ -620,14 +620,14 @@ bool gemma_prefill_sm90_launcher(
   // Long-KV paged only for SKINNY q: big-q prefills re-read every KV
   // tile per q-tile, and the gathered dense buffer wins on L2/TLB
   // locality (TTFT-16k regressed ~5% routing full prefills paged).
-  // Session 20: hd256 sliding paged is ~2x gather at ALL KV (window-bounded
-  // reads), but the multi-seq batched-paged path hangs at b>1 long-KV
-  // (unresolved). Widen for single-seq only — validated -2.7% TTFT-16k;
-  // b>1 stays on the proven gather path until the hang is root-caused.
+  // hd256 sliding: reads are WINDOW-bounded, so paged beats gather ~2x at
+  // ALL KV lengths (S20 op-level; S21 TTFT). Always paged. The b>1 hang
+  // (empty sliding trip range on padded tiny-q tiles -> pipeline deadlock)
+  // was root-caused and fixed in fmha_fusion.hpp get_trip_start (S21).
   const bool paged_call =
       use_paged && (max_kv_len <= paged_maxkv ||
                     (page_size == 64 && max_q_len <= 128) ||
-                    (page_size == 16 && sliding_window > 0 && num_seqs == 1));
+                    (page_size == 16 && sliding_window > 0));
   // Re-grow the expanded-KV scratch for the KV extent (sized for q above).
   const size_t kv_needed =
       (size_t)max_kv_len * num_kv_heads * head_size * sizeof(CACHE_T);
