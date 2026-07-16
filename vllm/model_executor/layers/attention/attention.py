@@ -647,7 +647,14 @@ class Attention(nn.Module, AttentionLayerBase):
             if (os.environ.get("GEMMA_CACHE_V3") == "1"
                     and getattr(self, "_gemma_k_norm_weight", None)
                     is not None):
-                return FullAttentionSpec(
+                from vllm.v1.kv_cache_interface import GemmaGlobalV3Spec
+                # Fail-closed arming: the record math assumes exactly the
+                # k_eq_v global geometry. Anything else must NOT reach the
+                # v3 allocator paths.
+                assert self.head_size == 512, (
+                    "GEMMA_CACHE_V3 global spec expects head_size=512, "
+                    f"got {self.head_size}")
+                return GemmaGlobalV3Spec(
                     block_size=64,
                     num_kv_heads=self.num_kv_heads,
                     head_size=self.head_size,

@@ -362,6 +362,17 @@ class TQFullAttentionSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class GemmaGlobalV3Spec(FullAttentionSpec):
+    """Gemma-4 (GEMMA_CACHE_V3) global-layer 640-channel single-plane
+    record. Inherits FullAttentionSpec's asymmetric (head_size +
+    head_size_v) page-bytes math (head_size=512, head_size_v=128 -> 640
+    channels, 1 plane). A DEDICATED type so C1 allocator branches key off
+    isinstance(spec, GemmaGlobalV3Spec) — no other model can mint this,
+    so the new paths are unreachable for anything but gemma-4-v3."""
+    pass
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
