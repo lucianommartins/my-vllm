@@ -149,6 +149,8 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
+    VLLM_GEMMA4_FA2_LOCAL: bool = False
+    VLLM_GEMMA4_FI_LOCAL: bool = False
     VLLM_USE_LAYERNAME: bool = True
     Q_SCALE_CONSTANT: int = 200
     K_SCALE_CONSTANT: int = 200
@@ -601,6 +603,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Gemma4 experiment (text-only): force the local sliding head_dim=256 layers
+    # onto FA2 / FlashInfer while global head_dim=512 stays on Triton, to bake off
+    # local-layer attention backends. TEXT-ONLY correct: drops the mm_prefix
+    # bidirectional-image mask on those layers. Set at most one of the two.
+    "VLLM_GEMMA4_FA2_LOCAL": lambda: bool(
+        int(os.getenv("VLLM_GEMMA4_FA2_LOCAL", "0"))
+    ),
+    "VLLM_GEMMA4_FI_LOCAL": lambda: bool(int(os.getenv("VLLM_GEMMA4_FI_LOCAL", "0"))),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton

@@ -342,6 +342,36 @@ class Attention(nn.Module, AttentionLayerBase):
         model_config = vllm_config.model_config
         self.use_mm_prefix = model_config is not None and model_config.is_mm_prefix_lm
 
+        # Gemma4 experiment (TEXT-ONLY): force the local sliding head_dim<=256
+        # layers onto a specific backend (FA2 / FlashInfer) while the global
+        # head_dim=512 layers stay on Triton. Gemma4Config forces
+        # attention_config.backend=TRITON_ATTN model-wide when FA4 is absent
+        # (models/config.py); the per-call backend_override below takes
+        # precedence for the local layers only. Dropping use_mm_prefix here also
+        # drops the bidirectional-image mask on these layers, so this is only
+        # correct for text-only inputs. Triggered on the local-layer signature
+        # (sliding + head<=256), not on mm_prefix.
+        backend_override = None
+        if (
+            sliding_window is not None
+            and head_size <= 256
+            and (envs.VLLM_GEMMA4_FA2_LOCAL or envs.VLLM_GEMMA4_FI_LOCAL)
+        ):
+            assert not (envs.VLLM_GEMMA4_FA2_LOCAL and envs.VLLM_GEMMA4_FI_LOCAL), (
+                "Set only one of VLLM_GEMMA4_FA2_LOCAL / VLLM_GEMMA4_FI_LOCAL"
+            )
+            backend_override = (
+                AttentionBackendEnum.FLASH_ATTN
+                if envs.VLLM_GEMMA4_FA2_LOCAL
+                else AttentionBackendEnum.FLASHINFER
+            )
+            self.use_mm_prefix = False
+            logger.warning_once(
+                "Gemma4 local layers forced to %s (text-only-correct only; "
+                "mm_prefix image mask dropped on these layers).",
+                backend_override.name,
+            )
+
         # During model initialization, the default dtype is set as the model
         # weight and activation dtype.
         dtype = torch.get_default_dtype()
@@ -356,6 +386,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 use_per_head_quant_scales=use_per_head_quant_scales,
                 attn_type=attn_type,
                 has_sliding_window=sliding_window is not None,
+                backend_override=backend_override,
             )
         else:
             self.attn_backend = attn_backend

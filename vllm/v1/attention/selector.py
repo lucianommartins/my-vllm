@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.registry import (
+    AttentionBackendEnum,
     MambaAttentionBackendEnum,
 )
 
@@ -65,8 +66,14 @@ def get_attn_backend(
     attn_type: str | None = None,
     num_heads: int | None = None,
     has_sliding_window: bool = False,
+    backend_override: AttentionBackendEnum | None = None,
 ) -> type[AttentionBackend]:
-    """Selects which attention backend to use and lazily imports it."""
+    """Selects which attention backend to use and lazily imports it.
+
+    If ``backend_override`` is provided, it takes precedence over the global
+    ``--attention-backend`` config for this call only, letting a single layer
+    pin a specific backend (validated like an explicitly selected backend).
+    """
 
     if kv_cache_dtype is not None:
         valid_cache_dtypes = get_args(CacheDType)
@@ -109,7 +116,7 @@ def get_attn_backend(
     )
 
     return _cached_get_attn_backend(
-        backend=vllm_config.attention_config.backend,
+        backend=backend_override or vllm_config.attention_config.backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
     )
