@@ -742,6 +742,14 @@ void gemma_paged_attention_launcher(
           LAUNCH_GEMMA_FUSED_SB(512, 16, true, false);             \
           did_stream = true;                                       \
         }                                                          \
+        /* 26B-A4B (g_kvh=2) and 31B (g_kvh=4): global GQA is 8:1 —  \
+           without this instantiation they silently ran the wmma     \
+           fallbacks (family-audit catch, contract v2). */           \
+        if (!did_stream && use_stream && decode_fused &&           \
+            gqa_group == 8) {                                      \
+          LAUNCH_GEMMA_FUSED_SB(512, 8, true, false);              \
+          did_stream = true;                                       \
+        }                                                          \
         if (!did_stream && use_stream && decode_bn != 0 &&         \
             gqa_group == 16) {                                     \
           if (decode_bn == 96) {                                   \
