@@ -636,6 +636,25 @@ class Attention(nn.Module, AttentionLayerBase):
                     evict_sink=int(os.environ.get("GEMMA_EVICT_SINK", "0")),
                     evict_budget=evict_budget,
                 )
+            # GEMMA_CACHE_V3: gemma-4 k_eq_v global layers store the
+            # contract-v3 640-channel single-plane record
+            # [Vperm(512)|rot64 strip(128)]. head_size_v=128 makes
+            # real_page_size_bytes = bs*kvh*(512+128)*2B — byte-exact with
+            # the backend's diffkv-style single-plane shape, so spec and
+            # shape derive from the same fields (the 7.1 failure mode is
+            # structurally impossible). Discriminator: the gemma4 model
+            # attaches _gemma_k_norm_weight only on k_eq_v global layers.
+            if (os.environ.get("GEMMA_CACHE_V3") == "1"
+                    and getattr(self, "_gemma_k_norm_weight", None)
+                    is not None):
+                return FullAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=128,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=quant_mode,
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

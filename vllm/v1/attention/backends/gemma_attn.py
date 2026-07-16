@@ -43,6 +43,10 @@ logger = init_logger(__name__)
 # shapes). Above it, the prefill paths take over.
 _MQ_DECODE_MAX = int(os.environ.get("GEMMA_MQ_DECODE_MAX", "8"))
 
+# Contract-v3 gemma-4 cache (640-ch global records + ps64 pools). Dev gate:
+# readers not yet migrated; default OFF.
+_CACHE_V3 = os.environ.get("GEMMA_CACHE_V3") == "1"
+
 PARTITION_SIZE = 512
 # Upper bound on split-KV partitions the decode kernel may use. The partition
 # buffers are sized to allow ~256 tokens/split so cross-CTA split-KV can engage
@@ -355,6 +359,12 @@ class GemmaAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if _CACHE_V3 and head_size == 512:
+            # Contract-v3 640-channel single-plane record for the global
+            # k_eq_v layers: [Vperm(512) | rot64 strip(128)] per token
+            # (diffkv-style shape; spec side mints head_size_v=128 so
+            # page bytes and this shape derive from the same fields).
+            return (num_blocks, block_size, num_kv_heads, 512 + 128)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
