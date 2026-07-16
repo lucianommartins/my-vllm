@@ -855,6 +855,7 @@ class GemmaAttentionImpl(AttentionImpl):
         return output
 
     def _vrecon_args(self, layer, dev):
+
         if self._empty_f32 is None:
             self._empty_f32 = torch.empty(0, dtype=torch.float32, device=dev)
         if not self._vrecon_on:
@@ -873,9 +874,24 @@ class GemmaAttentionImpl(AttentionImpl):
                 return self._empty_f32, 1.0
             hd = self.actual_head_size
             self._vrecon_inv_w = 1.0 / float(w[0].item())
-            self._vrecon_if = (1.0 / (base ** (
+            # Gemma4 "proportional" RoPE: only rope_angles pairs rotate;
+            # the remaining pairs are identity -> ZERO frequency (the
+            # kernel recurrence degenerates to scale-only for f=0).
+            n_ang = int(getattr(src, "_gemma_rope_angles", hd // 2))
+            iv = 1.0 / (base ** (
                 torch.arange(0, hd, 2, dtype=torch.float32, device=dev)
-                / hd))).contiguous()
+                / hd))
+            iv[n_ang:] = 0.0
+            self._vrecon_if = iv.contiguous()
+        if os.environ.get("GEMMA_DEBUG_RECON") == "1" and \
+                not getattr(self, "_dbg_printed", False):
+            self._dbg_printed = True
+            import sys
+            print(f"[VRECON-RET] impl={id(self)&0xffff:x} "
+                  f"k_eq_v={self.k_eq_v} on={self._vrecon_on} "
+                  f"numel={self._vrecon_if.numel() if self._vrecon_if is not None else -1} "
+                  f"inv_w={self._vrecon_inv_w:.4f} sw={self.sliding_window}",
+                  file=sys.stderr, flush=True)
         return self._vrecon_if, self._vrecon_inv_w
 
     def _maybe_select_tiles(

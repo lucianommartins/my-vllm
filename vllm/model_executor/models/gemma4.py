@@ -507,6 +507,10 @@ class Gemma4Attention(nn.Module):
             self.attn._gemma_k_norm_weight = self.k_norm.weight
             self.attn._gemma_rope_base = float(
                 rope_parameters.get("rope_theta", 1_000_000.0))
+            # proportional RoPE: only rope_angles pairs rotate; the rest
+            # are identity (zero-padded freqs). The recon must match.
+            self.attn._gemma_rope_angles = int(getattr(
+                self.rotary_emb, "rope_angles", self.head_dim // 2))
 
     def forward(
         self,
