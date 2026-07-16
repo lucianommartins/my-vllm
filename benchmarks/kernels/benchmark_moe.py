@@ -376,6 +376,11 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
         num_warps_range = [4, 8]
         group_m_range = [1, 16, 32, 64]
         num_stage_range = [2, 3, 4, 5]
+        if os.getenv("VLLM_MOE_TUNE_TRIM"):
+            # A100/SM80: BLOCK-256 tiles never win for narrow-N MoE and are the
+            # slow-to-compile configs that also trip a Triton MLIR pass bug.
+            block_m_range = [16, 32, 64, 128]
+            block_n_range = [32, 64, 128]
 
         param_ranges = {
             "BLOCK_SIZE_M": block_m_range,
@@ -650,6 +655,16 @@ class BenchmarkWorker:
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
                     continue
+                except Exception as e:
+                    # A candidate config can trigger a Triton compiler failure
+                    # (e.g. MLIR PassManager errors on SM80 for some tile shapes).
+                    # Skip it instead of aborting the whole multi-hour sweep.
+                    print(
+                        f"[tune] skip config (compile/bench failed) M={num_tokens} "
+                        f"{config}: {type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    continue
 
                 if kernel_time < best_time:
                     best_time = kernel_time
@@ -795,7 +810,11 @@ def get_model_params(config):
         topk = text_config.num_experts_per_tok
         intermediate_size = text_config.moe_intermediate_size
         hidden_size = text_config.hidden_size
-    elif architecture == "DiffusionGemmaForBlockDiffusion":
+    elif architecture in (
+        "DiffusionGemmaForBlockDiffusion",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
+    ):
         text_config = config.get_text_config()
         E = text_config.num_experts
         topk = text_config.top_k_experts
