@@ -15,6 +15,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.kv_cache_interface import GemmaGlobalV3Spec
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -53,15 +54,47 @@ def warmup_kernels(
     decode_block_deltas = [
         d - p for d, p in zip(decode_block_counts, prefill_block_counts)
     ]
-    max_blocks_per_req = sum(decode_block_counts)
+    is_gemma_group = [
+        isinstance(g.kv_cache_spec, GemmaGlobalV3Spec) for g in kv_cache_groups
+    ]
+    num_gemma_global_blocks = model_runner.kv_cache_config.num_gemma_global_blocks
+    if num_gemma_global_blocks is not None:
+        # Two pools with independent 0-based block-id spaces: bound requests
+        # by the tighter pool and draw ids from per-pool counters below.
+        main_blocks_per_req = sum(
+            c for c, g in zip(decode_block_counts, is_gemma_group) if not g
+        )
+        gemma_blocks_per_req = sum(
+            c for c, g in zip(decode_block_counts, is_gemma_group) if g
+        )
+        num_reqs = min(
+            model_runner.scheduler_config.max_num_seqs,
+            model_runner.scheduler_config.max_num_batched_tokens
+            // max(prompt_len, decode_query_len),
+            # Reserve each pool's block 0 (null block).
+            max(
+                1,
+                (model_runner.kv_cache_config.num_blocks - 1)
+                // max(main_blocks_per_req, 1),
+            ),
+            max(
+                1,
+                (num_gemma_global_blocks - 1) // max(gemma_blocks_per_req, 1),
+            ),
+        )
+    else:
+        max_blocks_per_req = sum(decode_block_counts)
 
-    num_reqs = min(
-        model_runner.scheduler_config.max_num_seqs,
-        model_runner.scheduler_config.max_num_batched_tokens
-        // max(prompt_len, decode_query_len),
-        # Reserve block 0 (null block) and ensure we have enough blocks.
-        max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
-    )
+        num_reqs = min(
+            model_runner.scheduler_config.max_num_seqs,
+            model_runner.scheduler_config.max_num_batched_tokens
+            // max(prompt_len, decode_query_len),
+            # Reserve block 0 (null block) and ensure we have enough blocks.
+            max(
+                1,
+                (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req,
+            ),
+        )
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
@@ -73,18 +106,24 @@ def warmup_kernels(
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
+    # Assign distinct block IDs per request per group. 0 null block, start
+    # from 1. Two-pool mode keeps a separate counter per pool: the id
+    # spaces are independent and the global pool may be the smaller one.
+    next_block_id_per_pool = [1, 1]
 
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    def _alloc_blocks(num_blocks: int, group_idx: int) -> list[int]:
+        pool = 1 if is_gemma_group[group_idx] else 0
+        start = next_block_id_per_pool[pool]
+        next_block_id_per_pool[pool] = start + num_blocks
+        return list(range(start, start + num_blocks))
 
     # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
     new_reqs = [
         NewRequestData.from_request(
             Request(req_ids[i], prompt_token_ids, sampling_params, pooling_params),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, gi) for gi, n in enumerate(prefill_block_counts)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -125,7 +164,11 @@ def warmup_kernels(
         cached_req_data.num_output_tokens = [1] * num_reqs
         new_block = any(decode_block_deltas)
         cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
+            tuple(
+                _alloc_blocks(n, gi) for gi, n in enumerate(decode_block_deltas)
+            )
+            if new_block
+            else None
             for _ in range(num_reqs)
         ]
 

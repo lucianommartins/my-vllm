@@ -268,6 +268,12 @@ class Scheduler(SchedulerInterface):
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
+            if self.kv_cache_manager.gemma_global_block_pool is not None:
+                raise NotImplementedError(
+                    "KV connectors are not supported with the GEMMA_CACHE_V3 "
+                    "two-pool KV cache (bind_gpu_block_pool exposes a single "
+                    "pool)."
+                )
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -295,7 +301,10 @@ class Scheduler(SchedulerInterface):
         self.processed_step_seq = 0
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
-        self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        # (fence, shared-pool blocks, gemma-global-pool blocks | None)
+        self.deferred_frees: deque[
+            tuple[int, list[KVCacheBlock], list[KVCacheBlock] | None]
+        ] = deque()
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -863,12 +872,15 @@ class Scheduler(SchedulerInterface):
                     )
 
                 reserved_blocks = 0
+                reserved_blocks_gemma = 0
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                    reserved_blocks, reserved_blocks_gemma = (
+                        self._inflight_prefill_reserved_blocks()
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -881,6 +893,7 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
+                    reserved_blocks_gemma=reserved_blocks_gemma,
                     has_scheduled_reqs=bool(self.running),
                 )
 
@@ -2085,9 +2098,18 @@ class Scheduler(SchedulerInterface):
         ):
             self.kv_cache_manager.free(request)
             return
+        if self.kv_cache_manager.gemma_global_block_pool is not None:
+            main_blocks, gemma_blocks = (
+                self.kv_cache_manager.pop_blocks_for_free_split(request)
+            )
+            if main_blocks or gemma_blocks:
+                self.deferred_frees.append(
+                    (self.sched_step_seq, main_blocks, gemma_blocks)
+                )
+            return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
-            self.deferred_frees.append((self.sched_step_seq, blocks))
+            self.deferred_frees.append((self.sched_step_seq, blocks, None))
 
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
@@ -2096,12 +2118,19 @@ class Scheduler(SchedulerInterface):
         stop at the first one that is still pending.
         """
         while self.deferred_frees:
-            fence, _ = self.deferred_frees[0]
+            fence = self.deferred_frees[0][0]
             if fence > self.processed_step_seq:
                 break
-            _, blocks = self.deferred_frees.popleft()
+            _, blocks, gemma_blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            if blocks:
+                self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            if gemma_blocks:
+                # Global-record blocks MUST return to their own pool; the
+                # pools' free lists are physically distinct.
+                self.kv_cache_manager.gemma_global_block_pool.free_blocks(
+                    reversed(gemma_blocks)
+                )
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -2327,10 +2356,13 @@ class Scheduler(SchedulerInterface):
 
         return self.connector.request_finished_all_groups(request, block_ids)
 
-    def _request_remaining_blocks(self, request: Request) -> int:
-        """Blocks `request` still needs to allocate to hold its full sequence."""
+    def _request_remaining_blocks(self, request: Request) -> tuple[int, int]:
+        """Blocks `request` still needs to hold its full sequence, as a
+        (shared_pool, gemma_global_pool) pair; the second element is 0 for
+        every model without the GEMMA_CACHE_V3 second pool."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
-        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        coordinator = self.kv_cache_manager.coordinator
+        kwargs = dict(
             request_id=request.request_id,
             num_tokens=full_num_tokens,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
@@ -2339,13 +2371,20 @@ class Scheduler(SchedulerInterface):
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
         )
+        if self.kv_cache_manager.gemma_global_block_pool is not None:
+            return coordinator.get_num_blocks_to_allocate_per_pool(**kwargs)
+        return coordinator.get_num_blocks_to_allocate(**kwargs), 0
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
-
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
-        )
+    def _inflight_prefill_reserved_blocks(self) -> tuple[int, int]:
+        """Blocks in-flight prefills still need (their reservation), per
+        pool: (shared, gemma_global)."""
+        main = 0
+        gemma = 0
+        for req in self._inflight_prefills:
+            m, g = self._request_remaining_blocks(req)
+            main += m
+            gemma += g
+        return main, gemma
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """

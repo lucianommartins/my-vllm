@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import math
 import threading
 import time
 from collections import defaultdict
@@ -146,6 +147,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
+    GemmaGlobalV3Spec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -7133,11 +7135,39 @@ class GPUModelRunner(
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
                     dtype = kv_cache_spec.dtype
-                    try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                    except (AttributeError, NotImplementedError):
+                    if isinstance(kv_cache_spec, GemmaGlobalV3Spec):
+                        # 640-channel single-plane record: 4-D natural
+                        # layout; the backend's stride order is for the
+                        # 5-D two-plane shape. Also verify the backend
+                        # shape and the spec page bytes agree — the two
+                        # are minted from the same env, but a divergence
+                        # here corrupts silently.
+                        expected = num_blocks * kv_cache_spec.page_size_bytes
+                        got = math.prod(kv_cache_shape) * get_dtype_size(dtype)
+                        assert got == expected, (
+                            f"GEMMA_CACHE_V3 shape/spec divergence for "
+                            f"{layer_name}: backend shape {kv_cache_shape} "
+                            f"({got} B) vs spec page bytes ({expected} B). "
+                            f"Check GEMMA_CACHE_V3 env vs minted spec."
+                        )
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                    else:
+                        try:
+                            kv_cache_stride_order = (
+                                attn_backend.get_kv_cache_stride_order()
+                            )
+                            assert len(kv_cache_stride_order) == len(
+                                kv_cache_shape
+                            ), (
+                                f"stride order {kv_cache_stride_order} vs "
+                                f"shape {kv_cache_shape} for {layer_name}; "
+                                f"if GEMMA_CACHE_V3=1, this layer minted a "
+                                f"plain spec (k_eq_v=false, e.g. E-series) "
+                                f"— the mode supports only k_eq_v gemma-4 "
+                                f"models"
+                            )
+                        except (AttributeError, NotImplementedError):
+                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                     # The allocation respects the backend-defined stride order
                     # to ensure the semantic remains consistent for each
                     # backend. We first obtain the generic kv cache shape and

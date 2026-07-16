@@ -16,6 +16,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
+    GemmaGlobalV3Spec,
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -241,12 +242,34 @@ def _reshape_kv_cache(
                     cache_dtype_str=cache_dtype,
                 )
 
-                # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
-                try:
-                    kv_cache_stride_order = group.backend.get_kv_cache_stride_order()
-                    assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                except (AttributeError, NotImplementedError):
+                if isinstance(kv_cache_spec, GemmaGlobalV3Spec):
+                    # 640-channel single-plane record: 4-D natural layout;
+                    # the backend stride order is for the 5-D two-plane
+                    # shape. Verify backend shape and spec page bytes agree
+                    # before viewing (divergence here corrupts silently).
+                    expected = num_blocks * kv_cache_spec.page_size_bytes
+                    got = prod(kv_cache_shape) * get_dtype_size(kv_cache_spec.dtype)
+                    assert got == expected, (
+                        f"GEMMA_CACHE_V3 shape/spec divergence for "
+                        f"{layer_name}: backend shape {kv_cache_shape} "
+                        f"({got} B) vs spec page bytes ({expected} B)."
+                    )
                     kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                else:
+                    # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
+                    try:
+                        kv_cache_stride_order = (
+                            group.backend.get_kv_cache_stride_order()
+                        )
+                        assert len(kv_cache_stride_order) == len(kv_cache_shape), (
+                            f"stride order {kv_cache_stride_order} vs shape "
+                            f"{kv_cache_shape} for {layer_name}; if "
+                            f"GEMMA_CACHE_V3=1, this model's layer minted a "
+                            f"plain spec (k_eq_v=false, e.g. E-series) — the "
+                            f"mode supports only k_eq_v gemma-4 models"
+                        )
+                    except (AttributeError, NotImplementedError):
+                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
 
                 kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
                 inv_order = [

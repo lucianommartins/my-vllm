@@ -926,6 +926,13 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    num_gemma_global_blocks: int | None = None
+    """Block count of the second (gemma-4 GEMMA_CACHE_V3 global-layer)
+    block pool. None everywhere except when a GemmaGlobalV3Spec group
+    exists; in that mode `num_blocks` means the sliding/shared pool only.
+    Sliding (block_size 16) and global-record (block_size 64, 81920 B)
+    pages have a non-integer byte ratio, so the pools are sized
+    independently."""
 
     @property
     def has_mamba_layers(self) -> bool:

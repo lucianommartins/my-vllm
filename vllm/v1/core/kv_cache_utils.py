@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    GemmaGlobalV3Spec,
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -902,6 +903,25 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if kv_cache_config.num_gemma_global_blocks is not None:
+        # Two-pool: concurrency is bounded by the tighter pool.
+        main_groups, gemma_groups = _split_gemma_v3_groups(
+            kv_cache_config.kv_cache_groups
+        )
+        concurrency = []
+        for groups, pool_blocks in (
+            (main_groups, kv_cache_config.num_blocks),
+            (gemma_groups, kv_cache_config.num_gemma_global_blocks),
+        ):
+            n_layer = max(len(g.layer_names) for g in groups)
+            per_request_bytes = n_layer * max_memory_usage_bytes(
+                vllm_config, (g.kv_cache_spec for g in groups)
+            )
+            per_block_bytes = groups[0].kv_cache_spec.page_size_bytes * n_layer
+            concurrency.append(
+                pool_blocks / cdiv(per_request_bytes, per_block_bytes)
+            )
+        return min(concurrency)
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -944,6 +964,13 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
+    main_groups, gemma_groups = _split_gemma_v3_groups(kv_cache_groups)
+    if gemma_groups and main_groups:
+        # num_gpu_blocks_override applies to BOTH pools; one override block
+        # costs the sum of the per-pool block byte rates.
+        return _pool_bytes_per_block(main_groups) + _pool_bytes_per_block(
+            gemma_groups
+        )
     group_size = max(len(g.layer_names) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
@@ -976,6 +1003,80 @@ def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     page_sizes = {layer.page_size_bytes for layer in kv_cache_specs}
     assert len(page_sizes) == 1
     return page_sizes.pop()
+
+
+def _split_gemma_v3_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[list[KVCacheGroupSpec], list[KVCacheGroupSpec]]:
+    """Partition groups into (shared/sliding-pool, gemma-v3 global-pool).
+
+    Gemma-4 GEMMA_CACHE_V3 mode stores global layers as 640-channel records
+    (GemmaGlobalV3Spec, block_size 64, 81920 B pages) whose byte size has a
+    non-integer ratio (6.4) to the sliding pages, so the two sides live in
+    independently sized block pools. Second list is empty for every other
+    model.
+    """
+    main = [
+        g
+        for g in kv_cache_groups
+        if not isinstance(g.kv_cache_spec, GemmaGlobalV3Spec)
+    ]
+    gemma = [
+        g for g in kv_cache_groups if isinstance(g.kv_cache_spec, GemmaGlobalV3Spec)
+    ]
+    return main, gemma
+
+
+def _gemma_v3_sliding_budget(
+    vllm_config: VllmConfig,
+    main_groups: list[KVCacheGroupSpec],
+    gemma_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> int:
+    """Byte budget for the sliding/shared pool under the two-pool split.
+
+    The sliding side is window-bounded: per group, worst-case live blocks
+    are max_seqs * (window_blocks + 2) for decode steady state plus one
+    in-flight chunk (max_num_batched_tokens / block_size) per step. Target
+    = 1.5x that aggregate bound (headroom for SWA prefix-cache retention).
+    When memory is plentiful the global pool — the axis whose demand grows
+    with context — gets the whole remainder; when the two targets together
+    exceed the budget, both scale down proportionally so neither pool
+    starves (concurrency degrades instead).
+    """
+    sched = vllm_config.scheduler_config
+    max_len = vllm_config.model_config.max_model_len
+    group_size = max(len(g.layer_names) for g in main_groups)
+    page = get_uniform_page_size([g.kv_cache_spec for g in main_groups])
+    live_blocks = 0
+    for g in main_groups:
+        spec = g.kv_cache_spec
+        window = getattr(spec, "sliding_window", None)
+        if window is None:
+            # Non-sliding layer in the shared pool: no window bound; fall
+            # back to full-context demand for this group.
+            live_blocks += sched.max_num_seqs * cdiv(max_len, spec.block_size)
+        else:
+            live_blocks += sched.max_num_seqs * (
+                cdiv(window, spec.block_size) + 2
+            ) + cdiv(sched.max_num_batched_tokens, spec.block_size)
+    sliding_target = int(1.5 * live_blocks) * page * group_size
+
+    gemma_group_size = max(len(g.layer_names) for g in gemma_groups)
+    gemma_page = get_uniform_page_size([g.kv_cache_spec for g in gemma_groups])
+    gemma_spec = gemma_groups[0].kv_cache_spec
+    gemma_target = (
+        sched.max_num_seqs
+        * cdiv(max_len, gemma_spec.block_size)
+        * gemma_page
+        * gemma_group_size
+    )
+
+    if sliding_target + gemma_target <= available_memory:
+        return sliding_target
+    return int(
+        available_memory * sliding_target / (sliding_target + gemma_target)
+    )
 
 
 def _get_kv_cache_groups_uniform_spec(
@@ -1308,6 +1409,107 @@ def get_kv_cache_config_from_groups(
         num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
             vllm_config, kv_cache_groups, available_memory
         )
+    elif any(
+        isinstance(group.kv_cache_spec, GemmaGlobalV3Spec)
+        for group in kv_cache_groups
+    ):
+        # Gemma-4 GEMMA_CACHE_V3 two-pool case: sliding and global-record
+        # pages cannot be unified (non-integer byte ratio), so size the two
+        # pools independently and never share a tensor across pools.
+        main_groups, gemma_groups = _split_gemma_v3_groups(kv_cache_groups)
+        if not (main_groups and gemma_groups):
+            raise ValueError(
+                "GEMMA_CACHE_V3 requires every worker/PP stage to hold both "
+                f"sliding and global layers; this stage has "
+                f"{len(main_groups)} sliding and {len(gemma_groups)} global "
+                "groups. Adjust the pipeline partition."
+            )
+        main_group_size = max(len(g.layer_names) for g in main_groups)
+        gemma_group_size = max(len(g.layer_names) for g in gemma_groups)
+        main_page = get_uniform_page_size(
+            [g.kv_cache_spec for g in main_groups]
+        )
+        gemma_page = get_uniform_page_size(
+            [g.kv_cache_spec for g in gemma_groups]
+        )
+
+        sliding_budget = _gemma_v3_sliding_budget(
+            vllm_config, main_groups, gemma_groups, available_memory
+        )
+        num_blocks = get_num_blocks(
+            vllm_config, main_group_size, sliding_budget, main_page
+        )
+        gemma_budget = max(
+            available_memory - num_blocks * main_page * main_group_size, 0
+        )
+        num_gemma_global_blocks = get_num_blocks(
+            vllm_config, gemma_group_size, gemma_budget, gemma_page
+        )
+
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            logger.warning_once(
+                "num_gpu_blocks_override=%d applies to BOTH GEMMA_CACHE_V3 "
+                "pools and skips the per-pool per-request floors; requests "
+                "may be rejected at runtime if a pool is too small.",
+                vllm_config.cache_config.num_gpu_blocks_override,
+            )
+        else:
+            # Per-pool per-request floors: fail loudly at startup instead
+            # of over-admitting one pool at runtime. Skipped under
+            # num_gpu_blocks_override (profiling sets tiny counts).
+            max_len = vllm_config.model_config.max_model_len
+            gemma_spec = gemma_groups[0].kv_cache_spec
+            need_gemma = cdiv(max_len, gemma_spec.block_size)
+            if num_gemma_global_blocks < need_gemma:
+                raise ValueError(
+                    f"GEMMA_CACHE_V3 global pool too small: "
+                    f"{num_gemma_global_blocks} blocks < {need_gemma} needed "
+                    f"for one max_model_len={max_len} request. Reduce "
+                    f"max_model_len or free GPU memory."
+                )
+            need_main = sum(
+                g.kv_cache_spec.max_admission_blocks_per_request(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    max_len,
+                )
+                if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+                else cdiv(max_len, g.kv_cache_spec.block_size)
+                for g in main_groups
+            )
+            if num_blocks < need_main:
+                raise ValueError(
+                    f"GEMMA_CACHE_V3 sliding pool too small: {num_blocks} "
+                    f"blocks < {need_main} needed for one request."
+                )
+
+        kv_cache_tensors = []
+        for i in range(main_group_size):
+            shared_by = [
+                g.layer_names[i]
+                for g in main_groups
+                if i < len(g.layer_names)
+            ]
+            kv_cache_tensors.append(
+                KVCacheTensor(size=main_page * num_blocks, shared_by=shared_by)
+            )
+        for i in range(gemma_group_size):
+            shared_by = [
+                g.layer_names[i]
+                for g in gemma_groups
+                if i < len(g.layer_names)
+            ]
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=gemma_page * num_gemma_global_blocks,
+                    shared_by=shared_by,
+                )
+            )
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            num_gemma_global_blocks=num_gemma_global_blocks,
+        )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1352,6 +1554,13 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     Args:
         kv_cache_spec: The kv cache spec of each attention layer in the model
     """
+    if any(isinstance(spec, GemmaGlobalV3Spec) for spec in kv_cache_spec.values()):
+        raise ValueError(
+            "GEMMA_CACHE_V3 two-pool mode is incompatible with "
+            "disable_hybrid_kv_cache_manager: the 81920-byte global-record "
+            "page cannot be unified with the sliding page. Unset one of the "
+            "two options."
+        )
 
     if is_kv_cache_spec_uniform(
         kv_cache_spec
@@ -1691,8 +1900,18 @@ def get_kv_cache_groups(
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    if any(isinstance(s, GemmaGlobalV3Spec) for s in filtered_spec.values()):
+        # Gemma-4 GEMMA_CACHE_V3: page sizes intentionally stay heterogeneous
+        # (non-integer 6.4 byte ratio); the two sides get independent block
+        # pools, sized in get_kv_cache_config_from_groups. Grouping itself is
+        # page-size independent.
+        assert not hidden_specs, (
+            "GEMMA_CACHE_V3 is incompatible with hidden-state cache layers"
+        )
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    else:
+        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
@@ -1714,6 +1933,10 @@ def generate_scheduler_kv_cache_config(
     """
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
+    )
+    assert all(
+        cfg.num_gemma_global_blocks == kv_cache_configs[0].num_gemma_global_blocks
+        for cfg in kv_cache_configs
     )
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
@@ -1789,6 +2012,13 @@ def _max_memory_usage_bytes_from_groups(
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
+
+    main_groups, gemma_groups = _split_gemma_v3_groups(kv_cache_groups)
+    if gemma_groups and main_groups:
+        # Two-pool: each side is uniform-page; sum the per-pool worst cases.
+        return _max_memory_usage_bytes_from_groups(
+            vllm_config, main_groups
+        ) + _max_memory_usage_bytes_from_groups(vllm_config, gemma_groups)
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -2067,14 +2297,46 @@ def get_kv_cache_configs(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
+    min_gemma_blocks = None
+    has_gemma = [
+        cfg.num_gemma_global_blocks is not None for cfg in kv_cache_configs
+    ]
+    assert all(has_gemma) or not any(has_gemma), (
+        "GEMMA_CACHE_V3 two-pool configs must be present on all workers or "
+        "none (mixed PP partition is unsupported)"
+    )
+    if kv_cache_configs and kv_cache_configs[0].num_gemma_global_blocks is not None:
+        min_gemma_blocks = min(
+            kv_cache_config.num_gemma_global_blocks
+            for kv_cache_config in kv_cache_configs
+        )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
+        gemma_blocks_old = kv_cache_config.num_gemma_global_blocks
+        gemma_layers: set[str] = set()
+        if min_gemma_blocks is not None:
+            kv_cache_config.num_gemma_global_blocks = min_gemma_blocks
+            gemma_layers = {
+                layer_name
+                for g in kv_cache_config.kv_cache_groups
+                if isinstance(g.kv_cache_spec, GemmaGlobalV3Spec)
+                for layer_name in g.layer_names
+            }
 
-        # Shrink tensor size proportionally
+        # Shrink tensor size proportionally (per pool: gemma-global tensors
+        # scale with THEIR pool's count, never the sliding ratio)
         for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            if (
+                min_gemma_blocks is not None
+                and tensor.shared_by
+                and tensor.shared_by[0] in gemma_layers
+            ):
+                assert tensor.size % gemma_blocks_old == 0
+                tensor.size = tensor.size // gemma_blocks_old * min_gemma_blocks
+            else:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

@@ -20,6 +20,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    GemmaGlobalV3Spec,
     KVCacheConfig,
     KVCacheSpec,
     SlidingWindowSpec,
@@ -94,6 +95,27 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
+        # Gemma-4 GEMMA_CACHE_V3: global-record groups live in their own
+        # pool (non-integer page-byte ratio to the sliding pool). None for
+        # every other model. Own (absent) metrics collector: block_metrics
+        # is keyed by bare block_id, which overlaps across pools.
+        self.gemma_global_block_pool: BlockPool | None = None
+        if any(
+            isinstance(g.kv_cache_spec, GemmaGlobalV3Spec)
+            for g in kv_cache_config.kv_cache_groups
+        ):
+            assert kv_cache_config.num_gemma_global_blocks is not None
+            assert not any(
+                type(g.kv_cache_spec) is FullAttentionSpec
+                for g in kv_cache_config.kv_cache_groups
+            ), "plain FullAttentionSpec group alongside GemmaGlobalV3Spec"
+            self.gemma_global_block_pool = BlockPool(
+                num_gpu_blocks=kv_cache_config.num_gemma_global_blocks,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=None,
+            )
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -108,7 +130,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self._pool_for_spec(kv_cache_group.kv_cache_spec),
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -125,6 +147,71 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+
+    def _pool_for_spec(self, spec: KVCacheSpec) -> BlockPool:
+        if self.gemma_global_block_pool is not None and isinstance(
+            spec, GemmaGlobalV3Spec
+        ):
+            return self.gemma_global_block_pool
+        return self.block_pool
+
+    def get_num_blocks_to_allocate_per_pool(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        num_encoder_tokens: int = 0,
+        apply_admission_cap: bool = False,
+    ) -> tuple[int, int]:
+        """Two-pool variant of `get_num_blocks_to_allocate`: returns
+        (shared_pool_blocks, gemma_global_pool_blocks). The pools' block
+        byte sizes differ non-integrally, so the two counts must each be
+        checked against their own pool's free count — never summed."""
+        main = 0
+        gemma = 0
+        for i, manager in enumerate(self.single_type_managers):
+            if isinstance(manager, CrossAttentionManager):
+                need = manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_encoder_tokens,
+                    [],
+                    0,
+                    num_encoder_tokens,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            else:
+                need = manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            if isinstance(manager.kv_cache_spec, GemmaGlobalV3Spec):
+                gemma += need
+            else:
+                main += need
+        return main, gemma
+
+    def pop_blocks_for_free_split(
+        self, request_id: str
+    ) -> tuple[list[KVCacheBlock], list[KVCacheBlock]]:
+        """Two-pool variant of `pop_blocks_for_free`: (shared, gemma_global)
+        block lists, each in allocation order. KVCacheBlock carries no pool
+        tag, so provenance must be captured here, per manager — freeing a
+        block into the wrong pool corrupts both free lists."""
+        main: list[KVCacheBlock] = []
+        gemma: list[KVCacheBlock] = []
+        for manager in self.single_type_managers:
+            popped = manager.pop_blocks_for_free(request_id)
+            if isinstance(manager.kv_cache_spec, GemmaGlobalV3Spec):
+                gemma.extend(popped)
+            else:
+                main.extend(popped)
+        return main, gemma
 
     def get_num_blocks_to_allocate(
         self,
@@ -477,7 +564,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
-            block_pool=self.block_pool,
+            block_pool=self._pool_for_spec(self.kv_cache_spec),
             kv_cache_spec=self.kv_cache_spec,
             drop_eagle_block=0 in self.eagle_group_ids,
             alignment_tokens=self.block_size,
@@ -692,7 +779,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=self._pool_for_spec(spec),
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.scheduler_block_size,
@@ -757,7 +844,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 block_hashes=_get_block_hashes(spec),
                 max_length=max_cache_hit_length,
                 kv_cache_group_ids=group_ids,
-                block_pool=self.block_pool,
+                block_pool=self._pool_for_spec(spec),
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self.scheduler_block_size,

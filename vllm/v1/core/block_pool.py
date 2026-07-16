@@ -458,6 +458,12 @@ class BlockPool:
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
 
+    def can_reset_prefix_cache(self) -> bool:
+        """Whether `reset_prefix_cache` would succeed right now (only the
+        null block in use). Read-only; lets multi-pool callers verify every
+        pool before mutating any of them."""
+        return self.num_gpu_blocks - self.get_num_free_blocks() == 1
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalid prefix caching after the weights are updated,
