@@ -76,6 +76,7 @@ struct FmhaMainloopTmaWarpSpecialized {
   // the producer skips V loads, and the pipeline uses ONE slot per k-tile
   // (2x tile depth at the same smem). Split-D consumer (compute_ncoop) only.
   static constexpr bool kKEqV = find_option_t<Tag::kKEqV, false_type, Options...>::value;
+  static constexpr bool kOverlapSoftmax = find_option_t<Tag::kOverlapSoftmax, false_type, Options...>::value;
 
   static constexpr int NumLoadWarpGroups = 1;
   static constexpr int NumMmaWarpGroups = find_option_t<Tag::kNumMmaWarpGroups, Int<2>, Options...>::value;
@@ -1035,6 +1036,187 @@ struct FmhaMainloopTmaWarpSpecialized {
 
     Tensor lse = softmax.tail(softmax_state, acc_pv, tiled_mma_pv);
 
+    return make_tuple(acc_pv, lse);
+  }
+
+  // ===== FA4-skew overlapped mainloop (kOverlapSoftmax; SESSION_31) =====
+  // Iteration t issues QK(t+1) and PV(t) back-to-back UNWAITED, retires
+  // only QK(t+1) via wait<1> (in-order: it is the older group), runs
+  // softmax(t+1) while PV(t) is still on the tensor cores, then drains
+  // PV(t) and only THEN converts S(t+1) into the single persistent P.
+  // The O rescale for scale(t+1) is banked and applied at the NEXT
+  // iteration's top, hidden under the QK(t+2) shadow (PV(t) retired).
+  // Slots: K(t) released at iteration top (its QK retired last iter);
+  // V(t) after wait<0> — both at-or-later than baseline points, ring
+  // order preserved via the sequential release cursor.
+  template<class BlkCoord, class ProblemShape, class MainloopPipelineReducer, class PipelineStateReducer, class MathWgOrderBarrier>
+  CUTLASS_DEVICE auto
+  compute_olap(
+      BlkCoord const& blk_coord, BlkCoord const& wg_coord,
+      Params const& params, ProblemShape const& problem_size,
+      MainloopPipeline& pipeline, PipelineState& smem_pipe_read,
+      MainloopPipelineQ& pipeline_q, PipelineStateQ& smem_pipe_read_q,
+      MainloopPipelineReducer&, PipelineStateReducer&,
+      SharedStorage& storage,
+      MathWgOrderBarrier& math_wg_order_barrier)
+  {
+    int thread_idx = int(threadIdx.x);
+
+    PipelineState smem_pipe_release = smem_pipe_read;
+    PipelineStateQ smem_pipe_release_q = smem_pipe_read_q;
+
+    TiledMmaQK tiled_mma_qk;
+    auto thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+    Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+    Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
+    Tensor tSsQ = thr_mma_qk.partition_A(sQ);
+    Tensor tSsK = thr_mma_qk.partition_B(sK);
+    Tensor tSrQ = thr_mma_qk.make_fragment_A(tSsQ);
+    Tensor tSrK = thr_mma_qk.make_fragment_B(tSsK);
+
+    TiledMmaPV tiled_mma_pv;
+    auto thr_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
+    Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
+    Tensor tOsV = thr_mma_pv.partition_B(sV);
+    Tensor tOrV = thr_mma_pv.make_fragment_B(tOsV);
+
+    const int n_total =
+        Fusion{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_size) +
+        Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    const int trip0 =
+        Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
+
+    pipeline_q.consumer_wait(smem_pipe_read_q);
+
+    Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{}));
+    Tensor tPcP = thr_mma_qk.partition_C(cP);
+    int m_block = get<0>(wg_coord);
+    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{})
+                              + E<1>{} * (trip0 * get<1>(TileShapeQK{}));
+
+    Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
+    cutlass::fmha::collective::CollectiveSoftmax<ElementAccumulatorQK, Fusion, decltype(params)> softmax{params};
+    auto softmax_state = softmax.init(acc_pv, tiled_mma_pv);
+
+    // K/V ring cursors: K at even data positions, V at odd. Independent
+    // per-slot mbarriers make the K(t+1)-before-V(t) wait order legal
+    // (StageCount 5 >= 3); releases stay strictly ring-ordered.
+    PipelineState pipe_k = smem_pipe_read;
+    PipelineState pipe_v = smem_pipe_read;
+    ++pipe_v;
+
+    // ---- Prologue (FA4 first_half_block): QK(0) + softmax(0) + P(0).
+    Tensor acc_s = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
+    pipeline.consumer_wait(pipe_k);
+    math_wg_order_barrier.wait();
+    warpgroup_fence_operand(acc_s);
+    warpgroup_arrive();
+    gemm_zero_acc(tiled_mma_qk, tSrQ(_,_,_,smem_pipe_read_q.index()),
+                  tSrK(_,_,_,pipe_k.index()), acc_s);
+    warpgroup_commit_batch();
+    math_wg_order_barrier.arrive();
+    ++pipe_k; ++pipe_k;
+    warpgroup_wait<0>();
+    warpgroup_fence_operand(acc_s);
+
+    auto banked_scale = softmax.step_scale(acc_s, tiled_mma_qk, tPcP,
+                                           softmax_state, problem_size,
+                                           /*needs_mask=*/true);
+    // Persistent P: allocate once with the operand layout; convert into
+    // it via an acc-layout view (mirrors make_acc_into_op).
+    Tensor tOrP = make_fragment_like<Element>(
+        convert_c_layout_to_a_layout(acc_s.layout(),
+                                     shape<1>(typename TiledMmaPV::LayoutA_TV{})));
+    Tensor tOrP_as_acc = make_tensor(tOrP.data(), acc_s.layout());
+    cute::copy(acc_s, tOrP_as_acc);
+
+    // ---- Steady loop: iteration t handles PV(t) + softmax(t+1).
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int t = 0; t < n_total - 1; t++) {
+      // QK(t+1), unwaited
+      pipeline.consumer_wait(pipe_k);
+      warpgroup_fence_operand(acc_s);
+      warpgroup_arrive();
+      gemm_zero_acc(tiled_mma_qk, tSrQ(_,_,_,smem_pipe_read_q.index()),
+                    tSrK(_,_,_,pipe_k.index()), acc_s);
+      warpgroup_commit_batch();
+      ++pipe_k; ++pipe_k;
+
+      // Deferred O rescale for scale(t) — under the QK(t+1) shadow;
+      // PV(t-1) retired at iteration t-1's wait<0>. t==0: PV starts
+      // zero-accumulated, no rescale.
+      if (t > 0) {
+        warpgroup_fence_operand(acc_pv);
+        softmax.apply_rescale(banked_scale, acc_pv, tiled_mma_pv);
+      }
+
+      // K(t) slot release (its QK retired before this iteration).
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+
+      // PV(t), unwaited (A = persistent P(t))
+      pipeline.consumer_wait(pipe_v);
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_fence_operand(tOrP);
+      warpgroup_arrive();
+      if (t == 0) {
+        gemm_zero_acc(tiled_mma_pv, tOrP, tOrV(_,_,_,pipe_v.index()), acc_pv);
+      } else {
+        cute::gemm(tiled_mma_pv, tOrP, tOrV(_,_,_,pipe_v.index()), acc_pv);
+      }
+      warpgroup_commit_batch();
+
+      // Retire QK(t+1) (older group); PV(t) stays on the tensor cores.
+      warpgroup_wait<1>();
+      warpgroup_fence_operand(acc_s);
+
+      // softmax(t+1) — THE OVERLAP WINDOW (PV(t) in flight; S only).
+      tPcP.data() = tPcP.data() + E<1>{} * get<1>(TileShapeQK{});
+      banked_scale = softmax.step_scale(
+          acc_s, tiled_mma_qk, tPcP, softmax_state, problem_size,
+          Fusion{}.tile_needs_mask(t + 1, blk_coord, TileShape{},
+                                   problem_size));
+
+      // Drain PV(t); then V(t) release and the P overwrite are safe.
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_fence_operand(tOrP);
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      ++pipe_v; ++pipe_v;
+
+      cute::copy(acc_s, tOrP_as_acc);   // P(t+1), PV(t) retired
+    }
+
+    // ---- Epilogue (FA4 last_half_block): final PV only.
+    {
+      const int t = n_total - 1;
+      if (t > 0) {
+        warpgroup_fence_operand(acc_pv);
+        softmax.apply_rescale(banked_scale, acc_pv, tiled_mma_pv);
+      }
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      pipeline.consumer_wait(pipe_v);
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_fence_operand(tOrP);
+      warpgroup_arrive();
+      if (t == 0) {
+        gemm_zero_acc(tiled_mma_pv, tOrP, tOrV(_,_,_,pipe_v.index()), acc_pv);
+      } else {
+        cute::gemm(tiled_mma_pv, tOrP, tOrV(_,_,_,pipe_v.index()), acc_pv);
+      }
+      warpgroup_commit_batch();
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_pv);
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      ++pipe_v; ++pipe_v;
+    }
+
+    if (kIsPersistent) pipeline_q.consumer_release(smem_pipe_release_q);
+    if (kIsPersistent) pipeline.consumer_release(smem_pipe_release);
+    ++smem_pipe_release;
+
+    smem_pipe_read = pipe_k;
+
+    Tensor lse = softmax.tail(softmax_state, acc_pv, tiled_mma_pv);
     return make_tuple(acc_pv, lse);
   }
 

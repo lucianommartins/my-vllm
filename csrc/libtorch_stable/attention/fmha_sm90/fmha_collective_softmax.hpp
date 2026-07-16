@@ -297,6 +297,80 @@ struct CollectiveSoftmax {
   }
 
 
+  // ===== Split softmax (FA4-skew overlap support) =====
+  // step_scale: masking + row-max + exp + a_sum update on S ONLY — never
+  // touches the O accumulator, so it can run while the previous PV is
+  // still in flight. Returns the per-row O-rescale factors to be applied
+  // later (under the next QK shadow) via apply_rescale.
+  template<class AccQK, class TiledMmaQK, class CountQK, class State, class ProblemShape>
+  CUTLASS_DEVICE auto step_scale(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk,
+                                 CountQK const& count_qk, State& state,
+                                 ProblemShape const& problem_shape,
+                                 bool needs_mask = true) {
+    if (needs_mask) {
+      Fusion{}.before_softmax(acc_qk, count_qk, problem_shape);
+      apply_mm_prefix_override(acc_qk, count_qk);
+    }
+
+    Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
+    auto reduction_target_qk = reduction_target_n(tiled_mma_qk);
+    constexpr int red_rank = decltype(rank(reduction_target_qk))::value;
+
+    auto& s_max = get<0>(state);
+    auto& a_sum = get<1>(state);
+
+    Tensor scale_pv_frag = make_fragment_like<SumType>(s_max);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<0>(acc_qk_mn); i++) {
+      MaxType s_max_prev = s_max(i);
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < size<1>(acc_qk_mn); j++) {
+        s_max(i) = overload_max(s_max(i), acc_qk_mn(i, j));
+      }
+      for_each(make_seq<red_rank>{}, [&](auto r) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 1; j < shape<r>(reduction_target_qk); j *= 2) {
+          s_max(i) = overload_max(s_max(i), MaxType{__shfl_xor_sync(uint32_t(-1), overload_to_native(s_max(i)), stride<r>(reduction_target_qk) * j)});
+        }
+      });
+
+      MaxType local_max = s_max(i) == static_cast<MaxType>(-INFINITY) ? static_cast<MaxType>(0) : s_max(i);
+      MaxType scale = static_cast<MaxType>(params.scale_softmax_log2);
+      MaxType scale_max = scale * local_max;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < size<1>(acc_qk_mn); j++) {
+        acc_qk_mn(i, j) = overload_exp2(scale * acc_qk_mn(i, j) - scale_max);
+      }
+
+      SumType scale_pv = (s_max_prev == static_cast<MaxType>(-INFINITY))
+          ? SumType(0)
+          : overload_exp2((s_max_prev - local_max) * scale);
+      scale_pv_frag(i) = scale_pv;
+      a_sum(i) *= scale_pv;
+      a_sum(i) += SumType{reduce(acc_qk_mn(i, _), cute::plus{})};
+    }
+    return scale_pv_frag;
+  }
+
+  // apply_rescale: the deferred O-accumulator rescale. Caller guarantees
+  // the PV that accumulates rows for these scales has RETIRED.
+  template<class ScaleFrag, class AccPV, class TiledMmaPV>
+  CUTLASS_DEVICE void apply_rescale(ScaleFrag const& scale_pv_frag,
+                                    AccPV& acc_pv,
+                                    TiledMmaPV const& tiled_mma_pv) {
+    Tensor acc_pv_mn = make_tensor(acc_pv.data(), layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
+    using ElementPV = typename AccPV::value_type;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<0>(acc_pv_mn); i++) {
+      ElementPV sc = static_cast<ElementPV>(scale_pv_frag(i));
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < size<1>(acc_pv_mn); j++) {
+        acc_pv_mn(i, j) *= sc;
+      }
+    }
+  }
+
   template<class State, class AccPV, class TiledMmaPV>
   CUTLASS_DEVICE auto tail(State& state, AccPV& acc_pv, TiledMmaPV const& tiled_mma_pv) {
     auto& s_max = get<0>(state);

@@ -214,9 +214,10 @@ static bool g_v_fill_tma = false;   // GEMMA_V_FILL=2: producer-TMA overwrite
 static const cutlass::bfloat16_t* g_v_fill_pool = nullptr;
 static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0;
 
-template <int HeadDim, bool KEqV = false>
+template <int HeadDim, bool KEqV = false, bool Overlap = false>
 struct FmhaCachedLauncher {
-  using FmhaTypes = vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV>;
+  using FmhaTypes =
+      vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV, Overlap>;
   using Kernel = typename FmhaTypes::Kernel;
   using FmhaOp = cutlass::device::Universal<Kernel>;
 
@@ -437,6 +438,25 @@ static bool launch_fmha_batched(
     const int* varlen_cu_q = nullptr,
     const int* varlen_q_offsets = nullptr,
     const int* varlen_kv_lo = nullptr) {
+  // FA4-skew overlapped mainloop (hd256 cooperative; SESSION_31/32).
+  // Correct on all suites but currently ~17% SLOWER than baseline —
+  // OPT-IN (GEMMA_PREFILL_OVERLAP=1) pending the pipeline diagnosis.
+  static const bool olap_env = []() {
+    const char* e = getenv("GEMMA_PREFILL_OVERLAP");
+    return e != nullptr && e[0] == '1';
+  }();
+  if constexpr (HeadDim == 256) {
+    if (olap_env) {
+      static FmhaCachedLauncher<HeadDim, KEqV, true> olauncher;
+      return olauncher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+                              num_q_heads, gqa_group, num_seqs, seq_q,
+                              seq_k, q_offset, q_stride, scale,
+                              sliding_window, mm_ranges_ptr, max_mm_ranges,
+                              device_id, sm_count, stream, paged,
+                              varlen_seq_lens, varlen_cu_q,
+                              varlen_q_offsets, varlen_kv_lo);
+    }
+  }
   static FmhaCachedLauncher<HeadDim, KEqV> launcher;
   return launcher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, num_q_heads,
                          gqa_group, num_seqs, seq_q, seq_k, q_offset,

@@ -467,6 +467,15 @@ struct FmhaKernelTmaWarpSpecialized {
                 pipeline_reducer, smem_pipe_write_reducer,
                 storage.tensors.mainloop,
                 math_wg_order_barrier);
+            } else if constexpr (CollectiveMainloop::kOverlapSoftmax) {
+              return collective_mainloop.compute_olap(
+                blk_coord, wg_coord,
+                params.mainloop, problem_size,
+                pipeline_inner, smem_pipe_read_inner,
+                pipeline_outer, smem_pipe_read_outer,
+                pipeline_reducer, smem_pipe_write_reducer,
+                storage.tensors.mainloop,
+                math_wg_order_barrier);
             } else {
               return collective_mainloop.compute(
                 blk_coord, wg_coord,
