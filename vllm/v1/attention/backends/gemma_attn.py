@@ -133,6 +133,9 @@ class GemmaAttentionMetadata:
     # D2H + stream sync in the SM90 launcher.
     seq_lens_cpu: torch.Tensor | None = None
     query_start_loc_cpu: torch.Tensor | None = None
+    # Token positions (persistent runner buffer slice). Needed by the
+    # GEMMA_CACHE_V3 record writer (rope strip is computed at write time).
+    positions: torch.Tensor | None = None
     # Multi-query extend steps (MTP/spec-decode verify, tiny extends):
     # (expanded_block_table, virtual_seq_lens, max_seq_len) — one batched
     # paged decode over per-token virtual sequences, precomputed once per
@@ -283,6 +286,7 @@ class GemmaAttentionMetadataBuilder(
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            positions=common_attn_metadata.positions,
             min_seq_len=min_seq_len,
             # seq_lens_cpu is a LAZY property that syncs GPU->CPU; touch it
             # only on prefill-shaped steps (the only consumer). Fetching it
@@ -398,6 +402,62 @@ class GemmaAttentionBackend(AttentionBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability >= DeviceCapability(8, 0)
+
+
+_V3_DEV_READER = os.environ.get("GEMMA_V3_DEV_READER") == "1"
+_V3_DEV_SCRATCH: dict = {}
+_V3_UNROT: torch.Tensor | None = None
+_V3_VPERM: torch.Tensor | None = None
+
+
+def _v3_dev_reconstruct(
+    record_pool: torch.Tensor, layer: torch.nn.Module
+) -> torch.Tensor:
+    """Rebuild the legacy (blocks, 2, page, kvh, 512) planes from the
+    640-record pool. K = w * [strip -> rotated cols, V -> unrotated cols];
+    V = inverse-Vperm scatter. Contract: record = [Vperm(512)|strip(128)],
+    Vperm = [V{64..256}|V{320..512}|V{0..64}|V{256..320}]."""
+    if not _V3_DEV_READER:
+        raise NotImplementedError(
+            "GEMMA_CACHE_V3 reader not migrated yet; set "
+            "GEMMA_V3_DEV_READER=1 for the slow correct-function dev "
+            "reader (boot/smoke only)."
+        )
+    global _V3_UNROT, _V3_VPERM
+    dev = record_pool.device
+    if _V3_UNROT is None or _V3_UNROT.device != dev:
+        unrot = list(range(64, 256)) + list(range(320, 512))
+        _V3_UNROT = torch.tensor(unrot, device=dev)
+        _V3_VPERM = torch.tensor(
+            unrot + list(range(0, 64)) + list(range(256, 320)), device=dev
+        )
+    blocks, page, kvh, rec_ch = record_pool.shape
+    assert rec_ch == 640
+    key = (dev, blocks, page, kvh)
+    scratch = _V3_DEV_SCRATCH.get(key)
+    if scratch is None:
+        scratch_bytes = blocks * 2 * page * kvh * 512 * 2
+        assert scratch_bytes < 8 << 30, (
+            f"v3 dev-reader scratch would be {scratch_bytes >> 30} GiB; "
+            f"cap the KV pool (small kv_cache_memory_bytes) for dev runs"
+        )
+        scratch = torch.empty(
+            blocks, 2, page, kvh, 512,
+            dtype=record_pool.dtype, device=dev,
+        )
+        _V3_DEV_SCRATCH[key] = scratch
+    w_vec = getattr(layer, "_gemma_k_norm_weight", None)
+    assert w_vec is not None
+    w = w_vec[0]
+    k_plane, v_plane = scratch.unbind(1)
+    rec = record_pool
+    # V: natural[VPERM[i]] = rec[i]
+    v_plane[..., _V3_VPERM] = rec[..., :512]
+    # K: unrotated channels = w * V; rotated pairs = w * strip
+    k_plane[..., _V3_UNROT] = w * rec[..., 0:384]
+    k_plane[..., 0:64] = w * rec[..., 512:576]
+    k_plane[..., 256:320] = w * rec[..., 576:640]
+    return scratch
 
 
 class GemmaAttentionImpl(AttentionImpl):
@@ -537,6 +597,14 @@ class GemmaAttentionImpl(AttentionImpl):
             return output.fill_(0)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        if _CACHE_V3 and kv_cache.dim() == 4:
+            # DEV READER (GEMMA_V3_DEV_READER=1): reconstruct the legacy
+            # two-plane K/V from the 640-record into a shared scratch and
+            # run the existing kernels. Correct function, pool-sized
+            # gather per layer per step — boot/smoke only. The real
+            # reader (column-range views in-kernel) replaces this.
+            kv_cache = _v3_dev_reconstruct(kv_cache, layer)
 
         key_cache, value_cache = kv_cache.unbind(1)
         if is_quantized_kv_cache(self.kv_cache_dtype):
@@ -1047,6 +1115,69 @@ class GemmaAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        if _CACHE_V3 and kv_cache.dim() == 4:
+            # 640-channel record pool: write [Vperm(512)|rope-strip(128)]
+            # from V + positions only — K is never stored (K == w*rope(V),
+            # w folded into the softmax scale by the reader).
+            from vllm.forward_context import get_forward_context
+            from vllm.v1.attention.ops.gemma_record640 import (
+                write_record640,
+            )
+
+            meta = get_forward_context().attn_metadata
+            if meta is None:
+                # Memory-profiling dummy forward: no metadata, nothing
+                # real to cache (mirrors forward()'s early-out).
+                return
+            if isinstance(meta, dict):
+                meta = meta[layer.layer_name]
+            assert meta.positions is not None, (
+                "GEMMA_CACHE_V3 writer needs positions in the attention "
+                "metadata (runner did not populate "
+                "CommonAttentionMetadata.positions)"
+            )
+            cs_cache = getattr(layer, "_gemma_cos_sin_cache", None)
+            assert cs_cache is not None, (
+                "GEMMA_CACHE_V3 writer needs the engine rope table "
+                "(gemma4.py sets attn._gemma_cos_sin_cache for k_eq_v "
+                "layers)"
+            )
+            num_tokens = slot_mapping.shape[0]
+            v_view = value[:num_tokens].view(num_tokens, self.num_kv_heads, 512)
+            write_record640(
+                v_view,
+                meta.positions[:num_tokens],
+                slot_mapping,
+                kv_cache,
+                cs_cache,
+            )
+            if os.environ.get("GEMMA_V3_DEBUG") == "1" and num_tokens > 4:
+                pos = meta.positions[:num_tokens]
+                blocks, page = kv_cache.shape[0], kv_cache.shape[1]
+                flat = kv_cache.view(blocks * page, self.num_kv_heads, 640)
+                ok_slots = slot_mapping >= 0
+                sl = slot_mapping[ok_slots]
+                got = flat[sl]
+                vv = v_view[ok_slots].float()
+                pp = pos[ok_slots]
+                c = cs_cache[pp, :64].float()[:, None, :]
+                sn = cs_cache[pp, 256:320].float()[:, None, :]
+                lo = c * vv[:, :, 0:64] - sn * vv[:, :, 256:320]
+                hi = sn * vv[:, :, 0:64] + c * vv[:, :, 256:320]
+                unrot = torch.cat([vv[:, :, 64:256], vv[:, :, 320:512],
+                                   vv[:, :, 0:64], vv[:, :, 256:320]], -1)
+                ref = torch.cat([unrot, lo, hi], -1).to(kv_cache.dtype)
+                err = (got.float() - ref.float()).abs().max().item()
+                k_dbg = getattr(self, "_v3_dbg_layers", 0)
+                if k_dbg < 3:
+                    self._v3_dbg_layers = k_dbg + 1
+                    print(f"[V3DBG] layer={layer.layer_name} T={num_tokens} "
+                          f"kvh={self.num_kv_heads} vshape={tuple(value.shape)} "
+                          f"pos[:4]={pp[:4].tolist()} "
+                          f"slot[:4]={sl[:4].tolist()} rec_err={err:.5f}",
+                          flush=True)
+            return
+
         key_cache, value_cache = kv_cache.unbind(1)
         if is_quantized_kv_cache(self.kv_cache_dtype):
             from vllm.platforms import current_platform

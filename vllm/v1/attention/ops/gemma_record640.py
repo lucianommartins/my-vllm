@@ -89,7 +89,9 @@ def write_record640(
 ) -> None:
     num_tokens, kvh, hd = v.shape
     assert hd == _HD and pool.shape[-1] == _REC
-    assert cos_sin_cache.dtype == torch.float32
+    assert cos_sin_cache.dtype in (
+        torch.float32, torch.bfloat16, torch.float16,
+    ), cos_sin_cache.dtype
     blocks, page = pool.shape[0], pool.shape[1]
     pool_flat = pool.view(blocks * page, kvh, _REC)
     grid = (num_tokens, kvh)

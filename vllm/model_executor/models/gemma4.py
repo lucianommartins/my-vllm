@@ -511,6 +511,9 @@ class Gemma4Attention(nn.Module):
             # are identity (zero-padded freqs). The recon must match.
             self.attn._gemma_rope_angles = int(getattr(
                 self.rotary_emb, "rope_angles", self.head_dim // 2))
+            # GEMMA_CACHE_V3 record writer: the strip must use the SAME
+            # cos/sin table the engine ropes Q with (bit-consistency).
+            self.attn._gemma_cos_sin_cache = self.rotary_emb.cos_sin_cache
 
     def forward(
         self,
