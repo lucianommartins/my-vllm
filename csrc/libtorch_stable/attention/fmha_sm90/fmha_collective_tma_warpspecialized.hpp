@@ -277,6 +277,11 @@ struct FmhaMainloopTmaWarpSpecialized {
   static constexpr int kNumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
   static constexpr uint32_t kBarrierPFull = 10;
   static constexpr uint32_t kBarrierPEmpty = 11;
+  // Sym ping-pong turn barriers (GEMMA_PINGPONG=1, tokamax recipe):
+  // A = "WG0's QK issued, WG1 may QK"; B = the reverse. IDs 8/9 are the
+  // first free user barriers (cutlass reserves 1-7; P-protocol has 10/11).
+  static constexpr uint32_t kBarPingA = 8;
+  static constexpr uint32_t kBarPingB = 9;
 
   using TileShapeOut = TileShapePV;
   using TiledMmaOut = TiledMmaPV;
@@ -320,6 +325,12 @@ struct FmhaMainloopTmaWarpSpecialized {
     int pool_num_kv_heads = 0;
     int pool_page_size = 16;   // 16 (page-sliced) or 64 (whole-tile)
     bool kv_pool_record640 = false;  // GEMMA_CACHE_V3 640-record pool
+    // Lazy O-rescale (GEMMA_LAZY=1): skip the identity acc_pv multiply
+    // when the running softmax max is unchanged (bit-exact).
+    bool lazy_rescale = false;
+    // Sym QK ping-pong skew (GEMMA_PINGPONG=1): stagger the two symmetric
+    // consumers so one WG's QK wgmma overlaps the other's softmax.
+    bool pingpong = false;
   };
 
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -508,6 +519,11 @@ struct FmhaMainloopTmaWarpSpecialized {
     // V via the fill path (rotor columns only — the unrot columns of the
     // K tile already hold natural-position V values).
     bool record640 = false;
+    // Lazy O-rescale (GEMMA_LAZY=1): skip the identity acc_pv multiply
+    // when the running softmax max is unchanged (bit-exact).
+    bool lazy_rescale = false;
+    // Sym QK ping-pong skew (GEMMA_PINGPONG=1).
+    bool pingpong = false;
     TMA_KRec64 tma_load_k_rec_s0 = {};
     TMA_KRec192 tma_load_k_rec_u0 = {};
     TMA_KRec64 tma_load_k_rec_s1 = {};
@@ -868,6 +884,8 @@ struct FmhaMainloopTmaWarpSpecialized {
         1                        // contig_gqa_group (set by prefill launcher)
     };
     p.record640 = args.kv_pool_record640;
+    p.lazy_rescale = args.lazy_rescale;
+    p.pingpong = args.pingpong;
     p.tma_load_k_rec_s0 = tma_k_rec_s0;
     p.tma_load_k_rec_u0 = tma_k_rec_u0;
     p.tma_load_k_rec_s1 = tma_k_rec_s1;
@@ -2861,11 +2879,20 @@ struct FmhaMainloopTmaWarpSpecialized {
       Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
 
       pipeline.consumer_wait(smem_pipe_read);
+      // Ping-pong initial skew: WG1 defers its first QK until WG0's is
+      // issued — from here on one WG's wgmma overlaps the other's softmax.
+      if (params.pingpong && pv_wg_idx == 1)
+        cutlass::arch::NamedBarrier::sync(
+            2 * cutlass::NumThreadsPerWarpGroup, kBarPingA);
       warpgroup_fence_operand(acc_qk);
       warpgroup_arrive();
       gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
                     tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
       warpgroup_commit_batch();
+      if (params.pingpong)
+        cutlass::arch::NamedBarrier::arrive(
+            2 * cutlass::NumThreadsPerWarpGroup,
+            pv_wg_idx == 0 ? kBarPingA : kBarPingB);
       if constexpr (!kKEqV) ++smem_pipe_read;
 
       warpgroup_wait<0>();
@@ -2903,11 +2930,20 @@ struct FmhaMainloopTmaWarpSpecialized {
       Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
 
       pipeline.consumer_wait(smem_pipe_read);
+      // Ping-pong turn: wait for the other WG's QK to issue before ours.
+      if (params.pingpong)
+        cutlass::arch::NamedBarrier::sync(
+            2 * cutlass::NumThreadsPerWarpGroup,
+            pv_wg_idx == 0 ? kBarPingB : kBarPingA);
       warpgroup_fence_operand(acc_qk);
       warpgroup_arrive();
       gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
                     tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
       warpgroup_commit_batch();
+      if (params.pingpong)
+        cutlass::arch::NamedBarrier::arrive(
+            2 * cutlass::NumThreadsPerWarpGroup,
+            pv_wg_idx == 0 ? kBarPingA : kBarPingB);
       if constexpr (!kKEqV) ++smem_pipe_read;
       auto tok = pipeline.consumer_try_wait(smem_pipe_read);
 

@@ -154,6 +154,9 @@ struct FmhaMainloopTma {
     int max_mm_ranges;
     const Element* ptr_V;
     LayoutV dV;
+    // Field parity with the warp-specialized Params so the shared
+    // CollectiveSoftmax::step() compiles; never enabled on this path.
+    bool lazy_rescale = false;
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<

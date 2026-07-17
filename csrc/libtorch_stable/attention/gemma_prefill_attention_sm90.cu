@@ -212,6 +212,11 @@ static float g_recon_inv_w = 1.f;
 // Supersedes the recon transform for prefill when both are enabled.
 static bool g_v_fill = false;
 static bool g_v_fill_tma = false;   // GEMMA_V_FILL=2: producer-TMA overwrite
+// GEMMA_LAZY=1: skip the identity O-rescale when the softmax max is
+// unchanged (bit-exact warp-vote; tokamax recipe, S68).
+static bool g_lazy_rescale = false;
+// GEMMA_PINGPONG=1: sym-consumer QK turn barriers (tokamax skew).
+static bool g_pingpong = false;
 static const cutlass::bfloat16_t* g_v_fill_pool = nullptr;
 static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0, g_v_fill_sh = 0;
 
@@ -305,6 +310,8 @@ struct FmhaCachedLauncher {
            o_ptr, stride_qo, lse_ptr, mm_ranges_ptr, max_mm_ranges},
           {o_ptr, stride_qo, lse_ptr, stride_lse},
           hw_info};
+      args.mainloop.lazy_rescale = g_lazy_rescale;
+      args.mainloop.pingpong = g_pingpong;
       if (paged != nullptr) {
         args.mainloop.kv_pool_k = paged->pool_k;
         args.mainloop.kv_pool_v =
@@ -518,9 +525,14 @@ static bool launch_fmha_batched(
   // vs 9e-4). Compile-time instantiation: the ncoop kernel is free of
   // sym codegen contamination either way. Legal only without in-place
   // K-tile transforms (v_fill_tma / plain).
+  // Default ON since S68: under the transposed scheduler + lazy rescale,
+  // sym wins every ladder rung (1.050/1.066/1.019/1.076 vs FA4; ncoop
+  // 1.127/1.131/1.100/1.098) with 9x tighter numerics. GEMMA_SYMPV=0
+  // restores ncoop. The legality gates below (v_fill/recon) still apply
+  // and fall back to ncoop automatically.
   static const bool sympv_env = []() {
     const char* e = getenv("GEMMA_SYMPV");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr ? true : e[0] == '1';
   }();
   // Record-native staging (GEMMA_RECNATIVE=1): rotor ring, no V TMA;
   // requires the record pool and no fill/recon transform.
@@ -626,6 +638,18 @@ bool gemma_prefill_sm90_launcher(
     const char* e = getenv("GEMMA_V_FILL");
     return e != nullptr ? atoi(e) : 0;
   }();
+  // Default ON since S68: bit-exact (skips only identity multiplies),
+  // wins every rung in both sym and ncoop. GEMMA_LAZY=0 opts out.
+  static const bool lazy_env = []() {
+    const char* e = getenv("GEMMA_LAZY");
+    return e == nullptr ? true : e[0] == '1';
+  }();
+  g_lazy_rescale = lazy_env;
+  static const bool pingpong_env = []() {
+    const char* e = getenv("GEMMA_PINGPONG");
+    return e != nullptr && e[0] == '1';
+  }();
+  g_pingpong = pingpong_env;
   g_v_fill = (v_fill_env == 1) && k_eq_v;
   g_v_fill_tma = (v_fill_env == 2) && k_eq_v;
   g_v_fill_pool = g_v_fill ? reinterpret_cast<const cutlass::bfloat16_t*>(

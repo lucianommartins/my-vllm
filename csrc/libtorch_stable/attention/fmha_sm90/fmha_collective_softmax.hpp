@@ -284,13 +284,22 @@ struct CollectiveSoftmax {
 
       MaxType s_max_cur = s_max(i) == static_cast<MaxType>(-INFINITY) ? static_cast<MaxType>(0) : s_max(i);
       SumType scale_pv = overload_exp2((s_max_prev(i) - s_max_cur) * scale);
-      a_sum(i) *= scale_pv;
-      
-      using ElementPV = typename AccPV::value_type;
-      ElementPV scale_pv_ele = static_cast<ElementPV>(scale_pv);
-      CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < size<1>(acc_pv_mn); j++) {
-        acc_pv_mn(i, j) *= scale_pv_ele;
+      // Lazy rescale (GEMMA_LAZY=1, tokamax recipe): in steady state the
+      // running max is unchanged, scale_pv == exp2(0) == 1.0 exactly, and
+      // the O-accumulator multiply is a 128-FMA identity. Warp-uniform
+      // vote (lanes are converged here — the shfl max-reduce above
+      // requires it) skips the loop bit-exactly.
+      bool skip_rescale = params.lazy_rescale &&
+          __all_sync(0xffffffffu, scale_pv == SumType(1.0));
+      if (!skip_rescale) {
+        a_sum(i) *= scale_pv;
+
+        using ElementPV = typename AccPV::value_type;
+        ElementPV scale_pv_ele = static_cast<ElementPV>(scale_pv);
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size<1>(acc_pv_mn); j++) {
+          acc_pv_mn(i, j) *= scale_pv_ele;
+        }
       }
       a_sum(i) += SumType{reduce(acc_qk_mn(i, _), cute::plus{})};
     }
