@@ -604,6 +604,16 @@ class GemmaAttentionImpl(AttentionImpl):
 
         if _CACHE_V3 and kv_cache.dim() == 4:
             if (
+                _V3_RECORD_DECODE
+                and attn_metadata.tiny_extend_plan is not None
+            ):
+                # Spec-verify / MTP steps: hd512 virtual-seq decode over
+                # the record pool (same substitution as record decode).
+                return self._forward_tiny_extend(
+                    layer, query, kv_cache, kv_cache, output,
+                    attn_metadata, record=True,
+                )
+            if (
                 _V3_RECORD_PREFILL
                 and attn_metadata.max_query_len > 1
                 and attn_metadata.tiny_extend_plan is None
@@ -683,6 +693,7 @@ class GemmaAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: GemmaAttentionMetadata,
+        record: bool = False,
     ) -> torch.Tensor:
         """Multi-query extend as ONE batched paged decode over virtual
         sequences (token t of seq i at offset o == decode at context+o+1
@@ -738,15 +749,30 @@ class GemmaAttentionImpl(AttentionImpl):
                     self._ensure_partition_buffers(
                         n, attn_metadata.max_seq_len,
                         query.dtype, query.device))
+                if record:
+                    w = getattr(self, "_v3_w", None)
+                    if w is None:
+                        w_vec = getattr(layer, "_gemma_k_norm_weight", None)
+                        assert w_vec is not None
+                        w = float(w_vec[0].item())
+                        self._v3_w = w
+                    if self._empty_f32 is None:
+                        self._empty_f32 = torch.empty(
+                            0, dtype=torch.float32, device=query.device)
+                    scale = self.scale * w
+                    recon_args = (self._empty_f32, 1.0)
+                else:
+                    scale = self.scale
+                    recon_args = self._vrecon_args(layer, query.device)
                 torch.ops._C.gemma_paged_attention(
                     output[:n], exp_sums, max_logits, tmp_out, query[:n],
-                    key_cache, value_cache, self.num_kv_heads, self.scale,
+                    key_cache, value_cache, self.num_kv_heads, scale,
                     bt_buf, sl_buf, key_cache.shape[1],
                     attn_metadata.max_seq_len, self.kv_cache_dtype,
                     layer._k_scale, layer._v_scale, self.actual_head_size,
                     self.k_eq_v, self.sliding_window,
                     self._empty_lse, self._empty_sel,
-                    *self._vrecon_args(layer, query.device),
+                    *recon_args,
                 )
                 return output
             return self._forward_prefill(
