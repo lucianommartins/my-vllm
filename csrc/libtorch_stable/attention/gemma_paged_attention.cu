@@ -444,12 +444,15 @@ void gemma_paged_attention_launcher(
   // stored): inferred from the channel dim; requires the fused decode
   // path (checked at dispatch).
   const bool record640 = key_cache.size(3) == 640;
-  // GEMMA_STRIP_DERIVE=1: decode reads 1KB/token (skip record cols
-  // 384..512; rotor-original V derived in-kernel by inverse-rotating
-  // the strip already staged for QK).
+  // Strip-derive decode: read 1KB/token (skip record cols 384..512;
+  // rotor-original V derived in-kernel by inverse-rotating the strip
+  // already staged for QK). Default ON since S70 — G2-with-strip passed
+  // (8/8 short + 4/4 long streams exact through end-of-turn; spec
+  // acceptance identical to the S52 golden). GEMMA_STRIP_DERIVE=0
+  // restores the 1.25KB/token direct read.
   static const bool g_strip_derive = []() {
     const char* e = getenv("GEMMA_STRIP_DERIVE");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr ? true : e[0] == '1';
   }();
 
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
