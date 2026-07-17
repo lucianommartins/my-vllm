@@ -264,6 +264,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     int pool_num_blocks = 0;
     int pool_num_kv_heads = 0;
     int pool_page_size = 16;   // 16 (page-sliced) or 64 (whole-tile)
+    bool kv_pool_record640 = false;  // GEMMA_CACHE_V3 640-record pool
   };
 
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -286,6 +287,44 @@ struct FmhaMainloopTmaWarpSpecialized {
       SM90_TMA_LOAD{}, GmemPagedKTensor{}, SmemLayoutKPage{}));
   using TMA_V16 = decltype(make_tma_copy(
       SM90_TMA_LOAD{}, GmemPagedVTensor{}, SmemLayoutVPage{}));
+
+  // ---- GEMMA_CACHE_V3 640-record K boxes (natural-order reader) ----
+  // Natural K columns <- record columns in 4 contiguous gmem windows:
+  //   cols {0..64}    <- rec[512..576] (strip lo)   chunk 0
+  //   cols {64..256}  <- rec[0..192]                chunks 1-3
+  //   cols {256..320} <- rec[576..640] (strip hi)   chunk 4
+  //   cols {320..512} <- rec[192..384]              chunks 5-7
+  // A chunk = 64 columns = one swizzle atom; each box reuses the parent
+  // K stage layout sliced on the chunk mode (same recipe as the paged-16
+  // page slices) with a chunk-aligned smem pointer offset — offsets are
+  // multiples of the swizzle codomain period (static-asserted below), so
+  // the swizzle phase is preserved and the GMMA-side layouts are
+  // untouched.
+  using SmemInnerKColDiv = decltype(logical_divide(
+      SmemInnerK{}, make_tile(_, Layout<Int<64>>{})));
+  static constexpr int kRecChunkStride =
+      decltype(cute::stride<1, 1>(SmemInnerKColDiv{}))::value;
+  static_assert(kRecChunkStride % 512 == 0,
+                "record box offsets must be swizzle-period aligned");
+  template<int N>
+  using RecBoxInner = decltype(make_layout(
+      cute::layout<0>(SmemInnerKColDiv{}),
+      make_layout(cute::layout<1, 0>(SmemInnerKColDiv{}),
+                  Layout<Int<N>, Int<kRecChunkStride>>{}),
+      cute::layout<2>(SmemInnerKColDiv{})));
+  template<int N>
+  using RecBoxLayout =
+      decltype(composition(SmemLayoutK{}.layout_a(), RecBoxInner<N>{}));
+  using GmemRecKTensor = decltype(make_tensor(
+      make_gmem_ptr(static_cast<Element const*>(nullptr)),
+      make_layout(
+          make_shape(int(0), int(0), make_shape(int(0), int(0))),
+          make_stride(int64_t(0), _1{},
+                      make_stride(int64_t(0), int64_t(0))))));
+  using TMA_KRec64 = decltype(make_tma_copy(
+      SM90_TMA_LOAD{}, GmemRecKTensor{}, RecBoxLayout<1>{}(_, _, _0{})));
+  using TMA_KRec192 = decltype(make_tma_copy(
+      SM90_TMA_LOAD{}, GmemRecKTensor{}, RecBoxLayout<3>{}(_, _, _0{})));
 
   struct Params {
     TMA_Q tma_load_q;
@@ -343,6 +382,14 @@ struct FmhaMainloopTmaWarpSpecialized {
     const Element* v_fill_pool = nullptr;
     int64_t v_fill_stride_block = 0;
     int64_t v_fill_stride_slot = 0;
+    // GEMMA_CACHE_V3 640-record mode: K via 4 column-box descriptors;
+    // V via the fill path (rotor columns only — the unrot columns of the
+    // K tile already hold natural-position V values).
+    bool record640 = false;
+    TMA_KRec64 tma_load_k_rec_s0 = {};
+    TMA_KRec192 tma_load_k_rec_u0 = {};
+    TMA_KRec64 tma_load_k_rec_s1 = {};
+    TMA_KRec192 tma_load_k_rec_u1 = {};
   };
 
   using LoadQ = cutlass::fmha::collective::CollectiveLoadTma<
@@ -400,6 +447,42 @@ struct FmhaMainloopTmaWarpSpecialized {
     SmemLayoutV,
     TMA_V
   >;
+
+  using LoadRecBox1 = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPaged64KRec,
+    MainloopPipeline, Element, RecBoxLayout<1>, TMA_KRec64>;
+  using LoadRecBox3 = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPaged64KRec,
+    MainloopPipeline, Element, RecBoxLayout<3>, TMA_KRec192>;
+
+  // Composite record-K loader: 4 box copies per tile, all completing on
+  // the SAME stage barrier (total bytes == one legacy K stage), exposing
+  // the LoadPaged64K step interface.
+  struct LoadRec640K {
+    LoadRecBox1 s0, s1;
+    LoadRecBox3 u0, u1;
+    template<class... As>
+    CUTLASS_DEVICE auto init_state(As&&... as) {
+      return cute::make_tuple(
+          s0.init_state(as...), u0.init_state(as...),
+          s1.init_state(as...), u1.init_state(as...));
+    }
+    template<bool kAdvanceIterator = true, class TileIterator, class State,
+             class PipeState>
+    CUTLASS_DEVICE void step(TileIterator& it, State const& st,
+                             PipeState& pipe, int lane, int& count,
+                             uint16_t mask = 0) {
+      int d;
+      d = count;
+      s0.template step<false, false, true>(it, get<0>(st), pipe, lane, d, mask);
+      d = count;
+      u0.template step<false, false, false>(it, get<1>(st), pipe, lane, d, mask);
+      d = count;
+      s1.template step<false, false, false>(it, get<2>(st), pipe, lane, d, mask);
+      u1.template step<kAdvanceIterator, true, false>(it, get<3>(st), pipe,
+                                                      lane, count, mask);
+    }
+  };
 
   // For non-chunked/non-split: QK and PV MMA sizes must match.
   static_assert(kHeadChunkedPV || kSplitDPV || size(typename CollectiveMmaQK::TiledMma{}) == size(typename CollectiveMmaPV::TiledMma{}));
@@ -506,7 +589,31 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     }
 
-    return Params{
+    TMA_KRec64 tma_k_rec_s0{}, tma_k_rec_s1{};
+    TMA_KRec192 tma_k_rec_u0{}, tma_k_rec_u1{};
+    if (args.kv_pool_k != nullptr && args.pool_page_size == kTileN &&
+        args.kv_pool_record640) {
+      auto make_rec_g = [&](int col0, int w) {
+        return make_tensor(
+            make_gmem_ptr(args.kv_pool_k + col0),
+            make_layout(
+                make_shape(int(kTileN), w,
+                           make_shape(args.pool_num_blocks,
+                                      args.pool_num_kv_heads)),
+                make_stride(int64_t(args.pool_stride_slot), _1{},
+                            make_stride(int64_t(args.pool_stride_block),
+                                        int64_t(args.pool_stride_head)))));
+      };
+      tma_k_rec_s0 = make_tma_copy(SM90_TMA_LOAD{}, make_rec_g(512, 64),
+                                   RecBoxLayout<1>{}(_, _, _0{}));
+      tma_k_rec_u0 = make_tma_copy(SM90_TMA_LOAD{}, make_rec_g(0, 192),
+                                   RecBoxLayout<3>{}(_, _, _0{}));
+      tma_k_rec_s1 = make_tma_copy(SM90_TMA_LOAD{}, make_rec_g(576, 64),
+                                   RecBoxLayout<1>{}(_, _, _0{}));
+      tma_k_rec_u1 = make_tma_copy(SM90_TMA_LOAD{}, make_rec_g(192, 192),
+                                   RecBoxLayout<3>{}(_, _, _0{}));
+    }
+    Params p{
         params_qk.tma_load_a,
         params_qk.tma_load_b,
         params_pv.tma_load_b,
@@ -535,6 +642,12 @@ struct FmhaMainloopTmaWarpSpecialized {
         nullptr,                 // d_kv_lo (null = kv_lo 0 / scalar)
         1                        // contig_gqa_group (set by prefill launcher)
     };
+    p.record640 = args.kv_pool_record640;
+    p.tma_load_k_rec_s0 = tma_k_rec_s0;
+    p.tma_load_k_rec_u0 = tma_k_rec_u0;
+    p.tma_load_k_rec_s1 = tma_k_rec_s1;
+    p.tma_load_k_rec_u1 = tma_k_rec_u1;
+    return p;
   }
 
   CUTLASS_DEVICE
@@ -543,6 +656,12 @@ struct FmhaMainloopTmaWarpSpecialized {
     if (params.page_table != nullptr) {
       cute::prefetch_tma_descriptor(params.tma_load_k_paged.get_tma_descriptor());
       cute::prefetch_tma_descriptor(params.tma_load_k_paged64.get_tma_descriptor());
+      if (params.record640) {
+        cute::prefetch_tma_descriptor(params.tma_load_k_rec_s0.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(params.tma_load_k_rec_u0.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(params.tma_load_k_rec_s1.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(params.tma_load_k_rec_u1.get_tma_descriptor());
+      }
       if constexpr (!kKEqV) {
         cute::prefetch_tma_descriptor(params.tma_load_v_paged.get_tma_descriptor());
         cute::prefetch_tma_descriptor(params.tma_load_v_paged64.get_tma_descriptor());
@@ -765,7 +884,31 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     };
 
-    if (params.pages_per_tile == 1) {
+    if (params.pages_per_tile == 1 && params.record640) {
+      // 640-record K: 4 column boxes into the shared K stage (chunk-
+      // aligned offsets; SharedStorage re-typed per box over the same
+      // smem_k array). V arrives via the fill path (record640 branch).
+      auto* base = storage.smem_k.data();
+      LoadRec640K load_rec{
+          {params.tma_load_k_rec_s0, pipeline,
+           *reinterpret_cast<typename LoadRecBox1::SharedStorage*>(base),
+           params.page_table, params.gqa_group, params.max_blocks_per_seq,
+           64, 0 * kRecChunkStride},
+          {params.tma_load_k_rec_s1, pipeline,
+           *reinterpret_cast<typename LoadRecBox1::SharedStorage*>(base),
+           params.page_table, params.gqa_group, params.max_blocks_per_seq,
+           64, 4 * kRecChunkStride},
+          {params.tma_load_k_rec_u0, pipeline,
+           *reinterpret_cast<typename LoadRecBox3::SharedStorage*>(base),
+           params.page_table, params.gqa_group, params.max_blocks_per_seq,
+           192, 1 * kRecChunkStride},
+          {params.tma_load_k_rec_u1, pipeline,
+           *reinterpret_cast<typename LoadRecBox3::SharedStorage*>(base),
+           params.page_table, params.gqa_group, params.max_blocks_per_seq,
+           192, 5 * kRecChunkStride}};
+      LoadPaged64V load_v64{params.tma_load_v_paged64, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      run_kv_loads(load_rec, load_v64);
+    } else if (params.pages_per_tile == 1) {
       LoadPaged64K load_k64{params.tma_load_k_paged64, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
       LoadPaged64V load_v64{params.tma_load_v_paged64, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
       run_kv_loads(load_k64, load_v64);
@@ -1715,6 +1858,36 @@ struct FmhaMainloopTmaWarpSpecialized {
           constexpr int CH16 = kHeadDim / kVecE;   // 16B chunks per row
           const int kv0 = recon_t * kTileKV;
           const int seq_k = int(get<3>(problem_size));
+          if (params.record640) {
+            // 640-record: the tile's unrot columns already hold natural-
+            // position V (record stores V there; K=w*V lives in the
+            // folded scale). Replace ONLY the rotor columns:
+            //   cols {0..64} <- rec[384+c], cols {256..320} <- rec[192+c].
+            constexpr int NREP = 128 / kVecE;
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (int i = pv_thread_idx; i < kTileKV * NREP;
+                 i += kNumMmaThreads) {
+              const int n = i / NREP, kk = i - n * NREP;
+              const int dv =
+                  (kk < NREP / 2) ? kk * kVecE : 256 + (kk - NREP / 2) * kVecE;
+              const int srcc = (dv < 64) ? dv + 384 : dv + 192;
+              int tok = kv0 + n;
+              if (tok >= seq_k) tok = seq_k - 1;
+              const int phys = params.page_table[
+                  fill_batch * params.max_blocks_per_seq + tok / fill_ps];
+              const Element* src = params.v_fill_pool +
+                    (int64_t)phys * params.v_fill_stride_block +
+                    (int64_t)(tok % fill_ps) * params.v_fill_stride_slot +
+                    srcc;
+              const uint32_t dst = cute::cast_smem_ptr_to_uint(
+                  &sK_full(n, dv, stage_idx));
+              asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                           :: "r"(dst), "l"(src));
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+            recon_t++;
+            return;
+          }
           CUTLASS_PRAGMA_NO_UNROLL
           for (int i = pv_thread_idx; i < kTileKV * CH16;
                i += kNumMmaThreads) {

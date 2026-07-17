@@ -142,6 +142,10 @@ void gemma_prefill_launcher(
           k_eq_v, sliding_window, mm_prefix_ranges, non_causal, lse_out,
           seq_lens_cpu, cu_seqlens_q_cpu, recon_invfreq, recon_inv_w);
       if (handled) return;
+      STD_TORCH_CHECK(
+          !(k_eq_v && key_cache.dim() == 4 && key_cache.size(3) == 640),
+          "GEMMA_CACHE_V3 record pool requires the SM90 paged64 prefill "
+          "path (GEMMA_SM90_PREFILL/GEMMA_PREFILL_PAGED must stay on)");
     }
   }
 #endif  // ENABLE_GEMMA_ATTN_SM90

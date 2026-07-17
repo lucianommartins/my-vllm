@@ -40,6 +40,7 @@ enum class LoadKind {
   kQ, kK, kV,
   kPagedK, kPagedV,        // 16-token pages: pages_per_tile copies per tile
   kPaged64K, kPaged64V,    // 64-token pages: one whole-tile copy (page==tile)
+  kPaged64KRec,            // GEMMA_CACHE_V3 640-record column box (one of 4)
   kBwdN, kBwdM, kBwdScalar
 };
 
@@ -70,14 +71,20 @@ struct CollectiveLoadTma {
   int max_blocks_per_seq;
   int batch_idx;
   int num_pages;  // valid pages this seq (paged tail clamp)
+  // kPaged64KRec: gmem channel-window width and smem element offset of
+  // this box (chunk-codomain-aligned, so the swizzle phase is preserved).
+  int rec_box_width;
+  int rec_smem_offset;
 
   CUTLASS_DEVICE
   CollectiveLoadTma(Params const& params, Pipeline& pipeline, SharedStorage& storage,
                     const int* page_table = nullptr, int gqa_group = 1,
-                    int max_blocks_per_seq = 0)
+                    int max_blocks_per_seq = 0, int rec_box_width = 0,
+                    int rec_smem_offset = 0)
     : params(params), pipeline(pipeline), storage(storage),
       page_table(page_table), gqa_group(gqa_group),
-      max_blocks_per_seq(max_blocks_per_seq), batch_idx(0), num_pages(0) {}
+      max_blocks_per_seq(max_blocks_per_seq), batch_idx(0), num_pages(0),
+      rec_box_width(rec_box_width), rec_smem_offset(rec_smem_offset) {}
 
   template<class ProblemSize, class TileShape, class BlockCoord>
   CUTLASS_DEVICE auto init_g(ProblemSize const& problem_size, TileShape const& tile_shape,
@@ -146,6 +153,17 @@ struct CollectiveLoadTma {
           make_shape(get<4>(problem_size), int(get<0>(tile_shape)),
                      make_shape(num_blocks, num_kv_heads)));
       return mV(_, _, make_coord(_, kv_head));
+    } else if constexpr (kKind == LoadKind::kPaged64KRec) {
+      // 640-record column box: same rank as kPaged64K but the channel
+      // extent is this box's window width (the descriptor's gmem base
+      // already carries the record column offset).
+      int num_blocks = get<7>(problem_size);
+      int num_kv_heads = get<0>(problem_size) / gqa_group;
+      int kv_head = int(get<0>(get<2>(blk_coord))) / gqa_group;
+      Tensor mK = params.get_tma_tensor(
+          make_shape(int(get<0>(tile_shape)), rec_box_width,
+                     make_shape(num_blocks, num_kv_heads)));
+      return mK(_, _, make_coord(_, kv_head));
     } else if constexpr (kKind == LoadKind::kBwdN) {
       Tensor m_full = params.get_tma_tensor(make_shape(get<3>(problem_size), get<4>(problem_size), select<0,1>(problem_size)));
       Tensor g_full = local_tile(m_full, tile_shape, make_coord(_, _, _), Step<_1, X, _1>{});
@@ -173,13 +191,17 @@ struct CollectiveLoadTma {
       batch_idx = int(get<1>(get<2>(block_coord)));
       num_pages = (int(get<3>(problem_size)) + kPagedPageSize - 1) / kPagedPageSize;
     }
-    if constexpr (kKind == LoadKind::kPaged64K || kKind == LoadKind::kPaged64V) {
+    if constexpr (kKind == LoadKind::kPaged64K || kKind == LoadKind::kPaged64V ||
+                  kKind == LoadKind::kPaged64KRec) {
       batch_idx = int(get<1>(get<2>(block_coord)));
       num_pages = (int(get<3>(problem_size)) + int(get<0>(tile_shape)) - 1) /
                   int(get<0>(tile_shape));
     }
     Tensor g = init_g(problem_size, tile_shape, block_coord, loop_count);
-    Tensor s = make_tensor(make_smem_ptr(storage.data()), SmemLayout{});
+    Tensor s = make_tensor(
+        make_smem_ptr(storage.data() +
+                      (kKind == LoadKind::kPaged64KRec ? rec_smem_offset : 0)),
+        SmemLayout{});
 
     auto block_tma = params.get_slice(block_rank_in_cluster);
     Tensor ts = block_tma.partition_D(s);
@@ -224,7 +246,8 @@ struct CollectiveLoadTma {
       }
       --tile_count;
     } else if constexpr (kKind == LoadKind::kPaged64K ||
-                         kKind == LoadKind::kPaged64V) {
+                         kKind == LoadKind::kPaged64V ||
+                         kKind == LoadKind::kPaged64KRec) {
       if ((lane_predicate == 1) && (tile_count > 0)) {
         if constexpr (kAcquireBarrier) pipeline.producer_acquire(smem_pipe_write);
         using BarrierType = typename Pipeline::ProducerBarrierType;

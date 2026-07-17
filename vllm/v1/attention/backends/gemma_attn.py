@@ -406,6 +406,7 @@ class GemmaAttentionBackend(AttentionBackend):
 
 _V3_DEV_READER = os.environ.get("GEMMA_V3_DEV_READER") == "1"
 _V3_RECORD_DECODE = os.environ.get("GEMMA_V3_RECORD_DECODE") == "1"
+_V3_RECORD_PREFILL = os.environ.get("GEMMA_V3_RECORD_PREFILL") == "1"
 # Natural-order record readers: the kernel address map absorbs the
 # record permutation, so no Q/O/weight permutation exists anywhere.
 _V3_DEV_SCRATCH: dict = {}
@@ -602,6 +603,17 @@ class GemmaAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         if _CACHE_V3 and kv_cache.dim() == 4:
+            if (
+                _V3_RECORD_PREFILL
+                and attn_metadata.max_query_len > 1
+                and attn_metadata.tiny_extend_plan is None
+            ):
+                # Record-direct prefill: SM90 4-box K TMA + rotor-V fill
+                # read the 640-record natively; w folds into the scale.
+                return self._forward_prefill_record(
+                    query[:num_actual_tokens], kv_cache,
+                    output[:num_actual_tokens], attn_metadata,
+                )
             if (
                 _V3_RECORD_DECODE
                 and attn_metadata.max_query_len == 1
@@ -820,6 +832,56 @@ class GemmaAttentionImpl(AttentionImpl):
             block_table=attn_metadata.block_table,
             softcap=0.0,
             fa_version=self._fa_version,
+        )
+        return output
+
+    def _forward_prefill_record(
+        self,
+        query: torch.Tensor,
+        record_pool: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+    ) -> torch.Tensor:
+        w = getattr(self, "_v3_w", None)
+        if w is None:
+            w_vec = getattr(self._layer_ref, "_gemma_k_norm_weight", None)
+            assert w_vec is not None, "record prefill needs k_norm weight"
+            w = float(w_vec[0].item())
+            self._v3_w = w
+        if (os.environ.get("GEMMA_V3_DEBUG") == "1"
+                and not getattr(self, "_v3_pref_logged", False)):
+            self._v3_pref_logged = True
+            print(f"[V3DBG] RECORD-DIRECT PREFILL active: "
+                  f"layer={self._layer_ref.layer_name} "
+                  f"pool={tuple(record_pool.shape)} scale*w={self.scale * w:.6f}",
+                  flush=True)
+        mm_ranges = attn_metadata.mm_prefix_range_tensor
+        if mm_ranges is None:
+            mm_ranges = torch.empty(0, dtype=torch.int32, device=query.device)
+        empty_i32 = torch.empty(0, dtype=torch.int32)
+        seq_lens_cpu = attn_metadata.seq_lens_cpu
+        q_start_cpu = attn_metadata.query_start_loc_cpu
+        torch.ops._C.gemma_prefill_attention(
+            output,
+            query,
+            record_pool,
+            record_pool,
+            self.num_kv_heads,
+            self.scale * w,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            attn_metadata.query_start_loc,
+            attn_metadata.max_query_len,
+            record_pool.shape[1],
+            self.k_eq_v,
+            self.sliding_window,
+            mm_ranges,
+            False,
+            torch.empty(0, dtype=torch.float32, device=query.device),
+            seq_lens_cpu if seq_lens_cpu is not None else empty_i32,
+            q_start_cpu if q_start_cpu is not None else empty_i32,
+            torch.empty(0, dtype=torch.float32, device=query.device),
+            1.0,
         )
         return output
 

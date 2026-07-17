@@ -200,6 +200,7 @@ struct PagedPool {
   const int* page_table;
   int max_blocks_per_seq;
   int page_size;        // 16 (page-sliced TMA) or 64 (whole-tile TMA)
+  bool record640;       // GEMMA_CACHE_V3 640-record pool (K 4-box TMA)
 };
 
 // k_eq_v V-reconstruction state for the CURRENT op call (host-side,
@@ -311,6 +312,7 @@ struct FmhaCachedLauncher {
         args.mainloop.pool_num_blocks = paged->num_blocks;
         args.mainloop.pool_num_kv_heads = paged->num_kv_heads;
         args.mainloop.pool_page_size = paged->page_size;
+        args.mainloop.kv_pool_record640 = paged->record640;
       }
 
       if (FmhaOp::can_implement(args) != cutlass::Status::kSuccess)
@@ -352,6 +354,24 @@ struct FmhaCachedLauncher {
                 : p.mainloop.tma_load_k_paged.get_tma_descriptor());
         cuTensorMapReplaceAddress(
             kd, const_cast<cutlass::bfloat16_t*>(paged->pool_k));
+        if (paged->record640) {
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_k_rec_s0.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 512));
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_k_rec_u0.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 0));
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_k_rec_s1.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 576));
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_k_rec_u1.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 192));
+        }
         if ((!KEqV || g_v_fill_tma) && paged->pool_v != nullptr) {
           CUtensorMap* vd = const_cast<CUtensorMap*>(
               paged->page_size == 64
@@ -495,6 +515,20 @@ bool gemma_prefill_sm90_launcher(
                            : nullptr;
   g_v_fill_sb = value_cache.stride(0);
   g_v_fill_ss = value_cache.stride(1);
+  // GEMMA_CACHE_V3 640-record pool: K via 4-box TMA; V via the fill path
+  // (rotor columns only) sourced from the RECORD pool, regardless of the
+  // GEMMA_V_FILL env. Recon has no role in record mode.
+  const bool record640 =
+      k_eq_v && key_cache.dim() == 4 && key_cache.size(3) == 640;
+  if (record640) {
+    g_v_fill = true;
+    g_v_fill_tma = false;
+    g_v_fill_pool =
+        reinterpret_cast<const cutlass::bfloat16_t*>(key_cache.data_ptr());
+    g_v_fill_sb = key_cache.stride(0);
+    g_v_fill_ss = key_cache.stride(1);
+    g_recon_invfreq = nullptr;
+  }
 
   // Default ON (P7): the CUTLASS warp-spec path is the production prefill on
   // Hopper (TTFT 28.5/180.6/783ms at 512/4k/16k b=1 vs FA4's 34.4/177.4/773).
@@ -546,7 +580,7 @@ bool gemma_prefill_sm90_launcher(
       head_size == 512 && num_seqs > 1 && use_paged &&
       mm_prefix_ranges.numel() == 0 &&
       cu_seqlens_q.numel() >= num_seqs + 1 && seq_lens.numel() >= num_seqs;
-  if (max_q_len <= 32 && !mq_batched_ok) return false;
+  if (max_q_len <= 32 && !mq_batched_ok && !record640) return false;
 
   constexpr int kAlignment = 16 / sizeof(T);
   if (max_q_len == 0) return false;
@@ -689,7 +723,9 @@ bool gemma_prefill_sm90_launcher(
   // (empty sliding trip range on padded tiny-q tiles -> pipeline deadlock)
   // was root-caused and fixed in fmha_fusion.hpp get_trip_start (S21).
   const bool paged_call =
-      use_paged && (max_kv_len <= paged_maxkv ||
+      use_paged && (record640 ||  // records are ONLY readable via the
+                                  // box-TMA + fill path, never gathered
+                    max_kv_len <= paged_maxkv ||
                     (page_size == 64 && max_q_len <= 128) ||
                     (page_size == 16 && sliding_window > 0));
   // Re-grow the expanded-KV scratch for the KV extent (sized for q above).
@@ -715,7 +751,8 @@ bool gemma_prefill_sm90_launcher(
           : reinterpret_cast<const Element*>(value_cache_ptr),
       kv_stride_block, kv_stride_slot, kv_stride_head,
       pool_num_blocks, num_kv_heads,
-      /*page_table=*/nullptr, max_num_blocks_per_seq, page_size};
+      /*page_table=*/nullptr, max_num_blocks_per_seq, page_size,
+      record640};
 
   bool ok = true;
   const int padded_qo_stride = num_q_heads * head_size;
