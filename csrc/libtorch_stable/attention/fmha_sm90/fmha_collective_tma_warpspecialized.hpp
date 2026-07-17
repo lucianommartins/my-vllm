@@ -77,6 +77,7 @@ struct FmhaMainloopTmaWarpSpecialized {
   // (2x tile depth at the same smem). Split-D consumer (compute_ncoop) only.
   static constexpr bool kKEqV = find_option_t<Tag::kKEqV, false_type, Options...>::value;
   static constexpr bool kOverlapSoftmax = find_option_t<Tag::kOverlapSoftmax, false_type, Options...>::value;
+  static constexpr bool kSymmetricPV = find_option_t<Tag::kSymmetricPV, false_type, Options...>::value;
 
   static constexpr int NumLoadWarpGroups = 1;
   static constexpr int NumMmaWarpGroups = find_option_t<Tag::kNumMmaWarpGroups, Int<2>, Options...>::value;
@@ -436,9 +437,6 @@ struct FmhaMainloopTmaWarpSpecialized {
     // V via the fill path (rotor columns only — the unrot columns of the
     // K tile already hold natural-position V values).
     bool record640 = false;
-    // Symmetric-PV consumers (requires v_fill_tma or no in-place K
-    // transform; host gates). Runtime switch — no new instantiation.
-    bool symmetric_pv = false;
     TMA_KRec64 tma_load_k_rec_s0 = {};
     TMA_KRec192 tma_load_k_rec_u0 = {};
     TMA_KRec64 tma_load_k_rec_s1 = {};

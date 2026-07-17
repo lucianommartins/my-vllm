@@ -215,10 +215,11 @@ static bool g_v_fill_tma = false;   // GEMMA_V_FILL=2: producer-TMA overwrite
 static const cutlass::bfloat16_t* g_v_fill_pool = nullptr;
 static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0, g_v_fill_sh = 0;
 
-template <int HeadDim, bool KEqV = false, bool Overlap = false>
+template <int HeadDim, bool KEqV = false, bool Overlap = false,
+          bool SymPV = false>
 struct FmhaCachedLauncher {
   using FmhaTypes =
-      vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV, Overlap>;
+      vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV, Overlap, SymPV>;
   using Kernel = typename FmhaTypes::Kernel;
   using FmhaOp = cutlass::device::Universal<Kernel>;
 
@@ -442,14 +443,7 @@ struct FmhaCachedLauncher {
       p.mainloop.v_fill_stride_block = g_v_fill_sb;
       p.mainloop.v_fill_stride_slot = g_v_fill_ss;
       p.mainloop.v_fill_stride_head = g_v_fill_sh;
-      // Symmetric-PV consumers (GEMMA_SYMPV=1): legal only when no
-      // in-place K-tile transform runs (v_fill_tma mode or plain).
-      static const bool sympv_env = []() {
-        const char* e = getenv("GEMMA_SYMPV");
-        return e != nullptr && e[0] == '1';
-      }();
-      p.mainloop.symmetric_pv =
-          sympv_env && !g_v_fill && g_recon_invfreq == nullptr;
+
     }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
@@ -494,6 +488,28 @@ static bool launch_fmha_batched(
     if (olap_env) {
       static FmhaCachedLauncher<HeadDim, KEqV, true> olauncher;
       return olauncher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+                              num_q_heads, gqa_group, num_seqs, seq_q,
+                              seq_k, q_offset, q_stride, scale,
+                              sliding_window, mm_ranges_ptr, max_mm_ranges,
+                              device_id, sm_count, stream, paged,
+                              varlen_seq_lens, varlen_cu_q,
+                              varlen_q_offsets, varlen_kv_lo);
+    }
+  }
+  // Symmetric-PV consumers (hd512 split-D), OPT-IN via GEMMA_SYMPV=1.
+  // Clean-codegen A/B (S61): perf-equivalent to ncoop (±3%, mixed by
+  // shape) with ~9x tighter numerics (full-tile softmax, xcheck 1e-4
+  // vs 9e-4). Compile-time instantiation: the ncoop kernel is free of
+  // sym codegen contamination either way. Legal only without in-place
+  // K-tile transforms (v_fill_tma / plain).
+  static const bool sympv_env = []() {
+    const char* e = getenv("GEMMA_SYMPV");
+    return e != nullptr && e[0] == '1';
+  }();
+  if constexpr (HeadDim == 512 && KEqV) {
+    if (sympv_env && !g_v_fill && g_recon_invfreq == nullptr) {
+      static FmhaCachedLauncher<HeadDim, KEqV, false, true> slauncher;
+      return slauncher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
                               num_q_heads, gqa_group, num_seqs, seq_q,
                               seq_k, q_offset, q_stride, scale,
                               sliding_window, mm_ranges_ptr, max_mm_ranges,

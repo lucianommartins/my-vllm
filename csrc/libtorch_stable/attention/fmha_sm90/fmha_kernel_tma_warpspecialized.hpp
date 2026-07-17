@@ -446,7 +446,7 @@ struct FmhaKernelTmaWarpSpecialized {
         // For split-D: both WGs handle the same M block (no M-split)
 
         if constexpr (kSplitDPV) {
-          if (params.mainloop.symmetric_pv) {
+          if constexpr (CollectiveMainloop::kSymmetricPV) {
             // Symmetric consumers: full QK per WG + register-P RS PV
             // (v_fill_tma / no-transform modes only; host gates).
             collective_mainloop.compute_sym(
