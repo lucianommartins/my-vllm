@@ -357,6 +357,22 @@ struct FmhaCachedLauncher {
         if (paged->record640) {
           cuTensorMapReplaceAddress(
               const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_v_rec_s0.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 384));
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_v_rec_u0.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 0));
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_v_rec_s1.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 448));
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
+                  p.mainloop.tma_load_v_rec_u1.get_tma_descriptor()),
+              const_cast<cutlass::bfloat16_t*>(paged->pool_k + 192));
+          cuTensorMapReplaceAddress(
+              const_cast<CUtensorMap*>(
                   p.mainloop.tma_load_k_rec_s0.get_tma_descriptor()),
               const_cast<cutlass::bfloat16_t*>(paged->pool_k + 512));
           cuTensorMapReplaceAddress(
@@ -523,8 +539,14 @@ bool gemma_prefill_sm90_launcher(
   const bool record640 =
       k_eq_v && key_cache.dim() == 4 && key_cache.size(3) == 640;
   if (record640) {
-    g_v_fill = true;
-    g_v_fill_tma = false;
+    // Rotor delivery: producer-TMA (mode-2 analog, default) or the
+    // consumer cp.async fill (GEMMA_V3_ROTOR=fill; A/B knob).
+    static const bool rotor_fill = []() {
+      const char* e = getenv("GEMMA_V3_ROTOR");
+      return e != nullptr && e[0] == 'f';
+    }();
+    g_v_fill = rotor_fill;
+    g_v_fill_tma = !rotor_fill;
     g_v_fill_pool =
         reinterpret_cast<const cutlass::bfloat16_t*>(key_cache.data_ptr());
     g_v_fill_sb = key_cache.stride(0);

@@ -7136,19 +7136,23 @@ class GPUModelRunner(
                     )
                     dtype = kv_cache_spec.dtype
                     if isinstance(kv_cache_spec, GemmaGlobalV3Spec):
-                        # 640-channel single-plane record: 4-D natural
-                        # layout; the backend's stride order is for the
-                        # 5-D two-plane shape. Also verify the backend
-                        # shape and the spec page bytes agree — the two
-                        # are minted from the same env, but a divergence
-                        # here corrupts silently.
+                        # 640-channel single-plane record: the SPEC is the
+                        # single source of truth for the shape (the
+                        # backend's shape/stride order describe the 5-D
+                        # two-plane layout only).
+                        kv_cache_shape = (
+                            kernel_num_blocks,
+                            shape_block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size
+                            + kv_cache_spec.head_size_v,
+                        )
                         expected = num_blocks * kv_cache_spec.page_size_bytes
                         got = math.prod(kv_cache_shape) * get_dtype_size(dtype)
                         assert got == expected, (
-                            f"GEMMA_CACHE_V3 shape/spec divergence for "
-                            f"{layer_name}: backend shape {kv_cache_shape} "
-                            f"({got} B) vs spec page bytes ({expected} B). "
-                            f"Check GEMMA_CACHE_V3 env vs minted spec."
+                            f"record shape/spec bytes mismatch for "
+                            f"{layer_name}: {kv_cache_shape} vs "
+                            f"{expected} B"
                         )
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                     else:

@@ -644,7 +644,7 @@ class Attention(nn.Module, AttentionLayerBase):
             # shape derive from the same fields (the 7.1 failure mode is
             # structurally impossible). Discriminator: the gemma4 model
             # attaches _gemma_k_norm_weight only on k_eq_v global layers.
-            if (os.environ.get("GEMMA_CACHE_V3") == "1"
+            if (os.environ.get("GEMMA_CACHE_V3", "1") != "0"
                     and getattr(self, "_gemma_k_norm_weight", None)
                     is not None):
                 from vllm.v1.kv_cache_interface import GemmaGlobalV3Spec

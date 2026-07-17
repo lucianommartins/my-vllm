@@ -45,7 +45,11 @@ _MQ_DECODE_MAX = int(os.environ.get("GEMMA_MQ_DECODE_MAX", "8"))
 
 # Contract-v3 gemma-4 cache (640-ch global records + ps64 pools). Dev gate:
 # readers not yet migrated; default OFF.
-_CACHE_V3 = os.environ.get("GEMMA_CACHE_V3") == "1"
+# Default ON: the 640-record two-pool cache is the production mode for
+# k_eq_v gemma-4 models (correct attention function, -37.5% global KV,
+# faster decode+prefill). GEMMA_CACHE_V3=0 reverts to the two-plane
+# legacy cache (recon/V_FILL correct mode).
+_CACHE_V3 = os.environ.get("GEMMA_CACHE_V3", "1") != "0"
 
 PARTITION_SIZE = 512
 # Upper bound on split-KV partitions the decode kernel may use. The partition
@@ -363,12 +367,10 @@ class GemmaAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        if _CACHE_V3 and head_size == 512:
-            # Contract-v3 640-channel single-plane record for the global
-            # k_eq_v layers: [Vperm(512) | rot64 strip(128)] per token
-            # (diffkv-style shape; spec side mints head_size_v=128 so
-            # page bytes and this shape derive from the same fields).
-            return (num_blocks, block_size, num_kv_heads, 512 + 128)
+        # GEMMA_CACHE_V3 record shape is computed by the RUNNER directly
+        # from GemmaGlobalV3Spec (single source of truth — an env-keyed
+        # branch here can diverge from the minted spec, e.g. E-series
+        # hd512 globals with k_eq_v=false).
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -405,8 +407,8 @@ class GemmaAttentionBackend(AttentionBackend):
 
 
 _V3_DEV_READER = os.environ.get("GEMMA_V3_DEV_READER") == "1"
-_V3_RECORD_DECODE = os.environ.get("GEMMA_V3_RECORD_DECODE") == "1"
-_V3_RECORD_PREFILL = os.environ.get("GEMMA_V3_RECORD_PREFILL") == "1"
+_V3_RECORD_DECODE = os.environ.get("GEMMA_V3_RECORD_DECODE", "1") != "0"
+_V3_RECORD_PREFILL = os.environ.get("GEMMA_V3_RECORD_PREFILL", "1") != "0"
 # Natural-order record readers: the kernel address map absorbs the
 # record permutation, so no Q/O/weight permutation exists anywhere.
 _V3_DEV_SCRATCH: dict = {}

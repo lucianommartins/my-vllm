@@ -243,16 +243,18 @@ def _reshape_kv_cache(
                 )
 
                 if isinstance(kv_cache_spec, GemmaGlobalV3Spec):
-                    # 640-channel single-plane record: 4-D natural layout;
-                    # the backend stride order is for the 5-D two-plane
-                    # shape. Verify backend shape and spec page bytes agree
-                    # before viewing (divergence here corrupts silently).
+                    # Record shape comes from the SPEC (single source of
+                    # truth); backend shape/stride describe two-plane only.
+                    kv_cache_shape = (
+                        kernel_num_blocks,
+                        kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size + kv_cache_spec.head_size_v,
+                    )
                     expected = num_blocks * kv_cache_spec.page_size_bytes
                     got = prod(kv_cache_shape) * get_dtype_size(kv_cache_spec.dtype)
                     assert got == expected, (
-                        f"GEMMA_CACHE_V3 shape/spec divergence for "
-                        f"{layer_name}: backend shape {kv_cache_shape} "
-                        f"({got} B) vs spec page bytes ({expected} B)."
+                        f"record shape/spec bytes mismatch for {layer_name}"
                     )
                     kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                 else:
