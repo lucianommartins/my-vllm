@@ -532,10 +532,7 @@ static bool launch_fmha_batched(
               int(recnat_env), int(paged != nullptr),
               int(paged != nullptr && paged->record640),
               int(g_recon_invfreq == nullptr));
-#if 0  // RECNATIVE QUARANTINE v3 (S65): SASS verdict = producer mbarrier
-       // phase-check fed by spills; 5-state wrapper condemned. Redesign
-       // (merged-box 640 slot, 4-state producer) speced in SESSION_64
-       // doc §S65 — typing-only next session.
+#if 1  // RECNATIVE merged-box (S66): 4-state producer, 640 slot
     if (recnat_env && paged != nullptr && paged->record640 &&
         g_recon_invfreq == nullptr) {
       if (getenv("GEMMA_PREFILL_DEBUG")) {

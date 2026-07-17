@@ -192,11 +192,13 @@ struct FmhaMainloopTmaWarpSpecialized {
         Layout<Shape<_1, Int<kHeadDim / 256>, _1>>{})),
     decltype(convert_to_gmma_rs(typename CollectiveMmaPV::TiledMma{}))>;
 
-  // Rotor ring: (64 tok, 128 ch, Stages) K-major atoms, own stage stride.
-  using SmemLayoutRotAtom = decltype(cute::GMMA::Layout_K_SW128_Atom<Element>{});
-  using SmemLayoutRot = decltype(tile_to_shape(
+  // Merged 640-wide stage ring (S65): K-hat chunks 0..7 + rotor chunks
+  // 8..9 in ONE slot; u1+rotor arrive as ONE gmem-contiguous box
+  // (rec[192..512] -> chunks 5..9). Producer keeps the proven 4-state
+  // wrapper shape.
+  using SmemLayoutRec640 = decltype(tile_to_shape(
       cute::GMMA::Layout_K_SW128_Atom<Element>{},
-      cute::Shape<cute::Int<64>, cute::Int<128>, cute::Int<StageCount>>{}));
+      cute::Shape<cute::Int<64>, cute::Int<640>, cute::Int<StageCount>>{}));
   // PV piece mmas (RecNative): per-WG 128-thread RS, N=192 (K-hat shared
   // cols) and N=64 (rotor half). A (P) layout matches across pieces
   // (same M, K, major).
@@ -252,8 +254,9 @@ struct FmhaMainloopTmaWarpSpecialized {
   using PipelineStateQ  = typename cutlass::PipelineState<MainloopPipelineQ::Stages>;
 
   static constexpr int kInnerLoadBytes =
-      size(SmemLayoutK{}(_,_,_0{})) * sizeof(Element) +
-      (kRecNative ? int(size(SmemLayoutRot{}(_,_,_0{}))) * int(sizeof(Element)) : 0);
+      (kRecNative ? int(size(SmemLayoutRec640{}(_,_,_0{})))
+                  : int(size(SmemLayoutK{}(_,_,_0{})))) *
+      int(sizeof(Element));
   static constexpr int kOuterLoadBytes = size(SmemLayoutQ{}(_,_,_0{})) * sizeof(Element);
 
   static constexpr int MPerWG = int(get<0>(TileShapeQK{}));
@@ -282,12 +285,12 @@ struct FmhaMainloopTmaWarpSpecialized {
   struct SharedStorage {
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     union {
-      cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+      cute::array_aligned<Element,
+          kRecNative ? cute::cosize_v<SmemLayoutRec640>
+                     : cute::cosize_v<SmemLayoutK>> smem_k;
       cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
     };
     cute::array_aligned<Element, kSmemOHalfElems> smem_o_half;
-    cute::array_aligned<Element,
-        kRecNative ? cute::cosize_v<SmemLayoutRot> : 0> smem_rot;
     cute::array_aligned<Element, kSmemPElems> smem_p;
     cute::array_aligned<float, kSmemScaleElems> smem_scale;
   };
@@ -377,8 +380,22 @@ struct FmhaMainloopTmaWarpSpecialized {
       SM90_TMA_LOAD{}, GmemRecKTensor{}, RecBoxLayout<1>{}(_, _, _0{})));
   using TMA_KRec192 = decltype(make_tma_copy(
       SM90_TMA_LOAD{}, GmemRecKTensor{}, RecBoxLayout<3>{}(_, _, _0{})));
-  using TMA_Rot = decltype(make_tma_copy(
-      SM90_TMA_LOAD{}, GmemRecKTensor{}, SmemLayoutRot{}(_, _, _0{})));
+  // 640-slot box layouts for the RecNative loaders: same chunk recipe,
+  // stage stride = the 640 slot (40960 elems). TMA-only products (the
+  // layout_a() idiom is fine for TMA; GMMA views use canonical types).
+  static constexpr int kRec640StageElems =
+      cute::cosize_v<decltype(SmemLayoutRec640{}(_, _, _0{}))>;
+  template<int N>
+  using Rec640BoxInner = decltype(make_layout(
+      cute::layout<0>(SmemInnerKColDiv{}),
+      make_layout(cute::layout<1, 0>(SmemInnerKColDiv{}),
+                  Layout<Int<N>, Int<kRecChunkStride>>{}),
+      Layout<Int<StageCount>, Int<kRec640StageElems>>{}));
+  template<int N>
+  using Rec640BoxLayout =
+      decltype(composition(SmemLayoutK{}.layout_a(), Rec640BoxInner<N>{}));
+  using TMA_KRec320 = decltype(make_tma_copy(
+      SM90_TMA_LOAD{}, GmemRecKTensor{}, Rec640BoxLayout<5>{}(_, _, _0{})));
 
   // RecNative PV B-views: canonical MN-major layouts over the K-slot /
   // rotor bytes. tile_to_shape with tok-first order (Step<_2,_1>) makes
@@ -398,9 +415,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       cute::Step<cute::_2, cute::_1>{}));
   static constexpr int kKStageElems =
       cute::cosize_v<decltype(SmemLayoutK{}(_, _, _0{}))>;
-  static constexpr int kRotStageElems =
-      cute::cosize_v<decltype(SmemLayoutRot{}(_, _, _0{}))>;
-  static constexpr int kRotChunkElems = 64 * 64;
+
 
 
   // V-side record boxes (mode-2 producer overwrite): natural-order V
@@ -497,7 +512,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     TMA_KRec192 tma_load_k_rec_u0 = {};
     TMA_KRec64 tma_load_k_rec_s1 = {};
     TMA_KRec192 tma_load_k_rec_u1 = {};
-    TMA_Rot tma_load_rot = {};       // rec cols 384..512 -> rotor ring
+    TMA_KRec320 tma_load_k_rec_u1m = {};  // rec[192..512] -> chunks 5..9
     TMA_VRec64 tma_load_v_rec_s0 = {};
     TMA_VRec192 tma_load_v_rec_u0 = {};
     TMA_VRec64 tma_load_v_rec_s1 = {};
@@ -603,22 +618,27 @@ struct FmhaMainloopTmaWarpSpecialized {
     }
   };
 
-  using LoadRotBox = cutlass::fmha::collective::CollectiveLoadTma<
+  using LoadRec640Box1 = cutlass::fmha::collective::CollectiveLoadTma<
     cutlass::fmha::collective::LoadKind::kPaged64KRec,
-    MainloopPipeline, Element, SmemLayoutRot, TMA_Rot>;
+    MainloopPipeline, Element, Rec640BoxLayout<1>, TMA_KRec64>;
+  using LoadRec640Box3 = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPaged64KRec,
+    MainloopPipeline, Element, Rec640BoxLayout<3>, TMA_KRec192>;
+  using LoadRec640Box5 = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPaged64KRec,
+    MainloopPipeline, Element, Rec640BoxLayout<5>, TMA_KRec320>;
 
-  // RecNative K loader: 4 K-hat boxes + the rotor box, 5 copies per
-  // stage on ONE barrier (tx = K stage + rotor stage).
-  struct LoadRec640KRot {
-    LoadRecBox1 s0, s1;
-    LoadRecBox3 u0, u1;
-    LoadRotBox rot;
+  // RecNative merged loader (S65): FOUR states — the proven wrapper
+  // shape — because u1+rotor are one gmem-contiguous 320-col box.
+  struct LoadRec640KM {
+    LoadRec640Box1 s0, s1;
+    LoadRec640Box3 u0;
+    LoadRec640Box5 u1m;
     template<class... As>
     CUTLASS_DEVICE auto init_state(As&&... as) {
       return cute::make_tuple(
           s0.init_state(as...), u0.init_state(as...),
-          s1.init_state(as...), u1.init_state(as...),
-          rot.init_state(as...));
+          s1.init_state(as...), u1m.init_state(as...));
     }
     template<bool kAdvanceIterator = true, class TileIterator, class State,
              class PipeState>
@@ -632,9 +652,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       u0.template step<false, false, false>(it, get<1>(st), pipe, lane, d, mask);
       d = count;
       s1.template step<false, false, false>(it, get<2>(st), pipe, lane, d, mask);
-      d = count;
-      u1.template step<false, false, false>(it, get<3>(st), pipe, lane, d, mask);
-      rot.template step<kAdvanceIterator, true, false>(it, get<4>(st), pipe,
+      u1m.template step<kAdvanceIterator, true, false>(it, get<3>(st), pipe,
                                                        lane, count, mask);
     }
   };
@@ -776,7 +794,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     TMA_KRec192 tma_k_rec_u0{}, tma_k_rec_u1{};
     TMA_VRec64 tma_v_rec_s0{}, tma_v_rec_s1{};
     TMA_VRec192 tma_v_rec_u0{}, tma_v_rec_u1{};
-    TMA_Rot tma_rot{};
+    TMA_KRec320 tma_k_rec_u1m{};
     if (args.kv_pool_k != nullptr && args.pool_page_size == kTileN &&
         args.kv_pool_record640) {
       auto make_rec_g = [&](int col0, int w) {
@@ -817,8 +835,8 @@ struct FmhaMainloopTmaWarpSpecialized {
                                    RecVBoxLayout<1>{}(_, _, _0{}));
       tma_v_rec_u1 = make_tma_copy(SM90_TMA_LOAD{}, make_rec_gv(192, 192),
                                    RecVBoxLayout<3>{}(_, _, _0{}));
-      tma_rot = make_tma_copy(SM90_TMA_LOAD{}, make_rec_g(384, 128),
-                              SmemLayoutRot{}(_, _, _0{}));
+      tma_k_rec_u1m = make_tma_copy(SM90_TMA_LOAD{}, make_rec_g(192, 320),
+                                    Rec640BoxLayout<5>{}(_, _, _0{}));
     }
     Params p{
         params_qk.tma_load_a,
@@ -854,7 +872,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     p.tma_load_k_rec_u0 = tma_k_rec_u0;
     p.tma_load_k_rec_s1 = tma_k_rec_s1;
     p.tma_load_k_rec_u1 = tma_k_rec_u1;
-    p.tma_load_rot = tma_rot;
+    p.tma_load_k_rec_u1m = tma_k_rec_u1m;
     p.tma_load_v_rec_s0 = tma_v_rec_s0;
     p.tma_load_v_rec_u0 = tma_v_rec_u0;
     p.tma_load_v_rec_s1 = tma_v_rec_s1;
@@ -925,7 +943,9 @@ struct FmhaMainloopTmaWarpSpecialized {
     LoadQ load_q{params.tma_load_q, pipeline_q, storage.smem_q};
     auto load_state_q = load_q.init_state(_0{}, problem_size, TileShapeQK{}, blk_coord, NumQKWarpGroups);
 
-    LoadK load_k{params.tma_load_k, pipeline, storage.smem_k, nullptr,
+    LoadK load_k{params.tma_load_k, pipeline,
+        *reinterpret_cast<typename LoadK::SharedStorage*>(storage.smem_k.data()),
+        nullptr,
                  params.contig_gqa_group};
     auto load_state_k = load_k.init_state(block_rank_in_cluster, problem_size, TileShapeQK{}, blk_coord, fusion_tile_count);
 
@@ -1101,26 +1121,23 @@ struct FmhaMainloopTmaWarpSpecialized {
         // Record-native: 4 K-hat boxes + rotor box; NO V delivery at all
         // (PV reads the K-hat slot + rotor ring directly).
         auto* base = storage.smem_k.data();
-        LoadRec640KRot load_rec{
+        LoadRec640KM load_rec{
             {params.tma_load_k_rec_s0, pipeline,
-             *reinterpret_cast<typename LoadRecBox1::SharedStorage*>(base),
+             *reinterpret_cast<typename LoadRec640Box1::SharedStorage*>(base),
              params.page_table, params.gqa_group, params.max_blocks_per_seq,
              64, 0 * kRecChunkStride},
             {params.tma_load_k_rec_s1, pipeline,
-             *reinterpret_cast<typename LoadRecBox1::SharedStorage*>(base),
+             *reinterpret_cast<typename LoadRec640Box1::SharedStorage*>(base),
              params.page_table, params.gqa_group, params.max_blocks_per_seq,
              64, 4 * kRecChunkStride},
             {params.tma_load_k_rec_u0, pipeline,
-             *reinterpret_cast<typename LoadRecBox3::SharedStorage*>(base),
+             *reinterpret_cast<typename LoadRec640Box3::SharedStorage*>(base),
              params.page_table, params.gqa_group, params.max_blocks_per_seq,
              192, 1 * kRecChunkStride},
-            {params.tma_load_k_rec_u1, pipeline,
-             *reinterpret_cast<typename LoadRecBox3::SharedStorage*>(base),
+            {params.tma_load_k_rec_u1m, pipeline,
+             *reinterpret_cast<typename LoadRec640Box5::SharedStorage*>(base),
              params.page_table, params.gqa_group, params.max_blocks_per_seq,
-             192, 5 * kRecChunkStride},
-            {params.tma_load_rot, pipeline, storage.smem_rot,
-             params.page_table, params.gqa_group, params.max_blocks_per_seq,
-             128, 0}};
+             320, 5 * kRecChunkStride}};
         LoadPaged64V load_v64{params.tma_load_v_paged64, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
         run_kv_loads(load_rec, load_v64);
         return;
@@ -1173,11 +1190,15 @@ struct FmhaMainloopTmaWarpSpecialized {
         run_kv_loads(load_rec, load_v64);
       }
     } else if (params.pages_per_tile == 1) {
-      LoadPaged64K load_k64{params.tma_load_k_paged64, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      LoadPaged64K load_k64{params.tma_load_k_paged64, pipeline,
+          *reinterpret_cast<typename LoadPaged64K::SharedStorage*>(storage.smem_k.data()),
+          params.page_table, params.gqa_group, params.max_blocks_per_seq};
       LoadPaged64V load_v64{params.tma_load_v_paged64, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
       run_kv_loads(load_k64, load_v64);
     } else {
-      LoadPagedK load_k{params.tma_load_k_paged, pipeline, storage.smem_k, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+      LoadPagedK load_k{params.tma_load_k_paged, pipeline,
+          *reinterpret_cast<typename LoadPagedK::SharedStorage*>(storage.smem_k.data()),
+          params.page_table, params.gqa_group, params.max_blocks_per_seq};
       LoadPagedV load_v{params.tma_load_v_paged, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
       run_kv_loads(load_k, load_v);
     }
@@ -2487,9 +2508,19 @@ struct FmhaMainloopTmaWarpSpecialized {
     TiledMmaQK_Sym tiled_mma_qk;
     auto thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
     Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
-    Tensor sK_full = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
     Tensor tSsQ = thr_mma_qk.partition_fragment_A(sQ);
-    Tensor tSsK = thr_mma_qk.partition_fragment_B(sK_full);
+    // K-hat = chunks 0..7 of the 640 slot: canonical per-stage K views
+    // (stage indexed by pointer offset, kRec640StageElems).
+    using CanonK512 = decltype(tile_to_shape(
+        cute::GMMA::Layout_K_SW128_Atom<Element>{},
+        cute::Shape<cute::Int<64>, cute::Int<512>>{}));
+    Tensor sK0 = make_tensor(make_smem_ptr(storage.smem_k.data()),
+                             CanonK512{});
+    Tensor sK1 = make_tensor(
+        make_smem_ptr(storage.smem_k.data() + kRec640StageElems),
+        CanonK512{});
+    Tensor tSsK0 = thr_mma_qk.partition_fragment_B(sK0);
+    Tensor tSsK1 = thr_mma_qk.partition_fragment_B(sK1);
 
     int pv_thread_idx = thread_idx - NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
     int pv_wg_idx = pv_thread_idx / cutlass::NumThreadsPerWarpGroup;
@@ -2504,13 +2535,14 @@ struct FmhaMainloopTmaWarpSpecialized {
     static_assert(StageCount == 2, "RecNative PV prebuilds 2 stage views");
     auto* b192_base = storage.smem_k.data() +
                       (pv_wg_idx == 0 ? 1 : 5) * kRecChunkStride;
-    auto* b64_base = storage.smem_rot.data() + pv_wg_idx * kRotChunkElems;
+    auto* b64_base = storage.smem_k.data() +
+                     (pv_wg_idx == 0 ? 8 : 9) * kRecChunkStride;
     Tensor sB192_0 = make_tensor(make_smem_ptr(b192_base), RecPvB192Layout{});
-    Tensor sB192_1 = make_tensor(make_smem_ptr(b192_base + kKStageElems),
-                                 RecPvB192Layout{});
+    Tensor sB192_1 = make_tensor(
+        make_smem_ptr(b192_base + kRec640StageElems), RecPvB192Layout{});
     Tensor sB64_0 = make_tensor(make_smem_ptr(b64_base), RecPvB64Layout{});
-    Tensor sB64_1 = make_tensor(make_smem_ptr(b64_base + kRotStageElems),
-                                RecPvB64Layout{});
+    Tensor sB64_1 = make_tensor(
+        make_smem_ptr(b64_base + kRec640StageElems), RecPvB64Layout{});
     Tensor tOrB192_0 = thr_pv192.make_fragment_B(thr_pv192.partition_B(sB192_0));
     Tensor tOrB192_1 = thr_pv192.make_fragment_B(thr_pv192.partition_B(sB192_1));
     Tensor tOrB64_0 = thr_pv64.make_fragment_B(thr_pv64.partition_B(sB64_0));
@@ -2570,8 +2602,13 @@ struct FmhaMainloopTmaWarpSpecialized {
       pipeline.consumer_wait(smem_pipe_read);
       warpgroup_fence_operand(acc_qk);
       warpgroup_arrive();
-      gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
-                    tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
+      if (smem_pipe_read.index() == 0) {
+        gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                      tSsK0, acc_qk);
+      } else {
+        gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                      tSsK1, acc_qk);
+      }
       warpgroup_commit_batch();
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc_qk);
@@ -2600,8 +2637,13 @@ struct FmhaMainloopTmaWarpSpecialized {
       pipeline.consumer_wait(smem_pipe_read);
       warpgroup_fence_operand(acc_qk);
       warpgroup_arrive();
-      gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
-                    tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
+      if (smem_pipe_read.index() == 0) {
+        gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                      tSsK0, acc_qk);
+      } else {
+        gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                      tSsK1, acc_qk);
+      }
       warpgroup_commit_batch();
 
       warpgroup_wait<0>();
