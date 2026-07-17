@@ -43,12 +43,18 @@ struct IndividualTileScheduler {
 
   struct Params {
     dim3 grid;
+    // Heads-inner co-residency (GEMMA_SCHED_T=1): grid launched as
+    // (heads, m, batch) so co-resident CTAs share one m — for GQA
+    // (kvh<heads) they stream the SAME KV tiles in lockstep (L2 reuse)
+    // and each wave has uniform causal trip counts (no tail imbalance).
+    bool transposed;
   };
 
   bool valid_ = true;
+  bool transposed_ = false;
 
   CUTLASS_DEVICE
-  IndividualTileScheduler(Params const&) {}
+  IndividualTileScheduler(Params const& p) : transposed_(p.transposed) {}
 
   template<class ProblemSize, class ClusterShape, class TileShape>
   static Params to_underlying_arguments(
@@ -56,8 +62,17 @@ struct IndividualTileScheduler {
       ClusterShape const& cluster_shape, TileShape const& tile_shape)
   {
     using namespace cute;
-    dim3 grid(round_up(ceil_div(size<2>(problem_size), size<0>(tile_shape)), size<0>(cluster_shape)), size<0>(problem_size), size<1>(problem_size));
-    return Params{ grid };
+    static const bool transposed = []() {
+      const char* e = getenv("GEMMA_SCHED_T");
+      return e != nullptr && e[0] == '1';
+    }();
+    const int m_tiles = round_up(
+        ceil_div(size<2>(problem_size), size<0>(tile_shape)),
+        size<0>(cluster_shape));
+    dim3 grid = transposed
+        ? dim3(size<0>(problem_size), m_tiles, size<1>(problem_size))
+        : dim3(m_tiles, size<0>(problem_size), size<1>(problem_size));
+    return Params{ grid, transposed };
   }
 
   static dim3 get_grid_shape(Params const& params) {
@@ -72,7 +87,12 @@ struct IndividualTileScheduler {
   CUTLASS_DEVICE
   auto get_block_coord() {
     using namespace cute;
-    return make_coord(blockIdx.x, _0{}, make_coord(blockIdx.y, blockIdx.z));
+    if (transposed_) {
+      return make_coord(int(blockIdx.y), _0{},
+                        make_coord(int(blockIdx.x), int(blockIdx.z)));
+    }
+    return make_coord(int(blockIdx.x), _0{},
+                      make_coord(int(blockIdx.y), int(blockIdx.z)));
   }
 
   CUTLASS_DEVICE
