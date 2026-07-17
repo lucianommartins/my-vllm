@@ -442,6 +442,14 @@ struct FmhaCachedLauncher {
       p.mainloop.v_fill_stride_block = g_v_fill_sb;
       p.mainloop.v_fill_stride_slot = g_v_fill_ss;
       p.mainloop.v_fill_stride_head = g_v_fill_sh;
+      // Symmetric-PV consumers (GEMMA_SYMPV=1): legal only when no
+      // in-place K-tile transform runs (v_fill_tma mode or plain).
+      static const bool sympv_env = []() {
+        const char* e = getenv("GEMMA_SYMPV");
+        return e != nullptr && e[0] == '1';
+      }();
+      p.mainloop.symmetric_pv =
+          sympv_env && !g_v_fill && g_recon_invfreq == nullptr;
     }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)

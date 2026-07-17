@@ -446,6 +446,19 @@ struct FmhaKernelTmaWarpSpecialized {
         // For split-D: both WGs handle the same M block (no M-split)
 
         if constexpr (kSplitDPV) {
+          if (params.mainloop.symmetric_pv) {
+            // Symmetric consumers: full QK per WG + register-P RS PV
+            // (v_fill_tma / no-transform modes only; host gates).
+            collective_mainloop.compute_sym(
+              blk_coord, wg_coord,
+              params.mainloop, problem_size,
+              pipeline_inner, smem_pipe_read_inner,
+              pipeline_outer, smem_pipe_read_outer,
+              pipeline_reducer, smem_pipe_write_reducer,
+              storage.tensors.mainloop,
+              math_wg_order_barrier,
+              pipeline_vfill, smem_pipe_read_vfill);
+          } else {
           // N-split cooperative: each WG does QK on its N-half + SS PV
           collective_mainloop.compute_ncoop(
             blk_coord, wg_coord,
@@ -456,6 +469,7 @@ struct FmhaKernelTmaWarpSpecialized {
             storage.tensors.mainloop,
             math_wg_order_barrier,
             pipeline_vfill, smem_pipe_read_vfill);
+          }
         } else {
           auto result = [&]() {
             if constexpr (kHeadChunkedPV) {

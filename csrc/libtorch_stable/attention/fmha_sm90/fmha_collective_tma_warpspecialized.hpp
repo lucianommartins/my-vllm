@@ -166,6 +166,26 @@ struct FmhaMainloopTmaWarpSpecialized {
         Layout<Shape<_1, Int<kHeadDim / 256>, _1>>{})),
     decltype(convert_to_gmma_rs(typename CollectiveMmaPV::TiledMma{}))>;
 
+  // Symmetric-PV (S59/S60 blueprint): each consumer WG computes the FULL
+  // QK + its own softmax (redundant math), then PVs its 256-col half with
+  // P in REGISTERS — no P all-gather, no smem_scale exchange, no
+  // kBarrierPFull/PEmpty per tile (FA4's own hd512 structure).
+  using TiledMmaQK_Sym = cute::conditional_t<kSplitDPV,
+    decltype(cute::make_tiled_mma(
+        cute::GMMA::ss_op_selector<
+            Element, Element, ElementAccumulatorQK,
+            TileShapeQK,
+            cute::GMMA::Major::K, cute::GMMA::Major::K>())),
+    typename CollectiveMmaQK::TiledMma>;
+  using TiledMmaPV_SymRS = cute::conditional_t<kSplitDPV,
+    decltype(cute::make_tiled_mma(
+        cute::GMMA::rs_op_selector<
+            Element, Element, ElementAccumulatorPV,
+            TileShapePV,
+            cute::GMMA::Major::K, cute::GMMA::Major::MN>(),
+        Layout<Shape<_1, Int<kHeadDim / 256>, _1>>{})),
+    decltype(convert_to_gmma_rs(typename CollectiveMmaPV::TiledMma{}))>;
+
   using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StagesQ::value>{}));
   using SmemLayoutK = typename CollectiveMmaQK::SmemLayoutB;
   using SmemLayoutV = typename CollectiveMmaPV::SmemLayoutB;
@@ -416,6 +436,9 @@ struct FmhaMainloopTmaWarpSpecialized {
     // V via the fill path (rotor columns only — the unrot columns of the
     // K tile already hold natural-position V values).
     bool record640 = false;
+    // Symmetric-PV consumers (requires v_fill_tma or no in-place K
+    // transform; host gates). Runtime switch — no new instantiation.
+    bool symmetric_pv = false;
     TMA_KRec64 tma_load_k_rec_s0 = {};
     TMA_KRec192 tma_load_k_rec_u0 = {};
     TMA_KRec64 tma_load_k_rec_s1 = {};
@@ -2301,6 +2324,275 @@ struct FmhaMainloopTmaWarpSpecialized {
         const int64_t lse_base =
             (int64_t)batch_idx * seqlen_q +
             (int64_t)head_idx * seqlen_q * get<0>(problem_size);
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < size<0>(pv_mn); mi++) {
+          int m = get<0>(tOcO(pv_mn(mi, _0{})));
+          if (m + m_block * MPerWG < seqlen_q) {
+            params.ptr_LSE[lse_base + m + m_block * MPerWG] = lse(mi);
+          }
+        }
+      }
+    }
+  }
+
+
+  // ===== Symmetric-PV consumer (S59/S60): full QK per WG, local softmax,
+  // register-P RS PV on the WG's 256-col half. Supports v_fill_tma
+  // (record / V_FILL=2) and no-transform modes ONLY — in-place K-tile
+  // transforms (fill mode-1, recon) need a cross-WG QK-drained barrier
+  // that this path deliberately does not have (host gates the switch).
+  template<class BlkCoord, class ProblemShape, class MainloopPipelineReducer,
+           class PipelineStateReducer, class MathWgOrderBarrier>
+  CUTLASS_DEVICE void
+  compute_sym(
+      BlkCoord const& blk_coord, BlkCoord const& wg_coord,
+      Params const& params, ProblemShape const& problem_size,
+      MainloopPipeline& pipeline, PipelineState& smem_pipe_read,
+      MainloopPipelineQ& pipeline_q, PipelineStateQ& smem_pipe_read_q,
+      MainloopPipelineReducer&, PipelineStateReducer&,
+      SharedStorage& storage,
+      MathWgOrderBarrier&,
+      MainloopPipeline& pipeline_vfill, PipelineState& smem_pipe_read_vfill)
+  {
+    static_assert(kSplitDPV);
+    int thread_idx = int(threadIdx.x);
+
+    PipelineState smem_pipe_release = smem_pipe_read;
+    PipelineStateQ smem_pipe_release_q = smem_pipe_read_q;
+
+    // QK: 128-thread SS MMA on the FULL tile per WG (redundant across WGs)
+    TiledMmaQK_Sym tiled_mma_qk;
+    auto thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+
+    Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+    Tensor sK_full = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
+    Tensor tSsQ = thr_mma_qk.partition_fragment_A(sQ);
+    Tensor tSsK = thr_mma_qk.partition_fragment_B(sK_full);
+
+    // PV: RS mode, WG owns its 256-col half; A (P) lives in registers.
+    TiledMmaPV_SymRS tiled_mma_pv;
+    static constexpr int kPVWarpGroups = kHeadDim / 256;
+    Layout wg_pv_layout = make_layout(Int<kPVWarpGroups>{}, Int<128>{});
+    int pv_thread_idx = thread_idx - NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
+    int pv_wg_idx = pv_thread_idx / cutlass::NumThreadsPerWarpGroup;
+    auto wg_mma_pv = tiled_mma_pv.get_slice(wg_pv_layout(pv_wg_idx));
+
+    Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
+    Tensor tOsV = wg_mma_pv.partition_fragment_B(sV);
+
+    int k_tile_count = Fusion{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_size);
+    pipeline_q.consumer_wait(smem_pipe_read_q);
+
+    // QK identity for masking (FULL-N, global offsets)
+    Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{}));
+    Tensor tPcP = thr_mma_qk.partition_C(cP);
+    int m_block = get<0>(wg_coord);
+    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{})
+                              + E<1>{} * (Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size) * get<1>(TileShapeQK{}));
+
+    Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
+
+    cutlass::fmha::collective::CollectiveSoftmax<ElementAccumulatorQK, Fusion, decltype(params)> softmax{params};
+    auto softmax_state = softmax.init(acc_pv, tiled_mma_pv);
+    auto& s_max = get<0>(softmax_state);
+    auto& a_sum = get<1>(softmax_state);
+
+    // Persistent register P (RS A operand), converted per tile from the
+    // QK accumulator via the acc-layout alias (same trick as the
+    // non-split stream path).
+    Tensor tOrP = make_fragment_like<Element>(
+        convert_c_layout_to_a_layout(
+            partition_fragment_C(tiled_mma_qk, take<0,2>(TileShapeQK{})).layout(),
+            shape<1>(typename TiledMmaPV_SymRS::LayoutA_TV{})));
+
+    // v_fill_tma bookkeeping (mode-2 producer V overwrite): release =
+    // this WG's QK drained; wait = V tile landed for PV. Per-WG calls;
+    // the pipeline's consumer counting spans both WGs as before.
+    PipelineState vfill_release_state = smem_pipe_read_vfill;
+    auto vfill_qk_done = [&]() {
+      if constexpr (kKEqV) {
+        if (params.v_fill_tma) {
+          pipeline_vfill.consumer_release(vfill_release_state);
+          ++vfill_release_state;
+        }
+      }
+    };
+    auto vfill_wait_v = [&]() {
+      if constexpr (kKEqV) {
+        if (params.v_fill_tma) {
+          pipeline_vfill.consumer_wait(smem_pipe_read_vfill);
+          ++smem_pipe_read_vfill;
+        }
+      }
+    };
+
+    // ===== First KV tile =====
+    {
+      --k_tile_count;
+      Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
+
+      pipeline.consumer_wait(smem_pipe_read);
+      warpgroup_fence_operand(acc_qk);
+      warpgroup_arrive();
+      gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                    tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
+      warpgroup_commit_batch();
+      if constexpr (!kKEqV) ++smem_pipe_read;
+
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_qk);
+
+      vfill_qk_done();
+      softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
+                   acc_pv, tiled_mma_pv, problem_size);
+
+      Tensor tOrP_as_acc = make_tensor(tOrP.data(), acc_qk.layout());
+      cute::copy(acc_qk, tOrP_as_acc);
+
+      pipeline.consumer_wait(smem_pipe_read);
+      vfill_wait_v();
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_fence_operand(tOrP);
+      warpgroup_arrive();
+      gemm_zero_acc(tiled_mma_pv, tOrP, tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
+      warpgroup_commit_batch();
+
+      if constexpr (!kKEqV) {
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      }
+      ++smem_pipe_read;
+      tPcP.data() = tPcP.data() + E<1>{} * int(get<1>(TileShapeQK{}));
+    }
+
+    // ===== Subsequent KV tiles =====
+    k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    int mask_t_abs = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size) - k_tile_count;
+    CUTLASS_PRAGMA_NO_UNROLL
+    while (k_tile_count > 0) {
+      --k_tile_count;
+      Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
+
+      pipeline.consumer_wait(smem_pipe_read);
+      warpgroup_fence_operand(acc_qk);
+      warpgroup_arrive();
+      gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                    tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
+      warpgroup_commit_batch();
+      if constexpr (!kKEqV) ++smem_pipe_read;
+      auto tok = pipeline.consumer_try_wait(smem_pipe_read);
+
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_qk);
+      warpgroup_fence_operand(acc_pv);
+      if constexpr (kKEqV) {
+        // Deferred stage release: wait<0> drained PV(t-1)'s read of this
+        // slot as V.
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      }
+
+      vfill_qk_done();
+      softmax.step(acc_qk, tiled_mma_qk, tPcP, softmax_state,
+                   acc_pv, tiled_mma_pv, problem_size,
+                   Fusion{}.tile_needs_mask(mask_t_abs++, blk_coord,
+                                            TileShape{}, problem_size));
+
+      Tensor tOrP_as_acc = make_tensor(tOrP.data(), acc_qk.layout());
+      cute::copy(acc_qk, tOrP_as_acc);
+
+      pipeline.consumer_wait(smem_pipe_read, tok);
+      vfill_wait_v();
+      warpgroup_fence_operand(acc_pv);
+      warpgroup_fence_operand(tOrP);
+      warpgroup_arrive();
+      tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
+      cute::gemm(tiled_mma_pv, tOrP, tOsV(_,_,_,smem_pipe_read.index()), acc_pv);
+      warpgroup_commit_batch();
+
+      if constexpr (!kKEqV) {
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+        pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+      }
+      ++smem_pipe_read;
+      tPcP.data() = tPcP.data() + E<1>{} * int(get<1>(TileShapeQK{}));
+    }
+
+    // ===== Tail =====
+    if (kIsPersistent) pipeline_q.consumer_release(smem_pipe_release_q);
+    warpgroup_wait<0>();
+    warpgroup_fence_operand(acc_pv);
+    if (kIsPersistent) pipeline.consumer_release(smem_pipe_release);
+    ++smem_pipe_release;
+
+    // a_sum intra-WG reduction (full-N: this IS the global sum)
+    auto reduction_target_qk = reduction_target_n(tiled_mma_qk);
+    constexpr int red_rank_qk = decltype(rank(reduction_target_qk))::value;
+    for_each(make_seq<red_rank_qk>{}, [&](auto r) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 1; j < shape<r>(reduction_target_qk); j *= 2) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(a_sum); i++) {
+          a_sum(i) = a_sum(i) + __shfl_xor_sync(uint32_t(-1), a_sum(i), stride<r>(reduction_target_qk) * j);
+        }
+      }
+    });
+
+    // Normalize O and compute LSE (local stats are complete)
+    Tensor lse = make_fragment_like(a_sum);
+    auto pv_mn = layout_acc_mn(tiled_mma_pv, acc_pv.layout());
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(pv_mn); mi++) {
+      float sum = a_sum(mi);
+      float inv_sum = (sum == 0.f || sum != sum) ? 1.f : __frcp_rn(sum);
+      lse(mi) = (sum == 0.f || sum != sum) ? INFINITY : s_max(mi) * params.scale_softmax + __logf(sum);
+      float scale = params.rp_dropout * inv_sum;
+      CUTLASS_PRAGMA_UNROLL
+      for (int ni = 0; ni < size<1>(pv_mn); ni++) {
+        acc_pv(pv_mn(mi, ni)) *= scale;
+      }
+    }
+
+    // O write (pair-packed, same as ncoop's tail)
+    int batch_idx = get<0>(get<2>(wg_coord));
+    int head_idx = get<1>(get<2>(wg_coord));
+    int seq_stride_o = get<0>(params.dO);
+    int batch_stride_o = get<0>(get<2>(params.dO));
+    int head_stride_o = get<1>(get<2>(params.dO));
+    int o_base = batch_idx * batch_stride_o + head_idx * head_stride_o +
+                 m_block * MPerWG * seq_stride_o;
+    int seqlen_q = get<2>(problem_size);
+
+    auto thr_pv = tiled_mma_pv.get_thread_slice(pv_thread_idx);
+    Tensor cO = make_identity_tensor(take<0, 2>(TileShapePV{}));
+    Tensor tOcO = thr_pv.partition_C(cO);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(acc_pv); i += 2) {
+      int m = get<0>(tOcO(i));
+      int n = get<1>(tOcO(i));
+      if (m + m_block * MPerWG < seqlen_q) {
+        if (get<0>(tOcO(i + 1)) == m && get<1>(tOcO(i + 1)) == n + 1) {
+          uint32_t pk =
+              (uint32_t)static_cast<Element>(acc_pv(i)).storage |
+              ((uint32_t)static_cast<Element>(acc_pv(i + 1)).storage << 16);
+          *reinterpret_cast<uint32_t*>(
+              &params.ptr_O[o_base + m * seq_stride_o + n]) = pk;
+        } else {
+          params.ptr_O[o_base + m * seq_stride_o + n] =
+              static_cast<Element>(acc_pv(i));
+          params.ptr_O[o_base + get<0>(tOcO(i + 1)) * seq_stride_o +
+                       get<1>(tOcO(i + 1))] =
+              static_cast<Element>(acc_pv(i + 1));
+        }
+      }
+    }
+
+    // LSE (WG0 only — both WGs hold identical stats)
+    if (params.ptr_LSE != nullptr && pv_wg_idx == 0) {
+      if (get<1>(tOcO(pv_mn(_0{}, _0{}))) == 0) {
+        const int64_t lse_base =
+            (int64_t)batch_idx * get<2>(problem_size) +
+            (int64_t)head_idx * get<2>(problem_size) * get<0>(problem_size);
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size<0>(pv_mn); mi++) {
           int m = get<0>(tOcO(pv_mn(mi, _0{})));
