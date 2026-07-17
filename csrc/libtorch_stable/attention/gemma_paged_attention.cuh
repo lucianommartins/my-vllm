@@ -1817,7 +1817,11 @@ gemma_decode_fused_kernel(
       if (n < _ntok) {                                                         \
         const int tok = _kv0 + n;                                              \
         const int64_t phys = block_table[tok / page_size];                     \
-        const int sdv = (record640 && dv >= 384) ? dv + 128 : dv;              \
+        const int sdv = !record640 ? dv                                        \
+                        : (dv < 64)    ? dv + 512                              \
+                        : (dv < 256)   ? dv - 64                               \
+                        : (dv < 320)   ? dv + 320                              \
+                                       : dv - 128;                             \
         const int64_t off = phys * kv_stride_block +                           \
                             (tok % page_size) * kv_stride_slot +               \
                             kv_head * kv_stride_head + sdv;                    \
@@ -1925,12 +1929,14 @@ gemma_decode_fused_kernel(
         constexpr int VEC16 = 16 / (int)sizeof(cache_t);
         constexpr int NV = 128 / VEC16;
         for (int i = tid; i < n_tok * NV; i += nthreads) {
-          const int n = i / NV, dv = 384 + (i - n * NV) * VEC16;
+          const int n = i / NV, k = i - n * NV;
+          const int dv = (k < NV / 2) ? k * VEC16 : 256 + (k - NV / 2) * VEC16;
+          const int src = (dv < 64) ? dv + 384 : dv + 192;
           const int tok = kv0 + n;
           const int64_t phys = block_table[tok / page_size];
           const int64_t off = phys * kv_stride_block +
                               (tok % page_size) * kv_stride_slot +
-                              kv_head * kv_stride_head + dv;
+                              kv_head * kv_stride_head + src;
           *reinterpret_cast<uint4*>(kbuf + n * LDH + dv) =
               *reinterpret_cast<const uint4*>(k_cache + off);
         }

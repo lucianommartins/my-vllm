@@ -406,21 +406,8 @@ class GemmaAttentionBackend(AttentionBackend):
 
 _V3_DEV_READER = os.environ.get("GEMMA_V3_DEV_READER") == "1"
 _V3_RECORD_DECODE = os.environ.get("GEMMA_V3_RECORD_DECODE") == "1"
-_V3_KHAT: torch.Tensor | None = None
-
-
-def _v3_khat(dev: torch.device) -> torch.Tensor:
-    """K-hat channel order (== Vperm): [64..256, 320..512, 0..64, 256..320].
-    Runtime Q/O permutation for record-direct decode while the offline
-    weight permutations have not landed; decode-only, tokens are few."""
-    global _V3_KHAT
-    if _V3_KHAT is None or _V3_KHAT.device != dev:
-        _V3_KHAT = torch.tensor(
-            list(range(64, 256)) + list(range(320, 512))
-            + list(range(0, 64)) + list(range(256, 320)),
-            device=dev,
-        )
-    return _V3_KHAT
+# Natural-order record readers: the kernel address map absorbs the
+# record permutation, so no Q/O/weight permutation exists anywhere.
 _V3_DEV_SCRATCH: dict = {}
 _V3_UNROT: torch.Tensor | None = None
 _V3_VPERM: torch.Tensor | None = None
@@ -994,15 +981,15 @@ class GemmaAttentionImpl(AttentionImpl):
             print(f"[V3DBG] RECORD-DIRECT DECODE active: "
                   f"layer={layer.layer_name} pool={tuple(record_pool.shape)} "
                   f"scale*w={self.scale * w:.6f}", flush=True)
-        khat = _v3_khat(query.device)
-        q_perm = query[:, :, khat].contiguous()
-        out_perm = torch.empty_like(q_perm)
+        # Natural-order record reads: the kernel's address map absorbs the
+        # permutation, so Q and O stay in natural channel order — no
+        # weight surgery, no runtime gathers.
         torch.ops._C.gemma_paged_attention(
-            out_perm,
+            output[:num_seqs],
             exp_sums,
             max_logits,
             tmp_out,
-            q_perm,
+            query,
             record_pool,
             record_pool,
             self.num_kv_heads,
@@ -1022,9 +1009,6 @@ class GemmaAttentionImpl(AttentionImpl):
             self._empty_f32,
             1.0,
         )
-        # O arrives in Vperm order; scatter back to natural channels
-        # (offline o_proj row permutation replaces this later).
-        output[:num_seqs].view_as(out_perm)[:, :, khat] = out_perm
         return output
 
     def _vrecon_args(self, layer, dev):
