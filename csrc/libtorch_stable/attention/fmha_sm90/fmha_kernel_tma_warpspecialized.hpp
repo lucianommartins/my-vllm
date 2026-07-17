@@ -142,7 +142,11 @@ struct FmhaKernelTmaWarpSpecialized {
   static const int MaxThreadsPerBlock = (NumMmaWarpGroups + NumLoadWarpGroups) * cutlass::NumThreadsPerWarpGroup;
   using ArchTag = cutlass::arch::Sm90;
 
-  static constexpr uint32_t LoadRegisterRequirement = 40 - 2 * 8;
+  // RecNative's producer holds FIVE TMA loader states (4 K-hat boxes +
+  // rotor); at the default 24-reg dealloc they spill to local with
+  // misaligned u128 slots (S64 sanitizer). Give the load WG headroom.
+  static constexpr uint32_t LoadRegisterRequirement =
+      CollectiveMainloop::kRecNative ? 56 : (40 - 2 * 8);
   static constexpr uint32_t TotalRegisterSupply = (64*1024 / MaxThreadsPerBlock / MinBlocksPerMultiprocessor / 8) * 8 * MaxThreadsPerBlock / cutlass::NumThreadsPerWarpGroup;
   static constexpr uint32_t MmaRegisterRequirementRaw = ((TotalRegisterSupply - LoadRegisterRequirement) / NumMmaWarpGroups / 8) * 8;
   static constexpr uint32_t MmaRegisterRequirement = MmaRegisterRequirementRaw > 256 ? 256 : MmaRegisterRequirementRaw;
@@ -446,7 +450,17 @@ struct FmhaKernelTmaWarpSpecialized {
         // For split-D: both WGs handle the same M block (no M-split)
 
         if constexpr (kSplitDPV) {
-          if constexpr (CollectiveMainloop::kSymmetricPV) {
+          if constexpr (CollectiveMainloop::kRecNative) {
+            collective_mainloop.compute_sym_rec(
+              blk_coord, wg_coord,
+              params.mainloop, problem_size,
+              pipeline_inner, smem_pipe_read_inner,
+              pipeline_outer, smem_pipe_read_outer,
+              pipeline_reducer, smem_pipe_write_reducer,
+              storage.tensors.mainloop,
+              math_wg_order_barrier,
+              pipeline_vfill, smem_pipe_read_vfill);
+          } else if constexpr (CollectiveMainloop::kSymmetricPV) {
             // Symmetric consumers: full QK per WG + register-P RS PV
             // (v_fill_tma / no-transform modes only; host gates).
             collective_mainloop.compute_sym(

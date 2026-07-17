@@ -78,6 +78,11 @@ struct FmhaMainloopTmaWarpSpecialized {
   static constexpr bool kKEqV = find_option_t<Tag::kKEqV, false_type, Options...>::value;
   static constexpr bool kOverlapSoftmax = find_option_t<Tag::kOverlapSoftmax, false_type, Options...>::value;
   static constexpr bool kSymmetricPV = find_option_t<Tag::kSymmetricPV, false_type, Options...>::value;
+  // Record-native staging: rotor ring replaces the V TMA overwrite
+  // entirely (PV reads the K-hat slot's shared 384 columns through
+  // transposed views + the 128 rotor columns from a small ring).
+  static constexpr bool kRecNative = find_option_t<Tag::kRecNative, false_type, Options...>::value;
+  static_assert(!kRecNative || kSymmetricPV, "RecNative requires SymmetricPV");
 
   static constexpr int NumLoadWarpGroups = 1;
   static constexpr int NumMmaWarpGroups = find_option_t<Tag::kNumMmaWarpGroups, Int<2>, Options...>::value;
@@ -187,6 +192,25 @@ struct FmhaMainloopTmaWarpSpecialized {
         Layout<Shape<_1, Int<kHeadDim / 256>, _1>>{})),
     decltype(convert_to_gmma_rs(typename CollectiveMmaPV::TiledMma{}))>;
 
+  // Rotor ring: (64 tok, 128 ch, Stages) K-major atoms, own stage stride.
+  using SmemLayoutRotAtom = decltype(cute::GMMA::Layout_K_SW128_Atom<Element>{});
+  using SmemLayoutRot = decltype(tile_to_shape(
+      cute::GMMA::Layout_K_SW128_Atom<Element>{},
+      cute::Shape<cute::Int<64>, cute::Int<128>, cute::Int<StageCount>>{}));
+  // PV piece mmas (RecNative): per-WG 128-thread RS, N=192 (K-hat shared
+  // cols) and N=64 (rotor half). A (P) layout matches across pieces
+  // (same M, K, major).
+  using TiledMmaPV_R192 = decltype(cute::make_tiled_mma(
+      cute::GMMA::rs_op_selector<
+          Element, Element, ElementAccumulatorPV,
+          cute::Shape<cute::_64, cute::_192, cute::_64>,
+          cute::GMMA::Major::K, cute::GMMA::Major::MN>()));
+  using TiledMmaPV_R64 = decltype(cute::make_tiled_mma(
+      cute::GMMA::rs_op_selector<
+          Element, Element, ElementAccumulatorPV,
+          cute::Shape<cute::_64, cute::_64, cute::_64>,
+          cute::GMMA::Major::K, cute::GMMA::Major::MN>()));
+
   using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StagesQ::value>{}));
   using SmemLayoutK = typename CollectiveMmaQK::SmemLayoutB;
   using SmemLayoutV = typename CollectiveMmaPV::SmemLayoutB;
@@ -227,7 +251,9 @@ struct FmhaMainloopTmaWarpSpecialized {
   using PipelineState  = typename cutlass::PipelineState<MainloopPipeline::Stages>;
   using PipelineStateQ  = typename cutlass::PipelineState<MainloopPipelineQ::Stages>;
 
-  static constexpr int kInnerLoadBytes = size(SmemLayoutK{}(_,_,_0{})) * sizeof(Element);
+  static constexpr int kInnerLoadBytes =
+      size(SmemLayoutK{}(_,_,_0{})) * sizeof(Element) +
+      (kRecNative ? int(size(SmemLayoutRot{}(_,_,_0{}))) * int(sizeof(Element)) : 0);
   static constexpr int kOuterLoadBytes = size(SmemLayoutQ{}(_,_,_0{})) * sizeof(Element);
 
   static constexpr int MPerWG = int(get<0>(TileShapeQK{}));
@@ -240,8 +266,11 @@ struct FmhaMainloopTmaWarpSpecialized {
 
   // Split-D: P smem (correct Swizzle<3,4,3> from CollectiveMmaPV) + scale smem
   using SmemLayoutP = typename CollectiveMmaPV::SmemLayoutA;
-  static constexpr int kSmemPElems = kSplitDPV ? cute::cosize_v<SmemLayoutP> : 0;
-  static constexpr int kSmemScaleElems = kSplitDPV ? MPerWG * 2 : 0;
+  // RecNative never touches P/scale smem (register-P, local softmax).
+  static constexpr int kSmemPElems =
+      (kSplitDPV && !kRecNative) ? cute::cosize_v<SmemLayoutP> : 0;
+  static constexpr int kSmemScaleElems =
+      (kSplitDPV && !kRecNative) ? MPerWG * 2 : 0;
   static constexpr int kNumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
   static constexpr uint32_t kBarrierPFull = 10;
   static constexpr uint32_t kBarrierPEmpty = 11;
@@ -257,6 +286,8 @@ struct FmhaMainloopTmaWarpSpecialized {
       cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
     };
     cute::array_aligned<Element, kSmemOHalfElems> smem_o_half;
+    cute::array_aligned<Element,
+        kRecNative ? cute::cosize_v<SmemLayoutRot> : 0> smem_rot;
     cute::array_aligned<Element, kSmemPElems> smem_p;
     cute::array_aligned<float, kSmemScaleElems> smem_scale;
   };
@@ -346,6 +377,31 @@ struct FmhaMainloopTmaWarpSpecialized {
       SM90_TMA_LOAD{}, GmemRecKTensor{}, RecBoxLayout<1>{}(_, _, _0{})));
   using TMA_KRec192 = decltype(make_tma_copy(
       SM90_TMA_LOAD{}, GmemRecKTensor{}, RecBoxLayout<3>{}(_, _, _0{})));
+  using TMA_Rot = decltype(make_tma_copy(
+      SM90_TMA_LOAD{}, GmemRecKTensor{}, SmemLayoutRot{}(_, _, _0{})));
+
+  // RecNative PV B-views: canonical MN-major layouts over the K-slot /
+  // rotor bytes. tile_to_shape with tok-first order (Step<_2,_1>) makes
+  // the canonical MN atom tiling land on EXACTLY the K-major ring's
+  // codomain (tok-blocks at 512 elems, 64-ch chunks at 4096), so the
+  // GMMA descriptor is legal by construction (the earlier layout_a()
+  // composition stripped the smem-ptr flag -> swizzle recast degraded).
+  // Stage indexing is done by pointer offset (stage strides are
+  // swizzle-period multiples), not a layout mode.
+  using RecPvB192Layout = decltype(tile_to_shape(
+      cute::GMMA::Layout_MN_SW128_Atom<Element>{},
+      cute::Shape<cute::Int<192>, cute::Int<64>>{},
+      cute::Step<cute::_2, cute::_1>{}));
+  using RecPvB64Layout = decltype(tile_to_shape(
+      cute::GMMA::Layout_MN_SW128_Atom<Element>{},
+      cute::Shape<cute::Int<64>, cute::Int<64>>{},
+      cute::Step<cute::_2, cute::_1>{}));
+  static constexpr int kKStageElems =
+      cute::cosize_v<decltype(SmemLayoutK{}(_, _, _0{}))>;
+  static constexpr int kRotStageElems =
+      cute::cosize_v<decltype(SmemLayoutRot{}(_, _, _0{}))>;
+  static constexpr int kRotChunkElems = 64 * 64;
+
 
   // V-side record boxes (mode-2 producer overwrite): natural-order V
   // assembled in the V smem slot from the same 4 record windows, on the
@@ -441,6 +497,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     TMA_KRec192 tma_load_k_rec_u0 = {};
     TMA_KRec64 tma_load_k_rec_s1 = {};
     TMA_KRec192 tma_load_k_rec_u1 = {};
+    TMA_Rot tma_load_rot = {};       // rec cols 384..512 -> rotor ring
     TMA_VRec64 tma_load_v_rec_s0 = {};
     TMA_VRec192 tma_load_v_rec_u0 = {};
     TMA_VRec64 tma_load_v_rec_s1 = {};
@@ -543,6 +600,42 @@ struct FmhaMainloopTmaWarpSpecialized {
       s1.template step<false, false, false>(it, get<2>(st), pipe, lane, d, mask);
       u1.template step<kAdvanceIterator, true, false>(it, get<3>(st), pipe,
                                                       lane, count, mask);
+    }
+  };
+
+  using LoadRotBox = cutlass::fmha::collective::CollectiveLoadTma<
+    cutlass::fmha::collective::LoadKind::kPaged64KRec,
+    MainloopPipeline, Element, SmemLayoutRot, TMA_Rot>;
+
+  // RecNative K loader: 4 K-hat boxes + the rotor box, 5 copies per
+  // stage on ONE barrier (tx = K stage + rotor stage).
+  struct LoadRec640KRot {
+    LoadRecBox1 s0, s1;
+    LoadRecBox3 u0, u1;
+    LoadRotBox rot;
+    template<class... As>
+    CUTLASS_DEVICE auto init_state(As&&... as) {
+      return cute::make_tuple(
+          s0.init_state(as...), u0.init_state(as...),
+          s1.init_state(as...), u1.init_state(as...),
+          rot.init_state(as...));
+    }
+    template<bool kAdvanceIterator = true, class TileIterator, class State,
+             class PipeState>
+    CUTLASS_DEVICE void step(TileIterator& it, State const& st,
+                             PipeState& pipe, int lane, int& count,
+                             uint16_t mask = 0) {
+      int d;
+      d = count;
+      s0.template step<false, false, true>(it, get<0>(st), pipe, lane, d, mask);
+      d = count;
+      u0.template step<false, false, false>(it, get<1>(st), pipe, lane, d, mask);
+      d = count;
+      s1.template step<false, false, false>(it, get<2>(st), pipe, lane, d, mask);
+      d = count;
+      u1.template step<false, false, false>(it, get<3>(st), pipe, lane, d, mask);
+      rot.template step<kAdvanceIterator, true, false>(it, get<4>(st), pipe,
+                                                       lane, count, mask);
     }
   };
 
@@ -683,6 +776,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     TMA_KRec192 tma_k_rec_u0{}, tma_k_rec_u1{};
     TMA_VRec64 tma_v_rec_s0{}, tma_v_rec_s1{};
     TMA_VRec192 tma_v_rec_u0{}, tma_v_rec_u1{};
+    TMA_Rot tma_rot{};
     if (args.kv_pool_k != nullptr && args.pool_page_size == kTileN &&
         args.kv_pool_record640) {
       auto make_rec_g = [&](int col0, int w) {
@@ -723,6 +817,8 @@ struct FmhaMainloopTmaWarpSpecialized {
                                    RecVBoxLayout<1>{}(_, _, _0{}));
       tma_v_rec_u1 = make_tma_copy(SM90_TMA_LOAD{}, make_rec_gv(192, 192),
                                    RecVBoxLayout<3>{}(_, _, _0{}));
+      tma_rot = make_tma_copy(SM90_TMA_LOAD{}, make_rec_g(384, 128),
+                              SmemLayoutRot{}(_, _, _0{}));
     }
     Params p{
         params_qk.tma_load_a,
@@ -758,6 +854,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     p.tma_load_k_rec_u0 = tma_k_rec_u0;
     p.tma_load_k_rec_s1 = tma_k_rec_s1;
     p.tma_load_k_rec_u1 = tma_k_rec_u1;
+    p.tma_load_rot = tma_rot;
     p.tma_load_v_rec_s0 = tma_v_rec_s0;
     p.tma_load_v_rec_u0 = tma_v_rec_u0;
     p.tma_load_v_rec_s1 = tma_v_rec_s1;
@@ -945,7 +1042,7 @@ struct FmhaMainloopTmaWarpSpecialized {
       // TMA V-overwrite bookkeeping (kKEqV fill mode).
       [[maybe_unused]] int vfill_count = 0;
       [[maybe_unused]] auto v_fill_iter = cute::make_coord_iterator(fusion_tile_count);
-      if constexpr (kKEqV) {
+      if constexpr (kKEqV && !kRecNative) {
         if (params.v_fill_tma) {
           vfill_count = fusion_tile_count - fusion_tile_start;
           for (int i = 0; i < fusion_tile_start; ++i) { ++v_fill_iter; }
@@ -999,6 +1096,36 @@ struct FmhaMainloopTmaWarpSpecialized {
       }
     };
 
+    if constexpr (kRecNative) {
+      if (params.pages_per_tile == 1 && params.record640) {
+        // Record-native: 4 K-hat boxes + rotor box; NO V delivery at all
+        // (PV reads the K-hat slot + rotor ring directly).
+        auto* base = storage.smem_k.data();
+        LoadRec640KRot load_rec{
+            {params.tma_load_k_rec_s0, pipeline,
+             *reinterpret_cast<typename LoadRecBox1::SharedStorage*>(base),
+             params.page_table, params.gqa_group, params.max_blocks_per_seq,
+             64, 0 * kRecChunkStride},
+            {params.tma_load_k_rec_s1, pipeline,
+             *reinterpret_cast<typename LoadRecBox1::SharedStorage*>(base),
+             params.page_table, params.gqa_group, params.max_blocks_per_seq,
+             64, 4 * kRecChunkStride},
+            {params.tma_load_k_rec_u0, pipeline,
+             *reinterpret_cast<typename LoadRecBox3::SharedStorage*>(base),
+             params.page_table, params.gqa_group, params.max_blocks_per_seq,
+             192, 1 * kRecChunkStride},
+            {params.tma_load_k_rec_u1, pipeline,
+             *reinterpret_cast<typename LoadRecBox3::SharedStorage*>(base),
+             params.page_table, params.gqa_group, params.max_blocks_per_seq,
+             192, 5 * kRecChunkStride},
+            {params.tma_load_rot, pipeline, storage.smem_rot,
+             params.page_table, params.gqa_group, params.max_blocks_per_seq,
+             128, 0}};
+        LoadPaged64V load_v64{params.tma_load_v_paged64, kKEqV ? pipeline_vfill : pipeline, storage.smem_v, params.page_table, params.gqa_group, params.max_blocks_per_seq};
+        run_kv_loads(load_rec, load_v64);
+        return;
+      }
+    }
     if (params.pages_per_tile == 1 && params.record640) {
       // 640-record K: 4 column boxes into the shared K stage (chunk-
       // aligned offsets; SharedStorage re-typed per box over the same
@@ -2333,6 +2460,266 @@ struct FmhaMainloopTmaWarpSpecialized {
     }
   }
 
+
+
+  // ===== Record-native symmetric consumer: PV reads the K-hat slot's
+  // shared columns (transposed views) + the rotor ring. No V delivery,
+  // no vfill pipeline, TMA traffic 1.25 KB/token.
+  template<class BlkCoord, class ProblemShape, class MainloopPipelineReducer,
+           class PipelineStateReducer, class MathWgOrderBarrier>
+  CUTLASS_DEVICE void
+  compute_sym_rec(
+      BlkCoord const& blk_coord, BlkCoord const& wg_coord,
+      Params const& params, ProblemShape const& problem_size,
+      MainloopPipeline& pipeline, PipelineState& smem_pipe_read,
+      MainloopPipelineQ& pipeline_q, PipelineStateQ& smem_pipe_read_q,
+      MainloopPipelineReducer&, PipelineStateReducer&,
+      SharedStorage& storage,
+      MathWgOrderBarrier&,
+      MainloopPipeline&, PipelineState&)
+  {
+    static_assert(kSplitDPV && kRecNative);
+    int thread_idx = int(threadIdx.x);
+
+    PipelineState smem_pipe_release = smem_pipe_read;
+    PipelineStateQ smem_pipe_release_q = smem_pipe_read_q;
+
+    TiledMmaQK_Sym tiled_mma_qk;
+    auto thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+    Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+    Tensor sK_full = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
+    Tensor tSsQ = thr_mma_qk.partition_fragment_A(sQ);
+    Tensor tSsK = thr_mma_qk.partition_fragment_B(sK_full);
+
+    int pv_thread_idx = thread_idx - NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
+    int pv_wg_idx = pv_thread_idx / cutlass::NumThreadsPerWarpGroup;
+    int pv_local_tid = pv_thread_idx % cutlass::NumThreadsPerWarpGroup;
+
+    // Per-WG PV pieces: B192 = K-hat slot chunks {1..3}/{5..7} transposed;
+    // B64 = rotor half {0}/{1} transposed.
+    TiledMmaPV_R192 mma_pv192;
+    TiledMmaPV_R64 mma_pv64;
+    auto thr_pv192 = mma_pv192.get_thread_slice(pv_local_tid);
+    auto thr_pv64 = mma_pv64.get_thread_slice(pv_local_tid);
+    static_assert(StageCount == 2, "RecNative PV prebuilds 2 stage views");
+    auto* b192_base = storage.smem_k.data() +
+                      (pv_wg_idx == 0 ? 1 : 5) * kRecChunkStride;
+    auto* b64_base = storage.smem_rot.data() + pv_wg_idx * kRotChunkElems;
+    Tensor sB192_0 = make_tensor(make_smem_ptr(b192_base), RecPvB192Layout{});
+    Tensor sB192_1 = make_tensor(make_smem_ptr(b192_base + kKStageElems),
+                                 RecPvB192Layout{});
+    Tensor sB64_0 = make_tensor(make_smem_ptr(b64_base), RecPvB64Layout{});
+    Tensor sB64_1 = make_tensor(make_smem_ptr(b64_base + kRotStageElems),
+                                RecPvB64Layout{});
+    Tensor tOrB192_0 = thr_pv192.make_fragment_B(thr_pv192.partition_B(sB192_0));
+    Tensor tOrB192_1 = thr_pv192.make_fragment_B(thr_pv192.partition_B(sB192_1));
+    Tensor tOrB64_0 = thr_pv64.make_fragment_B(thr_pv64.partition_B(sB64_0));
+    Tensor tOrB64_1 = thr_pv64.make_fragment_B(thr_pv64.partition_B(sB64_1));
+
+    int k_tile_count = Fusion{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_size);
+    pipeline_q.consumer_wait(smem_pipe_read_q);
+
+    Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{}));
+    Tensor tPcP = thr_mma_qk.partition_C(cP);
+    int m_block = get<0>(wg_coord);
+    tPcP.data() = tPcP.data() + E<0>{} * m_block * get<0>(TileShapeQK{})
+                              + E<1>{} * (Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size) * get<1>(TileShapeQK{}));
+
+    Tensor acc192 = partition_fragment_C(mma_pv192, Shape<_64, _192>{});
+    Tensor acc64 = partition_fragment_C(mma_pv64, Shape<_64, _64>{});
+
+    cutlass::fmha::collective::CollectiveSoftmax<ElementAccumulatorQK, Fusion, decltype(params)> softmax{params};
+    auto softmax_state = softmax.init(acc192, mma_pv192);
+    auto& s_max = get<0>(softmax_state);
+    auto& a_sum = get<1>(softmax_state);
+
+    Tensor tOrP = make_fragment_like<Element>(
+        convert_c_layout_to_a_layout(
+            partition_fragment_C(tiled_mma_qk, take<0,2>(TileShapeQK{})).layout(),
+            shape<1>(typename TiledMmaPV_R192::LayoutA_TV{})));
+
+    auto pv_pair = [&](int stage, bool first) {
+      warpgroup_fence_operand(acc192);
+      warpgroup_fence_operand(acc64);
+      warpgroup_fence_operand(tOrP);
+      warpgroup_arrive();
+      auto& b192 = stage ? tOrB192_1 : tOrB192_0;
+      auto& b64 = stage ? tOrB64_1 : tOrB64_0;
+#ifdef GEMMA_RN_BISECT_NOPV
+      (void)b192; (void)b64; (void)first;
+      if (false) {
+#else
+      if (first) {
+#endif
+        gemm_zero_acc(mma_pv192, tOrP, b192, acc192);
+        gemm_zero_acc(mma_pv64, tOrP, b64, acc64);
+      } else {
+        mma_pv192.accumulate_ = GMMA::ScaleOut::One;
+        mma_pv64.accumulate_ = GMMA::ScaleOut::One;
+        cute::gemm(mma_pv192, tOrP, b192, acc192);
+        cute::gemm(mma_pv64, tOrP, b64, acc64);
+      }
+      warpgroup_commit_batch();
+    };
+
+    // ===== First KV tile =====
+    {
+      --k_tile_count;
+      Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
+
+      pipeline.consumer_wait(smem_pipe_read);
+      warpgroup_fence_operand(acc_qk);
+      warpgroup_arrive();
+      gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                    tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
+      warpgroup_commit_batch();
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_qk);
+
+      auto banked = softmax.step_scale(acc_qk, tiled_mma_qk, tPcP,
+                                       softmax_state, problem_size,
+                                       /*needs_mask=*/true);
+      (void)banked;  // first tile: accs start zeroed, no rescale needed
+
+      Tensor tOrP_as_acc = make_tensor(tOrP.data(), acc_qk.layout());
+      cute::copy(acc_qk, tOrP_as_acc);
+
+      pv_pair(smem_pipe_read.index(), /*first=*/true);
+      ++smem_pipe_read;
+      tPcP.data() = tPcP.data() + E<1>{} * int(get<1>(TileShapeQK{}));
+    }
+
+    // ===== Subsequent KV tiles =====
+    k_tile_count += Fusion{}.get_masked_trip_count(blk_coord, TileShape{}, problem_size);
+    int mask_t_abs = Fusion{}.get_trip_count(blk_coord, TileShape{}, problem_size) - k_tile_count;
+    CUTLASS_PRAGMA_NO_UNROLL
+    while (k_tile_count > 0) {
+      --k_tile_count;
+      Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
+
+      pipeline.consumer_wait(smem_pipe_read);
+      warpgroup_fence_operand(acc_qk);
+      warpgroup_arrive();
+      gemm_zero_acc(tiled_mma_qk, tSsQ(_,_,_,smem_pipe_read_q.index()),
+                    tSsK(_,_,_,smem_pipe_read.index()), acc_qk);
+      warpgroup_commit_batch();
+
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc_qk);
+      warpgroup_fence_operand(acc192);
+      warpgroup_fence_operand(acc64);
+      // PV(t-1) drained by the wait above; release its slot.
+      pipeline.consumer_release(smem_pipe_release); ++smem_pipe_release;
+
+      auto banked = softmax.step_scale(acc_qk, tiled_mma_qk, tPcP,
+                                       softmax_state, problem_size,
+                                       Fusion{}.tile_needs_mask(
+                                           mask_t_abs++, blk_coord,
+                                           TileShape{}, problem_size));
+      softmax.apply_rescale(banked, acc192, mma_pv192);
+      softmax.apply_rescale(banked, acc64, mma_pv64);
+
+      Tensor tOrP_as_acc = make_tensor(tOrP.data(), acc_qk.layout());
+      cute::copy(acc_qk, tOrP_as_acc);
+
+      pv_pair(smem_pipe_read.index(), /*first=*/false);
+      ++smem_pipe_read;
+      tPcP.data() = tPcP.data() + E<1>{} * int(get<1>(TileShapeQK{}));
+    }
+
+    // ===== Tail =====
+    if (kIsPersistent) pipeline_q.consumer_release(smem_pipe_release_q);
+    warpgroup_wait<0>();
+    warpgroup_fence_operand(acc192);
+    warpgroup_fence_operand(acc64);
+    pipeline.consumer_release(smem_pipe_release);
+    ++smem_pipe_release;
+
+    auto reduction_target_qk = reduction_target_n(tiled_mma_qk);
+    constexpr int red_rank_qk = decltype(rank(reduction_target_qk))::value;
+    for_each(make_seq<red_rank_qk>{}, [&](auto r) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 1; j < shape<r>(reduction_target_qk); j *= 2) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(a_sum); i++) {
+          a_sum(i) = a_sum(i) + __shfl_xor_sync(uint32_t(-1), a_sum(i), stride<r>(reduction_target_qk) * j);
+        }
+      }
+    });
+
+    Tensor lse = make_fragment_like(a_sum);
+    auto pv_mn192 = layout_acc_mn(mma_pv192, acc192.layout());
+    auto pv_mn64 = layout_acc_mn(mma_pv64, acc64.layout());
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(pv_mn192); mi++) {
+      float sum = a_sum(mi);
+      float inv_sum = (sum == 0.f || sum != sum) ? 1.f : __frcp_rn(sum);
+      lse(mi) = (sum == 0.f || sum != sum) ? INFINITY : s_max(mi) * params.scale_softmax + __logf(sum);
+      float scale = params.rp_dropout * inv_sum;
+      CUTLASS_PRAGMA_UNROLL
+      for (int ni = 0; ni < size<1>(pv_mn192); ni++)
+        acc192(pv_mn192(mi, ni)) *= scale;
+      CUTLASS_PRAGMA_UNROLL
+      for (int ni = 0; ni < size<1>(pv_mn64); ni++)
+        acc64(pv_mn64(mi, ni)) *= scale;
+    }
+
+    // O writes: acc192 -> cols {64..256}/{320..512}; acc64 -> {0..64}/{256..320}
+    int batch_idx = get<0>(get<2>(wg_coord));
+    int head_idx = get<1>(get<2>(wg_coord));
+    int seq_stride_o = get<0>(params.dO);
+    int batch_stride_o = get<0>(get<2>(params.dO));
+    int head_stride_o = get<1>(get<2>(params.dO));
+    int o_base = batch_idx * batch_stride_o + head_idx * head_stride_o +
+                 m_block * MPerWG * seq_stride_o;
+    int seqlen_q = get<2>(problem_size);
+    const int col192 = pv_wg_idx == 0 ? 64 : 320;
+    const int col64 = pv_wg_idx == 0 ? 0 : 256;
+
+    auto write_acc = [&](auto& acc, auto& thr_pv, auto shape_mn, int col0) {
+      Tensor cO = make_identity_tensor(shape_mn);
+      Tensor tOcO = thr_pv.partition_C(cO);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(acc); i += 2) {
+        int m = get<0>(tOcO(i));
+        int n = get<1>(tOcO(i)) + col0;
+        if (m + m_block * MPerWG < seqlen_q) {
+          if (get<0>(tOcO(i + 1)) == m && get<1>(tOcO(i + 1)) + col0 == n + 1) {
+            uint32_t pk =
+                (uint32_t)static_cast<Element>(acc(i)).storage |
+                ((uint32_t)static_cast<Element>(acc(i + 1)).storage << 16);
+            *reinterpret_cast<uint32_t*>(
+                &params.ptr_O[o_base + m * seq_stride_o + n]) = pk;
+          } else {
+            params.ptr_O[o_base + m * seq_stride_o + n] =
+                static_cast<Element>(acc(i));
+            params.ptr_O[o_base + get<0>(tOcO(i + 1)) * seq_stride_o +
+                         get<1>(tOcO(i + 1)) + col0] =
+                static_cast<Element>(acc(i + 1));
+          }
+        }
+      }
+    };
+    write_acc(acc192, thr_pv192, Shape<_64, _192>{}, col192);
+    write_acc(acc64, thr_pv64, Shape<_64, _64>{}, col64);
+
+    if (params.ptr_LSE != nullptr && pv_wg_idx == 0) {
+      Tensor cO = make_identity_tensor(Shape<_64, _192>{});
+      Tensor tOcO = thr_pv192.partition_C(cO);
+      if (get<1>(tOcO(pv_mn192(_0{}, _0{}))) == 0) {
+        const int64_t lse_base =
+            (int64_t)batch_idx * get<2>(problem_size) +
+            (int64_t)head_idx * get<2>(problem_size) * get<0>(problem_size);
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < size<0>(pv_mn192); mi++) {
+          int m = get<0>(tOcO(pv_mn192(mi, _0{})));
+          if (m + m_block * MPerWG < seqlen_q) {
+            params.ptr_LSE[lse_base + m + m_block * MPerWG] = lse(mi);
+          }
+        }
+      }
+    }
+  }
 
   // ===== Symmetric-PV consumer (S59/S60): full QK per WG, local softmax,
   // register-P RS PV on the WG's 256-col half. Supports v_fill_tma

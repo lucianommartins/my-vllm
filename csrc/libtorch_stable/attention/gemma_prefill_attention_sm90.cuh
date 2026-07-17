@@ -22,7 +22,7 @@ namespace sm90 {
 using GemmaCausalFusion = cutlass::fmha::collective::SlidingWindowCausalFusion;
 
 template <int HeadDim, bool KEqV = false, bool Overlap = false,
-          bool SymPV = false>
+          bool SymPV = false, bool RecNative = false>
 struct GemmaFmhaTypes {
   using Element = cutlass::bfloat16_t;
   using ElementAccumulatorQK = float;
@@ -68,6 +68,9 @@ struct GemmaFmhaTypes {
       cutlass::fmha::kernel::Option<
           cutlass::fmha::kernel::Tag::kSymmetricPV,
           cute::bool_constant<SymPV>>,
+      cutlass::fmha::kernel::Option<
+          cutlass::fmha::kernel::Tag::kRecNative,
+          cute::bool_constant<RecNative>>,
       // FA4-skew overlap (blueprint: SESSION_31): softmax(t+1) runs under
       // the in-flight PV(t); single persistent P; split softmax with the
       // O-rescale deferred under the next QK shadow.

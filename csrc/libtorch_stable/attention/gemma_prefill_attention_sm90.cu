@@ -216,10 +216,10 @@ static const cutlass::bfloat16_t* g_v_fill_pool = nullptr;
 static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0, g_v_fill_sh = 0;
 
 template <int HeadDim, bool KEqV = false, bool Overlap = false,
-          bool SymPV = false>
+          bool SymPV = false, bool RecNative = false>
 struct FmhaCachedLauncher {
   using FmhaTypes =
-      vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV, Overlap, SymPV>;
+      vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV, Overlap, SymPV, RecNative>;
   using Kernel = typename FmhaTypes::Kernel;
   using FmhaOp = cutlass::device::Universal<Kernel>;
 
@@ -316,11 +316,19 @@ struct FmhaCachedLauncher {
         args.mainloop.kv_pool_record640 = paged->record640;
       }
 
-      if (FmhaOp::can_implement(args) != cutlass::Status::kSuccess)
+      if (FmhaOp::can_implement(args) != cutlass::Status::kSuccess) {
+        if (getenv("GEMMA_PREFILL_DEBUG"))
+          fprintf(stderr, "[sm90] launch FAIL: can_implement\n");
         return false;
+      }
 
       auto status = fmha_op.initialize(args, nullptr, stream);
-      if (status != cutlass::Status::kSuccess) return false;
+      if (status != cutlass::Status::kSuccess) {
+        if (getenv("GEMMA_PREFILL_DEBUG"))
+          fprintf(stderr, "[sm90] launch FAIL: initialize status=%d\n",
+                  int(status));
+        return false;
+      }
 
       cached_seq_len = seq_q;
       cached_seq_k = seq_k;
@@ -435,8 +443,11 @@ struct FmhaCachedLauncher {
       p.mainloop.recon_inv_w = g_recon_inv_w;
       // k_eq_v exact V-fill: refresh the raw V source every call (ptr_V is
       // only baked at initialize; layer pools change per call).
-      p.mainloop.v_fill = g_v_fill;
-      p.mainloop.v_fill_tma = g_v_fill_tma;
+      // RecNative: V is never delivered — PV reads the K-hat slot +
+      // rotor ring directly. Any vfill traffic would TMA-overwrite the
+      // unioned K slot mid-flight (S64 misaligned-address crash).
+      p.mainloop.v_fill = g_v_fill && !RecNative;
+      p.mainloop.v_fill_tma = g_v_fill_tma && !RecNative;
       p.mainloop.ptr_V = v_ptr;
       p.mainloop.v_fill_pool =
           (paged != nullptr && g_v_fill) ? g_v_fill_pool : nullptr;
@@ -445,9 +456,12 @@ struct FmhaCachedLauncher {
       p.mainloop.v_fill_stride_head = g_v_fill_sh;
 
     }
-    return FmhaOp::run(
-               const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
-               == cutlass::Status::kSuccess;
+    auto rstat = FmhaOp::run(
+        const_cast<typename Kernel::Params&>(fmha_op.params()), stream);
+    if (rstat != cutlass::Status::kSuccess && getenv("GEMMA_PREFILL_DEBUG"))
+      fprintf(stderr, "[sm90] launch FAIL: run status=%d cuda=%s\n",
+              int(rstat), cudaGetErrorString(cudaGetLastError()));
+    return rstat == cutlass::Status::kSuccess;
   }
 };
 
@@ -506,7 +520,40 @@ static bool launch_fmha_batched(
     const char* e = getenv("GEMMA_SYMPV");
     return e != nullptr && e[0] == '1';
   }();
+  // Record-native staging (GEMMA_RECNATIVE=1): rotor ring, no V TMA;
+  // requires the record pool and no fill/recon transform.
+  static const bool recnat_env = []() {
+    const char* e = getenv("GEMMA_RECNATIVE");
+    return e != nullptr && e[0] == '1';
+  }();
   if constexpr (HeadDim == 512 && KEqV) {
+    if (getenv("GEMMA_PREFILL_DEBUG"))
+      fprintf(stderr, "[sm90] recnat gate: env=%d paged=%d rec640=%d recon=%d\n",
+              int(recnat_env), int(paged != nullptr),
+              int(paged != nullptr && paged->record640),
+              int(g_recon_invfreq == nullptr));
+#if 0  // RECNATIVE QUARANTINE v3 (S65): SASS verdict = producer mbarrier
+       // phase-check fed by spills; 5-state wrapper condemned. Redesign
+       // (merged-box 640 slot, 4-state producer) speced in SESSION_64
+       // doc §S65 — typing-only next session.
+    if (recnat_env && paged != nullptr && paged->record640 &&
+        g_recon_invfreq == nullptr) {
+      if (getenv("GEMMA_PREFILL_DEBUG")) {
+        using RKernel = typename vllm::gemma_prefill::sm90::GemmaFmhaTypes<
+            HeadDim, KEqV, false, true, true>::Kernel;
+        fprintf(stderr, "[sm90] RECNATIVE smem=%zu (max 232448)\n",
+                sizeof(typename RKernel::SharedStorage));
+      }
+      static FmhaCachedLauncher<HeadDim, KEqV, false, true, true> rlauncher;
+      return rlauncher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+                              num_q_heads, gqa_group, num_seqs, seq_q,
+                              seq_k, q_offset, q_stride, scale,
+                              sliding_window, mm_ranges_ptr, max_mm_ranges,
+                              device_id, sm_count, stream, paged,
+                              varlen_seq_lens, varlen_cu_q,
+                              varlen_q_offsets, varlen_kv_lo);
+    }
+#endif
     if (sympv_env && !g_v_fill && g_recon_invfreq == nullptr) {
       static FmhaCachedLauncher<HeadDim, KEqV, false, true> slauncher;
       return slauncher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,

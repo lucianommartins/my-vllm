@@ -78,7 +78,8 @@ enum class Tag {
   kKEqV,
   // FA4-skew overlapped mainloop for compute() (hd256 cooperative)
   kOverlapSoftmax,
-  kSymmetricPV
+  kSymmetricPV,
+  kRecNative
 };
 
 template<auto kTag, class Value>
