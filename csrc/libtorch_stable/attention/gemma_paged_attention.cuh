@@ -1677,7 +1677,8 @@ gemma_decode_fused_kernel(
     const int mq = 1,
     const float* __restrict__ recon_invfreq = nullptr,
     const float recon_inv_w = 1.f,
-    const bool record640 = false) {
+    const bool record640 = false,
+    const bool strip_derive = false) {
   // mq: query positions PACKED into the M dim (MTP/spec-verify: one KV read
   // serves all positions). Row r = (position r/GROUP, gqa head r%GROUP);
   // requires GQA_GROUP*mq <= 16. mq==1 is the classic decode layout.
@@ -1838,6 +1839,12 @@ gemma_decode_fused_kernel(
   if (!V_SMEM && recon_invfreq != nullptr) {
     for (int i = tid; i < HEAD_SIZE / 2; i += nthreads)
       sIF[i] = recon_invfreq[i];
+  } else if (!V_SMEM && record640 && strip_derive) {
+    // Strip-derive: rope invfreq for the 64 rotor pairs (theta 1e6; pair
+    // (j, j+256) rotates by pos * 1e6^(-j/256); pairs j>=64 never rotate).
+    // Record mode passes recon_invfreq=nullptr, so compute once per CTA.
+    for (int i = tid; i < 64; i += nthreads)
+      sIF[i] = __powf(1e6f, -(float)i / 256.f);
   }
   __syncthreads();
   DF_STAGE(tile_lo, 0);
@@ -1926,6 +1933,24 @@ gemma_decode_fused_kernel(
       // overwritten with record cols {384..512} (the rotor-original V
       // channels). Plain loads, all QK reads of this tile completed at B2.
       if constexpr (sizeof(cache_t) == 2) {
+        if (strip_derive) {
+          // 1KB/token diet (GEMMA_STRIP_DERIVE): skip the gmem read of
+          // record cols {384..512}. kbuf's natural rotor cols (j, j+256)
+          // hold the STRIP = rope-forward of (v_j, v_{j+256}), UNSCALED
+          // (no w, no 1/w amplification) — inverse-rotate in place.
+          // __sincosf phase error at pos*f up to 64k is ~2e-3 rad, the
+          // same class the legacy recon recurrence shipped with.
+          for (int i = tid; i < n_tok * 64; i += nthreads) {
+            const int n = i >> 6, j = i & 63;
+            float sn, cs;
+            __sincosf((float)(kv0 + n) * sIF[j], &sn, &cs);
+            cache_t* p = kbuf + n * LDH + j;
+            const float lo = (float)p[0];
+            const float hi = (float)p[256];
+            from_float(p[0], cs * lo + sn * hi);
+            from_float(p[256], cs * hi - sn * lo);
+          }
+        } else {
         constexpr int VEC16 = 16 / (int)sizeof(cache_t);
         constexpr int NV = 128 / VEC16;
         for (int i = tid; i < n_tok * NV; i += nthreads) {
@@ -1939,6 +1964,7 @@ gemma_decode_fused_kernel(
                               kv_head * kv_stride_head + src;
           *reinterpret_cast<uint4*>(kbuf + n * LDH + dv) =
               *reinterpret_cast<const uint4*>(k_cache + off);
+        }
         }
       }
     } else if (!V_SMEM && recon_invfreq != nullptr) {

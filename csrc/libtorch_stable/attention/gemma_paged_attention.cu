@@ -258,7 +258,8 @@ static constexpr int DS_MINCTA_256 = 3;
         seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,            \
         kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,       \
         num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr, mq,          \
-        recon_invfreq_ptr, recon_inv_w_f, record640);                          \
+        recon_invfreq_ptr, recon_inv_w_f, record640,                           \
+        record640 && g_strip_derive);                                          \
     if (SPLITB) {                                                              \
       const dim3 fcg(num_kv_heads * (GROUP), num_seqs * mq);                   \
       LAUNCH_GEMMA_COMBINE_T(HEAD, fcg, lse_out_ptr, float,                    \
@@ -443,6 +444,13 @@ void gemma_paged_attention_launcher(
   // stored): inferred from the channel dim; requires the fused decode
   // path (checked at dispatch).
   const bool record640 = key_cache.size(3) == 640;
+  // GEMMA_STRIP_DERIVE=1: decode reads 1KB/token (skip record cols
+  // 384..512; rotor-original V derived in-kernel by inverse-rotating
+  // the strip already staged for QK).
+  static const bool g_strip_derive = []() {
+    const char* e = getenv("GEMMA_STRIP_DERIVE");
+    return e != nullptr && e[0] == '1';
+  }();
 
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
