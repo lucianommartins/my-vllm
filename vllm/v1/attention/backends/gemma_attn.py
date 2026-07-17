@@ -405,6 +405,22 @@ class GemmaAttentionBackend(AttentionBackend):
 
 
 _V3_DEV_READER = os.environ.get("GEMMA_V3_DEV_READER") == "1"
+_V3_RECORD_DECODE = os.environ.get("GEMMA_V3_RECORD_DECODE") == "1"
+_V3_KHAT: torch.Tensor | None = None
+
+
+def _v3_khat(dev: torch.device) -> torch.Tensor:
+    """K-hat channel order (== Vperm): [64..256, 320..512, 0..64, 256..320].
+    Runtime Q/O permutation for record-direct decode while the offline
+    weight permutations have not landed; decode-only, tokens are few."""
+    global _V3_KHAT
+    if _V3_KHAT is None or _V3_KHAT.device != dev:
+        _V3_KHAT = torch.tensor(
+            list(range(64, 256)) + list(range(320, 512))
+            + list(range(0, 64)) + list(range(256, 320)),
+            device=dev,
+        )
+    return _V3_KHAT
 _V3_DEV_SCRATCH: dict = {}
 _V3_UNROT: torch.Tensor | None = None
 _V3_VPERM: torch.Tensor | None = None
@@ -599,11 +615,25 @@ class GemmaAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         if _CACHE_V3 and kv_cache.dim() == 4:
+            if (
+                _V3_RECORD_DECODE
+                and attn_metadata.max_query_len == 1
+                and not attn_metadata.use_cascade
+            ):
+                # Record-direct decode: fused kernel reads the 640-record
+                # (K-hat two-box, strip->rotor-V replace). Q permuted to
+                # K-hat order at runtime; w folded into the scale; output
+                # inverse-permuted (stands in for the offline o_proj perm).
+                return self._forward_decode_record(
+                    layer, query[:num_actual_tokens], kv_cache,
+                    output, attn_metadata,
+                )
             # DEV READER (GEMMA_V3_DEV_READER=1): reconstruct the legacy
             # two-plane K/V from the 640-record into a shared scratch and
             # run the existing kernels. Correct function, pool-sized
             # gather per layer per step — boot/smoke only. The real
-            # reader (column-range views in-kernel) replaces this.
+            # reader (column-range views in-kernel) replaces this for
+            # prefill next (FA4-fork workstream).
             kv_cache = _v3_dev_reconstruct(kv_cache, layer)
 
         key_cache, value_cache = kv_cache.unbind(1)
@@ -930,6 +960,71 @@ class GemmaAttentionImpl(AttentionImpl):
             selected_tiles,
             *self._vrecon_args(layer, query.device),
         )
+        return output
+
+    def _forward_decode_record(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        record_pool: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+    ) -> torch.Tensor:
+        num_seqs = query.shape[0]
+        exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
+            num_seqs, attn_metadata.max_seq_len,
+            query.dtype, query.device,
+        )
+        if self._empty_lse is None:
+            self._empty_lse = output.new_empty(0, dtype=torch.float32)
+            self._empty_sel = output.new_empty(0, dtype=torch.int32)
+        if self._empty_f32 is None:
+            self._empty_f32 = torch.empty(
+                0, dtype=torch.float32, device=query.device
+            )
+        w = getattr(self, "_v3_w", None)
+        if w is None:
+            w_vec = getattr(layer, "_gemma_k_norm_weight", None)
+            assert w_vec is not None, "record decode needs k_norm weight"
+            w = float(w_vec[0].item())
+            self._v3_w = w
+        if (os.environ.get("GEMMA_V3_DEBUG") == "1"
+                and not getattr(self, "_v3_rec_logged", False)):
+            self._v3_rec_logged = True
+            print(f"[V3DBG] RECORD-DIRECT DECODE active: "
+                  f"layer={layer.layer_name} pool={tuple(record_pool.shape)} "
+                  f"scale*w={self.scale * w:.6f}", flush=True)
+        khat = _v3_khat(query.device)
+        q_perm = query[:, :, khat].contiguous()
+        out_perm = torch.empty_like(q_perm)
+        torch.ops._C.gemma_paged_attention(
+            out_perm,
+            exp_sums,
+            max_logits,
+            tmp_out,
+            q_perm,
+            record_pool,
+            record_pool,
+            self.num_kv_heads,
+            self.scale * w,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            record_pool.shape[1],
+            attn_metadata.max_seq_len,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+            self.actual_head_size,
+            self.k_eq_v,
+            self.sliding_window,
+            self._empty_lse,
+            self._empty_sel,
+            self._empty_f32,
+            1.0,
+        )
+        # O arrives in Vperm order; scatter back to natural channels
+        # (offline o_proj row permutation replaces this later).
+        output[:num_seqs].view_as(out_perm)[:, :, khat] = out_perm
         return output
 
     def _vrecon_args(self, layer, dev):

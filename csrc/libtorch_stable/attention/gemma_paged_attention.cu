@@ -258,7 +258,7 @@ static constexpr int DS_MINCTA_256 = 3;
         seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,            \
         kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,       \
         num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr, mq,          \
-        recon_invfreq_ptr, recon_inv_w_f);                                     \
+        recon_invfreq_ptr, recon_inv_w_f, record640);                          \
     if (SPLITB) {                                                              \
       const dim3 fcg(num_kv_heads * (GROUP), num_seqs * mq);                   \
       LAUNCH_GEMMA_COMBINE_T(HEAD, fcg, lse_out_ptr, float,                    \
@@ -439,6 +439,10 @@ void gemma_paged_attention_launcher(
   int64_t kv_stride_block = key_cache.stride(0);
   int64_t kv_stride_slot = key_cache.stride(1);
   int64_t kv_stride_head = key_cache.stride(2);
+  // GEMMA_CACHE_V3 640-channel record pool (single plane, K never
+  // stored): inferred from the channel dim; requires the fused decode
+  // path (checked at dispatch).
+  const bool record640 = key_cache.size(3) == 640;
 
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
@@ -750,6 +754,9 @@ void gemma_paged_attention_launcher(
           LAUNCH_GEMMA_FUSED_SB(512, 8, true, false);              \
           did_stream = true;                                       \
         }                                                          \
+        STD_TORCH_CHECK(!record640 || did_stream,                  \
+                        "record640 pool requires the fused hd512 " \
+                        "decode path (gqa_group 16 or 8)");        \
         if (!did_stream && use_stream && decode_bn != 0 &&         \
             gqa_group == 16) {                                     \
           if (decode_bn == 96) {                                   \

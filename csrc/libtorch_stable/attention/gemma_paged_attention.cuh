@@ -1676,7 +1676,8 @@ gemma_decode_fused_kernel(
     float* __restrict__ lse_out = nullptr,
     const int mq = 1,
     const float* __restrict__ recon_invfreq = nullptr,
-    const float recon_inv_w = 1.f) {
+    const float recon_inv_w = 1.f,
+    const bool record640 = false) {
   // mq: query positions PACKED into the M dim (MTP/spec-verify: one KV read
   // serves all positions). Row r = (position r/GROUP, gqa head r%GROUP);
   // requires GQA_GROUP*mq <= 16. mq==1 is the classic decode layout.
@@ -1816,9 +1817,10 @@ gemma_decode_fused_kernel(
       if (n < _ntok) {                                                         \
         const int tok = _kv0 + n;                                              \
         const int64_t phys = block_table[tok / page_size];                     \
+        const int sdv = (record640 && dv >= 384) ? dv + 128 : dv;              \
         const int64_t off = phys * kv_stride_block +                           \
                             (tok % page_size) * kv_stride_slot +               \
-                            kv_head * kv_stride_head + dv;                     \
+                            kv_head * kv_stride_head + sdv;                    \
         __pipeline_memcpy_async(DF_KBUF(st) + n * LDH + dv, k_cache + off,     \
                                 16);                                           \
         if (V_SMEM)                                                            \
@@ -1913,7 +1915,27 @@ gemma_decode_fused_kernel(
     // tile: V = unRoPE_neox(K) * inv_w (k_norm weight is channel-constant
     // per layer, so inv_w is a scalar). All QK ldmatrix reads of this tile
     // completed before B2; B3 below publishes the transform for PV.
-    if (!V_SMEM && recon_invfreq != nullptr) {
+    if (!V_SMEM && record640) {
+      // Record mode: kbuf holds K-hat = record cols {0..384}++{512..640}.
+      // PV needs V (record cols {0..512}); the first 384 columns are the
+      // SAME bytes, so only the strip slots (kbuf cols 384..512) must be
+      // overwritten with record cols {384..512} (the rotor-original V
+      // channels). Plain loads, all QK reads of this tile completed at B2.
+      if constexpr (sizeof(cache_t) == 2) {
+        constexpr int VEC16 = 16 / (int)sizeof(cache_t);
+        constexpr int NV = 128 / VEC16;
+        for (int i = tid; i < n_tok * NV; i += nthreads) {
+          const int n = i / NV, dv = 384 + (i - n * NV) * VEC16;
+          const int tok = kv0 + n;
+          const int64_t phys = block_table[tok / page_size];
+          const int64_t off = phys * kv_stride_block +
+                              (tok % page_size) * kv_stride_slot +
+                              kv_head * kv_stride_head + dv;
+          *reinterpret_cast<uint4*>(kbuf + n * LDH + dv) =
+              *reinterpret_cast<const uint4*>(k_cache + off);
+        }
+      }
+    } else if (!V_SMEM && recon_invfreq != nullptr) {
       if constexpr (sizeof(cache_t) == 2) {
         // Tile 0 = attention-sink tokens (bos): their V outlier channels
         // are where the 1/w-amplified bf16 recon noise bites hardest.
