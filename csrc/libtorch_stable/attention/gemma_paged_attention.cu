@@ -559,12 +559,18 @@ void gemma_paged_attention_launcher(
     return e != nullptr && e[0] == '1';
   }();
   // Packed multi-query is only implemented by the fused kernel and only
-  // where GQA_GROUP*mq fits the M=16 pad (hd256 sliding, GROUP=2, mq<=8).
+  // where GQA_GROUP*mq fits the M=16 pad:
+  //   hd256 sliding GROUP=2  -> mq <= 8 (12B/26B/31B locals)
+  //   hd512 k_eq_v  GROUP=8  -> mq <= 2 (26B/31B globals, gamma=1 verify)
+  // GROUP=16 (12B globals) can never pack; Python routes it virtual-seq.
   STD_TORCH_CHECK(mq == 1 ||
                       (decode_fused && head_size == 256 && sliding_window > 0 &&
-                       num_q_heads == 2 * num_kv_heads && mq <= 8),
-                  "packed multi-query decode requires the fused hd256 path "
-                  "(GQA_GROUP*mq <= 16)");
+                       num_q_heads == 2 * num_kv_heads && mq <= 8) ||
+                      (decode_fused && head_size == 512 && k_eq_v &&
+                       sliding_window <= 0 &&
+                       num_q_heads == 8 * num_kv_heads && mq <= 2),
+                  "packed multi-query decode requires the fused path with "
+                  "GQA_GROUP*mq <= 16");
 
   const int fused_nw =
       (fused_nw_env != 0)
@@ -626,6 +632,10 @@ void gemma_paged_attention_launcher(
          (actual_head_size == 256 && !k_eq_v && sliding_window > 0))) {
       const int n_tiles_bt = (eff_seq + decode_bn - 1) / decode_bn;
       const int per_sm = (decode_bn >= 64) ? 1 : 2;  // CTAs resident per SM
+      // floor, NOT ceil (A/B'd 2026-07-17): ceil for total_ctas in [55,107]
+      // measured -3..-6% e2e at short ctx — the extra split's combine kernel
+      // (one per local layer per step) costs more than the fill it buys when
+      // the window caps tiles at ~16. Fill only pays with plentiful tiles.
       int target = (per_sm * num_sms) / (total_ctas > 0 ? total_ctas : 1);
       if (target > n_tiles_bt) target = n_tiles_bt;
       if (target > max_parts) target = max_parts;

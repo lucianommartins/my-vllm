@@ -710,12 +710,22 @@ class GemmaAttentionImpl(AttentionImpl):
         # per-seq block_table/seq_lens; q/output rows are used in place.
         # Everything else (hd512 verify, mqu>8) uses the graph-safe prefill
         # path -- the fresh-tensor virtual expansion was NOT graph-safe.
-        if not (
+        # Packed rows must fit the mma M=16 pad: GQA_GROUP * mq <= 16.
+        #   hd256 sliding (group 2): mq <= 8  (gamma <= 7)
+        #   hd512 k_eq_v  (group 8, 26B/31B globals): mq <= 2 (gamma = 1)
+        #   hd512 group 16 (12B globals): never packs -> virtual-seq path.
+        group = (self.num_heads // self.num_kv_heads
+                 if self.num_kv_heads else 0)
+        packed_ok = (
             mqu >= 2
-            and self.sliding_window > 0
-            and self.actual_head_size == 256
-            and 2 * mqu <= 16
-        ):
+            and group > 0
+            and group * mqu <= 16
+            and (
+                (self.sliding_window > 0 and self.actual_head_size == 256)
+                or (self.k_eq_v and self.actual_head_size == 512)
+            )
+        )
+        if not packed_ok:
             if mqu >= 2 and self.actual_head_size == 512:
                 # hd512 verify: virtual-seq decode via PERSISTENT buffers
                 # (graph-safe: out=/copy_ only, constants cached at warmup;
@@ -789,6 +799,23 @@ class GemmaAttentionImpl(AttentionImpl):
         exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
             n, attn_metadata.max_seq_len, query.dtype, query.device,
         )
+        # hd512 record packing: K never stored -> w folds into the scale,
+        # recon args stay empty (same contract as the record decode path).
+        if record:
+            w = getattr(self, "_v3_w", None)
+            if w is None:
+                w_vec = getattr(layer, "_gemma_k_norm_weight", None)
+                assert w_vec is not None, "record packed-mq needs k_norm weight"
+                w = float(w_vec[0].item())
+                self._v3_w = w
+            if self._empty_f32 is None:
+                self._empty_f32 = torch.empty(
+                    0, dtype=torch.float32, device=query.device)
+            pk_scale = self.scale * w
+            pk_recon = (self._empty_f32, 1.0)
+        else:
+            pk_scale = self.scale
+            pk_recon = self._vrecon_args(layer, query.device)
         torch.ops._C.gemma_paged_attention(
             output[:n],
             exp_sums,
@@ -798,7 +825,7 @@ class GemmaAttentionImpl(AttentionImpl):
             key_cache,
             value_cache,
             self.num_kv_heads,
-            self.scale,
+            pk_scale,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
             key_cache.shape[1],
@@ -811,7 +838,7 @@ class GemmaAttentionImpl(AttentionImpl):
             self.sliding_window,
             self._empty_lse,
             self._empty_sel,
-            *self._vrecon_args(layer, query.device),
+            *pk_recon,
         )
         return output
 
@@ -1324,8 +1351,14 @@ class GemmaAttentionImpl(AttentionImpl):
                 pos = meta.positions[:num_tokens]
                 blocks, page = kv_cache.shape[0], kv_cache.shape[1]
                 flat = kv_cache.view(blocks * page, self.num_kv_heads, 640)
+                # Masked indexing + .item() below force host syncs, which are
+                # illegal (and were fatal) during cudagraph capture.
+                if torch.cuda.is_current_stream_capturing():
+                    return
                 ok_slots = slot_mapping >= 0
                 sl = slot_mapping[ok_slots]
+                if sl.numel() == 0:  # warmup steps have no real tokens
+                    return
                 got = flat[sl]
                 vv = v_view[ok_slots].float()
                 pp = pos[ok_slots]

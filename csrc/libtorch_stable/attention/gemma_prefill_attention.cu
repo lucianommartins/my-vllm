@@ -3,6 +3,7 @@
  */
 #include "../torch_utils.h"
 #include "gemma_prefill_attention.cuh"
+#include "gemma_prefill_fused.cuh"
 #include "../../cuda_compat.h"
 
 #include <cuda_runtime.h>
@@ -45,7 +46,7 @@ static constexpr int PF_MINCTA_256 = 3;
         max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
         kv_stride_slot, kv_stride_head, sliding_window,                        \
         mm_prefix_ranges_ptr, max_mm_ranges,                                   \
-        non_causal, lse_out_ptr, num_tokens);                                 \
+        non_causal, lse_out_ptr, num_tokens, record640, ldgsts_overlap);       \
   } while (0)
 
 #define LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, MMPF, KEQV, USW)             \
@@ -57,6 +58,101 @@ static constexpr int PF_MINCTA_256 = 3;
     case 16: LAUNCH_PREFILL_V2(HEAD, NW, MINCTA, MMPF, 16, KEQV, USW); break;  \
     default:                                                                   \
       STD_TORCH_CHECK(false, "Unsupported prefill GQA group: ", gqa_group);    \
+  }
+
+// Fused prefill (Gate-D dataflow port): mma.sync register-softmax +
+// cp.async ring. Opt-in via GEMMA_PREFILL_FUSED=1 for A/B vs the wmma v2;
+// flips to default after validation. NW: hd512 -> 8 (BN64, 1 CTA/SM);
+// hd256 -> GEMMA_PREFILL_FUSED_NW (default 4 = BN32, 2 CTA/SM).
+#define LAUNCH_PREFILL_FUSED(HEAD, NW, MINCTA, GROUP, KEQV, USW, MMPF)         \
+  do {                                                                         \
+    auto kern = vllm::gemma_prefill::gemma_prefill_fused_kernel<               \
+        T, CACHE_T, HEAD, NW, GROUP, KEQV, USW, MMPF, MINCTA>;                 \
+    constexpr int FLDH = (HEAD) + 8;                                           \
+    constexpr int FBN = 8 * (NW);                                              \
+    constexpr int FLDN = FBN + 8;                                              \
+    constexpr int FSTG = FBN * FLDH * ((KEQV) ? 1 : 2);                        \
+    size_t smem = (size_t)(16 * FLDH + 2 * FSTG + 16 * FLDN)                   \
+                      * sizeof(CACHE_T)                                        \
+                  + (size_t)(2 * (NW) * 16) * sizeof(float)                    \
+                  + (size_t)(32 * 2) * sizeof(int);                            \
+    {                                                                          \
+      static bool _a = false;                                                  \
+      if (!_a) {                                                               \
+        if (smem > 48 * 1024)                                                  \
+          cudaFuncSetAttribute(                                                \
+              kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);        \
+        cudaFuncSetAttribute(                                                  \
+            kern, cudaFuncAttributePreferredSharedMemoryCarveout, 100);        \
+        _a = true;                                                             \
+      }                                                                        \
+    }                                                                          \
+    dim3 grid(PF_CDIV(max_q_len, 16), num_q_heads, num_seqs);                  \
+    kern<<<grid, (NW) * 32, smem, stream>>>(                                   \
+        out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,             \
+        block_tables_ptr, seq_lens_ptr, cu_seqlens_q_ptr,                      \
+        max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
+        kv_stride_slot, kv_stride_head, sliding_window,                        \
+        mm_prefix_ranges_ptr, max_mm_ranges,                                   \
+        non_causal, lse_out_ptr, num_tokens, record640);                       \
+  } while (0)
+
+#define LAUNCH_PREFILL_FUSED_GROUP(HEAD, NW, MINCTA, KEQV, USW, MMPF)          \
+  switch (gqa_group) {                                                         \
+    case 1: LAUNCH_PREFILL_FUSED(HEAD, NW, MINCTA, 1, KEQV, USW, MMPF); break; \
+    case 2: LAUNCH_PREFILL_FUSED(HEAD, NW, MINCTA, 2, KEQV, USW, MMPF); break; \
+    case 4: LAUNCH_PREFILL_FUSED(HEAD, NW, MINCTA, 4, KEQV, USW, MMPF); break; \
+    case 8: LAUNCH_PREFILL_FUSED(HEAD, NW, MINCTA, 8, KEQV, USW, MMPF); break; \
+    case 16:                                                                   \
+      LAUNCH_PREFILL_FUSED(HEAD, NW, MINCTA, 16, KEQV, USW, MMPF);             \
+      break;                                                                   \
+    default:                                                                   \
+      STD_TORCH_CHECK(false, "Unsupported fused prefill GQA group: ",          \
+                      gqa_group);                                              \
+  }
+
+// fused2: BM=32 two-M-tile register-softmax prefill (hd512 k_eq_v only).
+// GEMMA_PREFILL_FUSED=2. smem ~106KB -> 1 CTA/SM.
+#define LAUNCH_PREFILL_FUSED2(GROUP)                                           \
+  do {                                                                         \
+    auto kern = vllm::gemma_prefill::gemma_prefill_fused2_kernel<              \
+        T, CACHE_T, 512, 8, GROUP, 1>;                                         \
+    constexpr int F2LDH = 512 + 8;                                             \
+    constexpr int F2BN = 64;                                                   \
+    constexpr int F2LDN = F2BN + 8;                                            \
+    size_t smem = (size_t)(32 * F2LDH + F2BN * F2LDH + 2 * 16 * F2LDN)         \
+                      * sizeof(CACHE_T)                                        \
+                  + (size_t)(2 * 2 * 8 * 16) * sizeof(float);                  \
+    {                                                                          \
+      static bool _a = false;                                                  \
+      if (!_a) {                                                               \
+        if (smem > 48 * 1024)                                                  \
+          cudaFuncSetAttribute(                                                \
+              kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);        \
+        cudaFuncSetAttribute(                                                  \
+            kern, cudaFuncAttributePreferredSharedMemoryCarveout, 100);        \
+        _a = true;                                                             \
+      }                                                                        \
+    }                                                                          \
+    dim3 grid(PF_CDIV(max_q_len, 32), num_q_heads, num_seqs);                  \
+    kern<<<grid, 8 * 32, smem, stream>>>(                                      \
+        out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,             \
+        block_tables_ptr, seq_lens_ptr, cu_seqlens_q_ptr,                      \
+        max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
+        kv_stride_slot, kv_stride_head, sliding_window,                        \
+        mm_prefix_ranges_ptr, max_mm_ranges,                                   \
+        non_causal, lse_out_ptr, num_tokens, record640);                       \
+  } while (0)
+
+#define LAUNCH_PREFILL_FUSED2_GROUP()                                          \
+  switch (gqa_group) {                                                         \
+    case 1: LAUNCH_PREFILL_FUSED2(1); break;                                   \
+    case 2: LAUNCH_PREFILL_FUSED2(2); break;                                   \
+    case 4: LAUNCH_PREFILL_FUSED2(4); break;                                   \
+    case 8: LAUNCH_PREFILL_FUSED2(8); break;                                   \
+    case 16: LAUNCH_PREFILL_FUSED2(16); break;                                 \
+    default:                                                                   \
+      STD_TORCH_CHECK(false, "Unsupported fused2 GQA group: ", gqa_group);     \
   }
 
 // SM90 prefill launcher — defined in gemma_prefill_attention_sm90.cu.
@@ -97,6 +193,20 @@ void gemma_prefill_launcher(
   const int64_t kv_stride_head = key_cache.stride(2);
   const int gqa_group = num_q_heads / num_kv_heads;
   const bool use_sw = (sliding_window > 0);
+  // GEMMA_CACHE_V3 640-channel record pool (single plane, K never stored):
+  // inferred from the channel dim, same as the decode launcher. The v2
+  // kernel materializes K-hat via the record address permutation and
+  // rebuilds V's 128 rotated channels before PV — SM80-native record read.
+  const bool record640 = key_cache.dim() == 4 && key_cache.size(3) == 640;
+  // V staging order: post-softmax (default) — at 2-3 CTA/SM the V load is
+  // already hidden cross-CTA, and pre-softmax issue measured -17% TTFT at
+  // mixed c32 (DRAM pressure against coexisting decode kernels) with no
+  // pure-prefill gain (A/B 2026-07-17). GEMMA_PREFILL_LDGSTS_OVERLAP=1
+  // re-enables the early-issue variant for experiments.
+  static const bool ldgsts_overlap = []() {
+    const char* e = getenv("GEMMA_PREFILL_LDGSTS_OVERLAP");
+    return e != nullptr && e[0] == '1';
+  }();
 
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
@@ -142,10 +252,8 @@ void gemma_prefill_launcher(
           k_eq_v, sliding_window, mm_prefix_ranges, non_causal, lse_out,
           seq_lens_cpu, cu_seqlens_q_cpu, recon_invfreq, recon_inv_w);
       if (handled) return;
-      STD_TORCH_CHECK(
-          !(k_eq_v && key_cache.dim() == 4 && key_cache.size(3) == 640),
-          "GEMMA_CACHE_V3 record pool requires the SM90 paged64 prefill "
-          "path (GEMMA_SM90_PREFILL/GEMMA_PREFILL_PAGED must stay on)");
+      // Record pools no longer require the SM90 path: the v2 kernel below
+      // reads records natively (K-hat permutation + rotor-V overwrite).
     }
   }
 #endif  // ENABLE_GEMMA_ATTN_SM90
@@ -163,7 +271,61 @@ void gemma_prefill_launcher(
     return (r != nullptr && r[0] == '1') ||
            (f != nullptr && f[0] != '0' && f[0] != '\0');
   }();
-  if (correct_mode) k_eq_v = false;
+  // Records are already the correct function (true V rebuilt in-kernel);
+  // correct_mode's k_eq_v=false toggle only applies to two-plane caches.
+  if (correct_mode && !record640) k_eq_v = false;
+
+  if (record640) {
+    STD_TORCH_CHECK(
+        head_size == 512 && k_eq_v && !use_sw && max_mm_ranges == 0,
+        "record640 prefill supports only full-attention k_eq_v hd512 layers "
+        "(got head_size=", head_size, " k_eq_v=", k_eq_v,
+        " sliding_window=", sliding_window,
+        " mm_ranges=", max_mm_ranges, ")");
+  }
+
+  // ---- fused prefill (opt-in A/B): 1 = BM16 (measured slower, kept for
+  // reference), 2 = BM32 two-M-tile fused2 (hd512 k_eq_v; rest stays v2) ----
+  static const int prefill_fused_mode = []() {
+    const char* e = getenv("GEMMA_PREFILL_FUSED");
+    if (e == nullptr) return 0;
+    return e[0] == '2' ? 2 : (e[0] == '1' ? 1 : 0);
+  }();
+  const bool prefill_fused = prefill_fused_mode == 1;
+  if (prefill_fused_mode == 2 && head_size == 512 && k_eq_v && !use_sw &&
+      max_mm_ranges == 0) {
+    LAUNCH_PREFILL_FUSED2_GROUP();
+    return;
+  }
+  static const int fused_nw256 = []() {
+    const char* e = getenv("GEMMA_PREFILL_FUSED_NW");
+    if (e == nullptr) return 4;
+    return e[0] == '8' ? 8 : 4;
+  }();
+  if (prefill_fused) {
+    if (head_size == 512) {
+      // k_eq_v: K-only ring -> BN64/NW8 fits (153KB). !k_eq_v stages V too:
+      // BN64 would need 266KB -> BN32/NW4 (152KB, 1 CTA/SM).
+      if (k_eq_v) {
+        LAUNCH_PREFILL_FUSED_GROUP(512, 8, 1, true, false, false);
+      } else {
+        LAUNCH_PREFILL_FUSED_GROUP(512, 4, 1, false, false, false);
+      }
+    } else if (max_mm_ranges > 0) {
+      if (fused_nw256 == 8) {
+        LAUNCH_PREFILL_FUSED_GROUP(256, 8, 1, false, true, true);
+      } else {
+        LAUNCH_PREFILL_FUSED_GROUP(256, 4, 2, false, true, true);
+      }
+    } else {
+      if (fused_nw256 == 8) {
+        LAUNCH_PREFILL_FUSED_GROUP(256, 8, 1, false, true, false);
+      } else {
+        LAUNCH_PREFILL_FUSED_GROUP(256, 4, 2, false, true, false);
+      }
+    }
+    return;
+  }
 
 #define PF_DISPATCH(HEAD, NW, MINCTA, MMPF)                          \
   do {                                                               \

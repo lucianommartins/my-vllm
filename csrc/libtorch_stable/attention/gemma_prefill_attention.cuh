@@ -16,6 +16,7 @@
 #include "../../attention/attention_dtypes.h"
 #include "../../cuda_compat.h"
 
+#include <cuda_pipeline.h>
 #include <mma.h>
 #include <float.h>
 
@@ -58,7 +59,16 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     // shared-prefix pass). lse_out [num_q_heads, num_tokens] natural-log (or
     // nullptr to skip). num_tokens is the head stride for lse_out.
     const bool non_causal = false, float* __restrict__ lse_out = nullptr,
-    const int num_tokens = 0) {
+    const int num_tokens = 0,
+    // GEMMA_CACHE_V3: k_cache is the 640-ch record pool [Vperm(512)|strip(128)].
+    // K-hat is materialized on load via an address permutation (sdv map, same
+    // as the fused decode kernel); PV overwrites the 128 rotated channels with
+    // the record's rotor-original V. K_EQ_V full layers only.
+    const bool record640 = false,
+    // Issue V-plane cp.async before the softmax phase (overlap) vs staging it
+    // post-softmax behind its own barrier (legacy order). Bisect knob:
+    // GEMMA_PREFILL_LDGSTS_OVERLAP.
+    const bool v_overlap = true) {
   constexpr int MT = BLOCK_M / 16;            // M tiles
   constexpr int NT = BLOCK_N / 16;            // QK N tiles
   constexpr int DT = HEAD_SIZE / 16;          // total head tiles
@@ -111,6 +121,9 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
 
   for (int r = tid; r < BLOCK_M; r += nthreads) { sM[r] = -FLT_MAX; sL[r] = 0.f; }
 
+  // Q stage via cp.async (LDGSTS): global->smem directly, no per-load
+  // register round-trip or issue stall; pad rows zero-filled with plain
+  // smem stores (cp.async cannot synthesize zeros).
   const int hvps = HEAD_SIZE / VEC;
   for (int iv = tid; iv < BLOCK_M * hvps; iv += nthreads) {
     const int r = iv / hvps;
@@ -119,12 +132,13 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     if (qr < q_len) {
       const scalar_t* gq = q + (int64_t)(q_start + qr) * q_stride
                              + q_head * HEAD_SIZE + dv;
-      *reinterpret_cast<uint4*>(sQ + r * LDH + dv) =
-          *reinterpret_cast<const uint4*>(gq);
+      __pipeline_memcpy_async(sQ + r * LDH + dv, gq, 16);
     } else {
       *reinterpret_cast<uint4*>(sQ + r * LDH + dv) = uint4{0, 0, 0, 0};
     }
   }
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
   __syncthreads();
 
   // Preload this seq's mm-prefix image spans into smem (shared by every (q,k)
@@ -167,7 +181,8 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
   for (int kv0 = kv_begin; kv0 < kv_end; kv0 += BLOCK_N) {
     const int n_tok = min(BLOCK_N, seq_len - kv0);
 
-    // stage K block
+    // stage K block. record640: apply the record->K-hat channel permutation
+    // (regions are 64-aligned, so every 16B chunk stays inside one region).
     for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {
       const int n = iv / hvps;
       const int dv = (iv - n * hvps) * VEC;
@@ -175,15 +190,21 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
         const int tok = kv0 + n;
         const int64_t phys = block_table[tok / page_size];
         const int slot = tok % page_size;
+        const int sdv = !record640 ? dv
+                        : (dv < 64)    ? dv + 512
+                        : (dv < 256)   ? dv - 64
+                        : (dv < 320)   ? dv + 320
+                                       : dv - 128;
         const cache_t* gk = k_cache + phys * kv_stride_block
                               + slot * kv_stride_slot
-                              + kv_head * kv_stride_head + dv;
-        *reinterpret_cast<uint4*>(sKV + n * LDH + dv) =
-            *reinterpret_cast<const uint4*>(gk);
+                              + kv_head * kv_stride_head + sdv;
+        __pipeline_memcpy_async(sKV + n * LDH + dv, gk, 16);
       } else {
         *reinterpret_cast<uint4*>(sKV + n * LDH + dv) = uint4{0, 0, 0, 0};
       }
     }
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
     __syncthreads();
 
     // QK: first MT*NT warps each own one S[16x16] tile, full-head contraction.
@@ -204,6 +225,59 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
                               wmma::mem_row_major);
     }
     __syncthreads();
+
+    // record640: sKV holds K-hat; PV needs V. Only the 128 rotated channels
+    // (head cols 0..64 and 256..320) differ — overwrite them with the
+    // record's rotor-original V (record cols 384..512). All QK reads of sKV
+    // completed at the barrier above; the softmax-phase barrier below
+    // publishes these writes before PV. No extra __syncthreads. Mirrors the
+    // fused decode kernel (gemma_paged_attention.cuh record path).
+    if constexpr (K_EQ_V) {
+      if (record640) {
+        constexpr int NV16 = 128 / VEC;  // 16B chunks per token (two 64-ch strips)
+        for (int i = tid; i < BLOCK_N * NV16; i += nthreads) {
+          const int n = i / NV16;
+          const int k = i - n * NV16;
+          if (n < n_tok) {
+            const int dv =
+                (k < NV16 / 2) ? k * VEC : 256 + (k - NV16 / 2) * VEC;
+            const int src = (dv < 64) ? dv + 384 : dv + 192;
+            const int tok = kv0 + n;
+            const int64_t phys = block_table[tok / page_size];
+            const int slot = tok % page_size;
+            __pipeline_memcpy_async(
+                sKV + n * LDH + dv,
+                k_cache + phys * kv_stride_block + slot * kv_stride_slot +
+                    kv_head * kv_stride_head + src,
+                16);
+          }
+        }
+        __pipeline_commit();
+      }
+    }
+
+    // !k_eq_v: ISSUE the V-plane loads here (QK reads of sKV completed at the
+    // barrier above) and wait only after the softmax phase — the entire V
+    // load overlaps softmax, and the old separate V barrier disappears.
+    // Tail rows keep the zeros staged with the K tile.
+    // v_overlap=false reverts to post-softmax V staging (bisect knob).
+    if constexpr (!K_EQ_V) {
+      if (v_overlap)
+      for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {
+        const int n = iv / hvps;
+        const int dv = (iv - n * hvps) * VEC;
+        if (n < n_tok) {
+          const int tok = kv0 + n;
+          const int64_t phys = block_table[tok / page_size];
+          const int slot = tok % page_size;
+          const cache_t* gv = v_cache + phys * kv_stride_block
+                                + slot * kv_stride_slot
+                                + kv_head * kv_stride_head + dv;
+          __pipeline_memcpy_async(sKV + n * LDH + dv, gv, 16);
+        }
+      }
+      __pipeline_commit();
+    }
 
     // mask + online softmax, parallelized: one WARP per row (32 lanes = the
     // BLOCK_N columns), warp-reduced max/sum. All warps active (vs the previous
@@ -270,26 +344,33 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
         sA[r] = alpha;
       }
     }
+    // V / record-strip cp.async issued before softmax has landed by now (it
+    // overlapped the whole softmax phase); the barrier publishes sP AND the
+    // V tile together. Replaces the old post-softmax V stage + extra barrier.
+    __pipeline_wait_prior(0);
     __syncthreads();
 
+    // Legacy order (v_overlap=false): stage V after softmax behind its own
+    // barrier — still LDGSTS, just no softmax overlap.
     if constexpr (!K_EQ_V) {
-      for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {
-        const int n = iv / hvps;
-        const int dv = (iv - n * hvps) * VEC;
-        if (n < n_tok) {
-          const int tok = kv0 + n;
-          const int64_t phys = block_table[tok / page_size];
-          const int slot = tok % page_size;
-          const cache_t* gv = v_cache + phys * kv_stride_block
-                                + slot * kv_stride_slot
-                                + kv_head * kv_stride_head + dv;
-          *reinterpret_cast<uint4*>(sKV + n * LDH + dv) =
-              *reinterpret_cast<const uint4*>(gv);
-        } else {
-          *reinterpret_cast<uint4*>(sKV + n * LDH + dv) = uint4{0, 0, 0, 0};
+      if (!v_overlap) {
+        for (int iv = tid; iv < BLOCK_N * hvps; iv += nthreads) {
+          const int n = iv / hvps;
+          const int dv = (iv - n * hvps) * VEC;
+          if (n < n_tok) {
+            const int tok = kv0 + n;
+            const int64_t phys = block_table[tok / page_size];
+            const int slot = tok % page_size;
+            const cache_t* gv = v_cache + phys * kv_stride_block
+                                  + slot * kv_stride_slot
+                                  + kv_head * kv_stride_head + dv;
+            __pipeline_memcpy_async(sKV + n * LDH + dv, gv, 16);
+          }
         }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
       }
-      __syncthreads();
     }
 
     // PV: rescale O frags by per-row alpha (SM80 wmma acc layout), then P@V.

@@ -332,6 +332,18 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
+            # The draft layer has no k_proj/k_norm (KV sharing reads the
+            # TARGET's cache), but GEMMA_ATTN's record/recon paths need the
+            # target's k_norm weight + rope constants to interpret that
+            # cache (w folds into the scale). Mirror them from the target
+            # attention module.
+            fwd_ctx = self.vllm_config.compilation_config.static_forward_context
+            tgt_attn = fwd_ctx.get(target_layer_name)
+            if tgt_attn is not None:
+                for a in ("_gemma_k_norm_weight", "_gemma_rope_base",
+                          "_gemma_rope_angles", "_gemma_cos_sin_cache"):
+                    if hasattr(tgt_attn, a):
+                        setattr(attn, a, getattr(tgt_attn, a))
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,
