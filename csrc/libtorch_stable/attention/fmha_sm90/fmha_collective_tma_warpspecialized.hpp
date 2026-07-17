@@ -2373,6 +2373,8 @@ struct FmhaMainloopTmaWarpSpecialized {
     }
 
     // ===== Tail =====
+    // (persistent Q-state advance lives in the kernel's consumer loop tail:
+    // smem_pipe_read_outer.advance(kOuterLoads) — do NOT also advance here)
     if (kIsPersistent) pipeline_q.consumer_release(smem_pipe_release_q);
     warpgroup_wait<0>();
     warpgroup_fence_operand(acc_pv);

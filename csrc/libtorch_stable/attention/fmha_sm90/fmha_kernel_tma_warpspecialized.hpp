@@ -183,6 +183,11 @@ struct FmhaKernelTmaWarpSpecialized {
     CUTE_INVALID_CONTROL_PATH("ERROR : Arch conditional MMA instruction used without targeting appropriate compute capability. Aborting.\n");
 #else
 
+    // NOTE (S67): this blockIdx.z-keyed derivation is one-tile-per-CTA
+    // only. The persistent scheduler's 1-D grid visits many seqs per CTA;
+    // a per-tile in-loop re-derivation was tried and measurably cost ~2%
+    // on the default ncoop kernel (codegen perturbation), so persistent
+    // launches are host-gated to num_seqs==1 / uniform batches instead.
     ProblemShape problem_size_local = params.problem_size;
     if (params.mainloop.d_seq_lens != nullptr) {
       int seq_k = params.mainloop.d_seq_lens[blockIdx.z];

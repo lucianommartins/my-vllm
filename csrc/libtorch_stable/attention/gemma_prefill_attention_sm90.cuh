@@ -22,7 +22,8 @@ namespace sm90 {
 using GemmaCausalFusion = cutlass::fmha::collective::SlidingWindowCausalFusion;
 
 template <int HeadDim, bool KEqV = false, bool Overlap = false,
-          bool SymPV = false, bool RecNative = false>
+          bool SymPV = false, bool RecNative = false,
+          bool Persistent = false>
 struct GemmaFmhaTypes {
   using Element = cutlass::bfloat16_t;
   using ElementAccumulatorQK = float;
@@ -71,6 +72,11 @@ struct GemmaFmhaTypes {
       cutlass::fmha::kernel::Option<
           cutlass::fmha::kernel::Tag::kRecNative,
           cute::bool_constant<RecNative>>,
+      // Persistent tile scheduler: grid = min(tiles, SMs), each CTA loops
+      // tiles. Costs the union->struct smem split (hd512: 226.5/227 KB).
+      cutlass::fmha::kernel::Option<
+          cutlass::fmha::kernel::Tag::kIsPersistent,
+          cute::bool_constant<Persistent>>,
       // FA4-skew overlap (blueprint: SESSION_31): softmax(t+1) runs under
       // the in-flight PV(t); single persistent P; split softmax with the
       // O-rescale deferred under the next QK shadow.

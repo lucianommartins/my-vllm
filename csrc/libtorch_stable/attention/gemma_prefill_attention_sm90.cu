@@ -216,10 +216,12 @@ static const cutlass::bfloat16_t* g_v_fill_pool = nullptr;
 static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0, g_v_fill_sh = 0;
 
 template <int HeadDim, bool KEqV = false, bool Overlap = false,
-          bool SymPV = false, bool RecNative = false>
+          bool SymPV = false, bool RecNative = false,
+          bool Persistent = false>
 struct FmhaCachedLauncher {
   using FmhaTypes =
-      vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV, Overlap, SymPV, RecNative>;
+      vllm::gemma_prefill::sm90::GemmaFmhaTypes<HeadDim, KEqV, Overlap, SymPV,
+                                                RecNative, Persistent>;
   using Kernel = typename FmhaTypes::Kernel;
   using FmhaOp = cutlass::device::Universal<Kernel>;
 
@@ -543,6 +545,37 @@ static bool launch_fmha_batched(
       }
       static FmhaCachedLauncher<HeadDim, KEqV, false, true, true> rlauncher;
       return rlauncher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+                              num_q_heads, gqa_group, num_seqs, seq_q,
+                              seq_k, q_offset, q_stride, scale,
+                              sliding_window, mm_ranges_ptr, max_mm_ranges,
+                              device_id, sm_count, stream, paged,
+                              varlen_seq_lens, varlen_cu_q,
+                              varlen_q_offsets, varlen_kv_lo);
+    }
+#endif
+    // Persistent tile scheduler (GEMMA_PERSISTENT=1 + compile with
+    // -DGEMMA_BUILD_PERSISTENT): grid = min(tiles, SMs), CTAs loop tiles.
+    // FALSIFIED as a prefill lever (S67 same-binary ladder: +10-12%
+    // SLOWER at q8192, +3-4% at q2048; xcheck clean). Root cause:
+    // StageCountQ=1 (smem-forced at hd512) serializes every tile
+    // boundary — producer can't stage Q(t+1) until tile t drains; a Q
+    // double-buffer costs +64KB smem (290 > 227KB). Compile-time OFF so
+    // the default TU stays codegen-clean (S61 contamination class).
+#ifdef GEMMA_BUILD_PERSISTENT
+    static const bool persist_env = []() {
+      const char* e = getenv("GEMMA_PERSISTENT");
+      return e != nullptr && e[0] == '1';
+    }();
+    // num_seqs==1 only: the kernel's per-seq varlen derivation is keyed on
+    // blockIdx.z, which the persistent 1-D grid pins to 0 (see S67 NOTE in
+    // fmha_kernel_tma_warpspecialized.hpp).
+    if (persist_env && g_recon_invfreq == nullptr &&
+        (num_seqs == 1 || varlen_seq_lens == nullptr)) {
+      if (getenv("GEMMA_PREFILL_DEBUG"))
+        fprintf(stderr, "[sm90] PERSISTENT scheduler engaged\n");
+      static FmhaCachedLauncher<HeadDim, KEqV, false, false, false, true>
+          plauncher;
+      return plauncher.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
                               num_q_heads, gqa_group, num_seqs, seq_q,
                               seq_k, q_offset, q_stride, scale,
                               sliding_window, mm_ranges_ptr, max_mm_ranges,

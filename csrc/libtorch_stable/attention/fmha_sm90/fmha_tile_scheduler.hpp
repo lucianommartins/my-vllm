@@ -62,10 +62,18 @@ struct IndividualTileScheduler {
       ClusterShape const& cluster_shape, TileShape const& tile_shape)
   {
     using namespace cute;
-    static const bool transposed = []() {
+    // Default AUTO (S67): transposed for hd512 — interleaved same-binary
+    // ladder showed heads-inner wins 2.5-3.7% at q8192 and ties q2048
+    // (the S56 "±1.6pt mixed" verdict was the untransposed default being
+    // compared against reference numbers recorded WITH it engaged).
+    // GEMMA_SCHED_T=1/0 still forces either way for all head dims.
+    static const int sched_t_env = []() -> int {
       const char* e = getenv("GEMMA_SCHED_T");
-      return e != nullptr && e[0] == '1';
+      return e == nullptr ? -1 : (e[0] == '1' ? 1 : 0);
     }();
+    const bool transposed = sched_t_env < 0
+        ? (get<4>(problem_size) == 512)
+        : sched_t_env == 1;
     const int m_tiles = round_up(
         ceil_div(size<2>(problem_size), size<0>(tile_shape)),
         size<0>(cluster_shape));
