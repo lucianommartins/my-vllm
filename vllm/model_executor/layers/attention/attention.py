@@ -646,7 +646,8 @@ class Attention(nn.Module, AttentionLayerBase):
             # attaches _gemma_k_norm_weight only on k_eq_v global layers.
             if (os.environ.get("GEMMA_CACHE_V3", "1") != "0"
                     and getattr(self, "_gemma_k_norm_weight", None)
-                    is not None):
+                    is not None
+                    and self.attn_backend.get_name() == "GEMMA_ATTN"):
                 from vllm.v1.kv_cache_interface import GemmaGlobalV3Spec
                 # Fail-closed arming: the record math assumes exactly the
                 # k_eq_v global geometry. Anything else must NOT reach the
