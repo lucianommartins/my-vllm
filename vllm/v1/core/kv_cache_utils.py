@@ -904,24 +904,36 @@ def get_max_concurrency_for_kv_cache_config(
     Get the maximum concurrency for the given KV cache configuration.
     """
     if kv_cache_config.num_gemma_global_blocks is not None:
-        # Two-pool: concurrency is bounded by the tighter pool.
+        # Two-pool: concurrency is bounded by the tighter pool. Sliding
+        # residency is counted at STEADY STATE (window blocks + rounding);
+        # the in-flight chunk is one shared transient per step, not a
+        # per-request cost — charging it per request under-reports
+        # concurrency ~10x at long context.
         main_groups, gemma_groups = _split_gemma_v3_groups(
             kv_cache_config.kv_cache_groups
         )
-        concurrency = []
-        for groups, pool_blocks in (
-            (main_groups, kv_cache_config.num_blocks),
-            (gemma_groups, kv_cache_config.num_gemma_global_blocks),
-        ):
-            n_layer = max(len(g.layer_names) for g in groups)
-            per_request_bytes = n_layer * max_memory_usage_bytes(
-                vllm_config, (g.kv_cache_spec for g in groups)
+        main_blocks_per_req = 0
+        for g in main_groups:
+            spec = g.kv_cache_spec
+            window = getattr(spec, "sliding_window", None)
+            if window is not None:
+                main_blocks_per_req += cdiv(window, spec.block_size) + 2
+            else:
+                main_blocks_per_req += cdiv(
+                    vllm_config.model_config.max_model_len, spec.block_size
+                )
+        gemma_blocks_per_req = sum(
+            cdiv(
+                vllm_config.model_config.max_model_len,
+                g.kv_cache_spec.block_size,
             )
-            per_block_bytes = groups[0].kv_cache_spec.page_size_bytes * n_layer
-            concurrency.append(
-                pool_blocks / cdiv(per_request_bytes, per_block_bytes)
-            )
-        return min(concurrency)
+            for g in gemma_groups
+        )
+        return min(
+            kv_cache_config.num_blocks / max(main_blocks_per_req, 1),
+            kv_cache_config.num_gemma_global_blocks
+            / max(gemma_blocks_per_req, 1),
+        )
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
