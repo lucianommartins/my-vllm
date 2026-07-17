@@ -95,15 +95,20 @@ __global__ void split_params_build_kernel(
     int* __restrict__ d_kvlo_v, int* __restrict__ vtable,
     const int* __restrict__ seq_lens, const int* __restrict__ cu_q,
     const int* __restrict__ block_tables, int num_seqs, int S,
-    int uniform_q_len, int max_blocks, int tile) {
+    int uniform_q_len, int max_blocks, int tile, bool ws_decode = false) {
   const int v = blockIdx.x;
   if (v >= num_seqs * S) return;
   const int s = v / S, j = v % S;
   const int kv = seq_lens[s];
   const int qlen = cu_q != nullptr ? cu_q[s + 1] - cu_q[s] : uniform_q_len;
-  const int qoff = kv - qlen;
+  // WS-decode: q_offset := kv (full-range rows; before_softmax's k>=seq_k
+  // bound handles the residue). The dense frontier then covers all but
+  // the last tile so the final split stays non-degenerate.
+  const int qoff = ws_decode ? kv : kv - qlen;
   if (threadIdx.x == 0) {
-    const int frontier_t = qoff / tile;      // dense region = [0, frontier_t)
+    const int total_t = (kv + tile - 1) / tile;
+    const int frontier_t =                   // dense region = [0, frontier_t)
+        ws_decode ? (total_t > 0 ? total_t - 1 : 0) : qoff / tile;
     // Balanced partition of the dense region over S-1 splits: slice j =
     // [j*F/(S-1), (j+1)*F/(S-1)) tiles — never empty while F >= S-1
     // (launcher guarantees min_kv; combine still skips empty-LSE entries).
@@ -694,7 +699,15 @@ bool gemma_prefill_sm90_launcher(
   const int num_seqs = seq_lens.size(0);
 
   if (head_size != 256 && head_size != 512) return false;
-  if (non_causal) return false;   // cascade prefix pass -> wmma fallback
+  // non_causal + record640 = WS-DECODE mode (S72): GQA-as-M decode through
+  // this warp-specialized kernel. Per-seq q_offset := seq_k (decode-batch
+  // semantics) makes the causal machinery degenerate to full-range
+  // visibility for every packed row — no fusion changes needed. Plain
+  // non_causal (cascade prefix experiments) still falls back to wmma.
+  const bool ws_decode =
+      non_causal && k_eq_v && head_size == 512 &&
+      key_cache.dim() == 4 && key_cache.size(3) == 640;
+  if (non_causal && !ws_decode) return false;  // cascade -> wmma fallback
   if (lse_out.numel() > 0) return false;  // LSE epilogue not implemented here
   // Tiny-query steps (prefix-cache last-block recompute q<=17, small
   // extends): the per-seq gather+launch of this path costs more than the
@@ -980,7 +993,8 @@ bool gemma_prefill_sm90_launcher(
       const int* d_sl_real = seq_lens.mutable_data_ptr<int>();
       split_params_build_kernel<<<V, 128, 0, stream>>>(
           d_sl_v, d_qoff_v, d_kvlo_v, d_vtable, d_sl_real, d_cu_q,
-          block_tables_ptr, num_seqs, S, seq_len, max_num_blocks_per_seq, 64);
+          block_tables_ptr, num_seqs, S, seq_len, max_num_blocks_per_seq, 64,
+          ws_decode);
       dim3 sgrid(max_q_pad, V);
       split_replicate_q_kernel<Element><<<sgrid, 256, 0, stream>>>(
           reinterpret_cast<Element*>(q_scratch), query_ptr, d_cu_q, S,
@@ -1030,7 +1044,9 @@ bool gemma_prefill_sm90_launcher(
     bool kv_uniform = true;
     for (int s2 = 1; s2 < num_seqs; s2++)
       kv_uniform &= (h_seq_lens[s2] == h_seq_lens[0]);
-    if (kv_uniform && paged_call) {
+    // WS-decode skips the uniform fast path (scalar q_offset only) — the
+    // varlen-batched / per-seq paths below carry the per-seq override.
+    if (kv_uniform && paged_call && !ws_decode) {
       // Batched paged: ONE launch, block_tables is already the row-major 2D
       // page table ([seq][max_blocks]); loaders index it via the batch coord.
       // Absolute coords (no gather slice): trip_start skips out-of-window
@@ -1197,11 +1213,13 @@ bool gemma_prefill_sm90_launcher(
             sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
             &pool, d_sl, d_cu_q);
       } else if (k_eq_v) {
+        // WS-decode: per-seq q_offset := seq_k — the seq_lens tensor IS
+        // the q_offsets tensor (decode-batch semantics, full-range rows).
         vok = launch_fmha_batched<512, true>(
             qs, kc, vc, os, lse_scratch, num_q_heads, gqa_group, num_seqs,
             max_q_pad, max_kv_len, q_off_dummy, row_elems, scale,
             sliding_window, nullptr, 0, s_device_id, s_sm_count, stream,
-            &pool, d_sl, d_cu_q);
+            &pool, d_sl, d_cu_q, ws_decode ? d_sl : nullptr);
       } else {
         vok = launch_fmha_batched<512>(
             qs, kc, vc, os, lse_scratch, num_q_heads, gqa_group, num_seqs,
@@ -1236,7 +1254,8 @@ bool gemma_prefill_sm90_launcher(
       if (kv_lo < 0) kv_lo = 0;
     }
     const int kv_len_s = kv_len_full - kv_lo;  // paged: full absolute extent
-    const int q_off_s = kv_len_s - seq_len_s;  // context length
+    const int q_off_s = ws_decode ? kv_len_s
+                                  : kv_len_s - seq_len_s;  // context length
     const int padded_sl_s = (seq_len_s + kAlignment - 1) / kAlignment * kAlignment;
     const bool needs_pad_s = (padded_sl_s != seq_len_s);
     const int* seq_block_table =

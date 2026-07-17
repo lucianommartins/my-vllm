@@ -225,7 +225,7 @@ static constexpr int DS_MINCTA_256 = 3;
 // for A/B against the BLOCK_N=16 default.
 // Gate D fused mma.sync decode (register softmax). BLOCK_N fixed at 64
 // (8 warps x n8 slices). smem = sQ + 2-stage K(+V) ring + sP + warp stats.
-#define LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, SPLITB, NW)                 \
+#define LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, SPLITB, NW, NSTGV)          \
   do {                                                                         \
     const dim3 fgrid = (SPLITB) ? dim3(num_kv_heads, num_seqs, num_splits)     \
                                 : dim3(num_kv_heads, num_seqs);                 \
@@ -233,13 +233,13 @@ static constexpr int DS_MINCTA_256 = 3;
     constexpr int FBN = 8 * (NW);                                              \
     constexpr int FLDN = FBN + 8;                                              \
     constexpr int FSTAGE = FBN * FLDH * ((KEQV) ? 1 : 2);                      \
-    constexpr int FNSTG = 2;                                                   \
+    constexpr int FNSTG = (NSTGV);                                             \
     size_t fsmem = (size_t)(16 * FLDH + FNSTG * FSTAGE + 16 * FLDN)            \
                        * sizeof(CACHE_T)                                       \
                    + (size_t)(2 * (NW) * 16 + ((KEQV) ? (HEAD) / 2 : 0))       \
                        * sizeof(float);                                        \
     auto fk = vllm::gemma::gemma_decode_fused_kernel<                          \
-        T, CACHE_T, HEAD, GROUP, KEQV, USW, SPLITB, NW>;                       \
+        T, CACHE_T, HEAD, GROUP, KEQV, USW, SPLITB, NW, NSTGV>;                \
     {                                                                          \
       static bool fattr = false;                                               \
       if (!fattr) {                                                            \
@@ -271,15 +271,23 @@ static constexpr int DS_MINCTA_256 = 3;
   do {                                                                         \
     if (fused_nw == 4) {                                                       \
       if (num_splits > 1) {                                                    \
-        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true, 4);                   \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true, 4, 2);                \
       } else {                                                                 \
-        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false, 4);                  \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false, 4, 2);               \
+      }                                                                        \
+    } else if ((KEQV) && fused_nstg1) {                                        \
+      /* S71 experiment: single-stage ring -> ~87KB smem -> 2 CTA/SM;    */    \
+      /* double-buffering moves ACROSS co-resident CTAs.                 */    \
+      if (num_splits > 1) {                                                    \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true, 8, 1);                \
+      } else {                                                                 \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false, 8, 1);               \
       }                                                                        \
     } else {                                                                   \
       if (num_splits > 1) {                                                    \
-        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true, 8);                   \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, true, 8, 2);                \
       } else {                                                                 \
-        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false, 8);                  \
+        LAUNCH_GEMMA_FUSED(HEAD, GROUP, KEQV, USW, false, 8, 2);               \
       }                                                                        \
     }                                                                          \
   } while (0)
@@ -543,6 +551,12 @@ void gemma_paged_attention_launcher(
     const char* e = getenv("GEMMA_DECODE_FUSED_NW");
     if (e == nullptr) return 0;
     return e[0] == '4' ? 4 : (e[0] == '8' ? 8 : 0);
+  }();
+  // GEMMA_DECODE_NSTG=1: single-stage ring (KEqV fused only) -> 2 CTA/SM
+  // cross-CTA double-buffering. S71 experiment, default off (=2).
+  static const bool fused_nstg1 = []() {
+    const char* e = getenv("GEMMA_DECODE_NSTG");
+    return e != nullptr && e[0] == '1';
   }();
   // Packed multi-query is only implemented by the fused kernel and only
   // where GQA_GROUP*mq fits the M=16 pad (hd256 sliding, GROUP=2, mq<=8).

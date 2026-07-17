@@ -1657,8 +1657,9 @@ gemma_decode_mma_kernel(
 // GROUP <= 16, BLOCK_N == 8 * NWARP (64), bf16, k_eq_v or V_SMEM staged.
 // ---------------------------------------------------------------------------
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int GQA_GROUP,
-          bool K_EQ_V, bool USE_SLIDING_WINDOW, bool SPLIT, int NWARP_T = 8>
-__global__ void __launch_bounds__(NWARP_T * 32, 1)
+          bool K_EQ_V, bool USE_SLIDING_WINDOW, bool SPLIT, int NWARP_T = 8,
+          int NSTG_T = 2>
+__global__ void __launch_bounds__(NWARP_T * 32, NSTG_T == 1 ? 2 : 1)
 gemma_decode_fused_kernel(
     scalar_t* __restrict__ out_or_tmp,
     float* __restrict__ exp_sums,
@@ -1694,9 +1695,13 @@ gemma_decode_fused_kernel(
   constexpr bool V_SMEM = !K_EQ_V;          // decode: stage V unless V==K
   constexpr int KTILE = BLOCK_N * LDH;
   constexpr int STAGE = KTILE * (V_SMEM ? 2 : 1);
-  // 2-stage double buffer (3-stage measured -3%: depth is not the decode
-  // constraint; modulo indexing + fatter footprint cost more than they buy).
-  constexpr int NSTG = 2;
+  // 2-stage double buffer (3-stage measured -3% twice, incl. under strip:
+  // depth is not the decode constraint). NSTG_T=1 (S71): single stage ->
+  // ~87KB smem -> 2 CTAs/SM co-reside; the double-buffering moves ACROSS
+  // CTAs (one CTA's DMA lands under the other's compute, 16 warps/SM in
+  // independent streams) with ZERO per-tile overhead increase — the trap
+  // that killed BN32. Host gates it to grids >= 2 waves.
+  constexpr int NSTG = NSTG_T;
   static_assert(GQA_GROUP <= 16 && HEAD_SIZE % (16 * NWARP) == 0);
 
   const int kv_head = blockIdx.x;
@@ -1859,7 +1864,8 @@ gemma_decode_fused_kernel(
       // (NSTG-1 skipped the wait on the current tile -> QK read zeros
       // under DMA contention; showed as 0.007-0.02 split-partial error.)
       const int rem = ntiles_local - 1 - t;  // tiles still outstanding
-      __pipeline_wait_prior(rem >= NSTG - 2 ? NSTG - 2 : rem);
+      __pipeline_wait_prior(NSTG == 1 ? 0
+                                      : (rem >= NSTG - 2 ? NSTG - 2 : rem));
     }
     __syncthreads();  // B1: staged K(+V) visible CTA-wide
 
@@ -1867,7 +1873,8 @@ gemma_decode_fused_kernel(
     // back-edge to reach B1, so iteration t-1's reads of this ring slot are
     // complete CTA-wide. Committing here (vs post-B2) gives the DMA the
     // whole iteration (QK+softmax+PV) to land instead of just softmax+PV.
-    if (t + NSTG - 1 < ntiles_local)
+    // (NSTG==1 has no free slot here — it stages at the loop tail instead.)
+    if (NSTG >= 2 && t + NSTG - 1 < ntiles_local)
       DF_STAGE(tile_lo + t + NSTG - 1, (t + NSTG - 1) % NSTG);
 
     const int kv0 = kv_begin + (tile_lo + t) * BLOCK_N;
@@ -2081,6 +2088,15 @@ gemma_decode_fused_kernel(
       }
       l_run0 = l_run0 * al0 + tl0;
       l_run1 = l_run1 * al1 + tl1;
+    }
+    // NSTG==1: single-slot re-stage. B4 drains ALL warps' PV ldmatrix
+    // reads of this tile before the cp.async overwrite; the exposed DMA
+    // window (B4 -> next B1) is what the co-resident 2nd CTA hides.
+    if constexpr (NSTG == 1) {
+      if (t + 1 < ntiles_local) {
+        __syncthreads();  // B4: PV reads of the slot complete CTA-wide
+        DF_STAGE(tile_lo + t + 1, 0);
+      }
     }
   }
 #undef DF_STAGE
