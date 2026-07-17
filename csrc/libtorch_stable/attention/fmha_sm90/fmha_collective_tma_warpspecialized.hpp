@@ -2266,13 +2266,28 @@ struct FmhaMainloopTmaWarpSpecialized {
     Tensor cO = make_identity_tensor(take<0, 2>(TileShapePV{}));
     Tensor tOcO = thr_pv.partition_C(cO);
 
+    // Pair-packed O write: wgmma c-frags hold column pairs (n, n+1) in
+    // consecutive accumulator elements, so pack to one 4B store — halves
+    // the store-instruction count and removes 2B sub-sector RMW churn in
+    // L2 (ncu S57: 2.1M scalar stores were the top L2/L1TEX offender).
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(acc_pv); i++) {
+    for (int i = 0; i < size(acc_pv); i += 2) {
       int m = get<0>(tOcO(i));
       int n = get<1>(tOcO(i));
       if (m + m_block * MPerWG < seqlen_q) {
-        params.ptr_O[o_base + m * seq_stride_o + n] =
-            static_cast<Element>(acc_pv(i));
+        if (get<0>(tOcO(i + 1)) == m && get<1>(tOcO(i + 1)) == n + 1) {
+          uint32_t pk =
+              (uint32_t)static_cast<Element>(acc_pv(i)).storage |
+              ((uint32_t)static_cast<Element>(acc_pv(i + 1)).storage << 16);
+          *reinterpret_cast<uint32_t*>(
+              &params.ptr_O[o_base + m * seq_stride_o + n]) = pk;
+        } else {
+          params.ptr_O[o_base + m * seq_stride_o + n] =
+              static_cast<Element>(acc_pv(i));
+          params.ptr_O[o_base + get<0>(tOcO(i + 1)) * seq_stride_o +
+                       get<1>(tOcO(i + 1))] =
+              static_cast<Element>(acc_pv(i + 1));
+        }
       }
     }
 
@@ -2555,13 +2570,28 @@ struct FmhaMainloopTmaWarpSpecialized {
     Tensor cO = make_identity_tensor(take<0, 2>(TileShapePV{}));
     Tensor tOcO = thr_pv.partition_C(cO);
 
+    // Pair-packed O write: wgmma c-frags hold column pairs (n, n+1) in
+    // consecutive accumulator elements, so pack to one 4B store — halves
+    // the store-instruction count and removes 2B sub-sector RMW churn in
+    // L2 (ncu S57: 2.1M scalar stores were the top L2/L1TEX offender).
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(acc_pv); i++) {
+    for (int i = 0; i < size(acc_pv); i += 2) {
       int m = get<0>(tOcO(i));
       int n = get<1>(tOcO(i));
       if (m + m_block * MPerWG < seqlen_q) {
-        params.ptr_O[o_base + m * seq_stride_o + n] =
-            static_cast<Element>(acc_pv(i));
+        if (get<0>(tOcO(i + 1)) == m && get<1>(tOcO(i + 1)) == n + 1) {
+          uint32_t pk =
+              (uint32_t)static_cast<Element>(acc_pv(i)).storage |
+              ((uint32_t)static_cast<Element>(acc_pv(i + 1)).storage << 16);
+          *reinterpret_cast<uint32_t*>(
+              &params.ptr_O[o_base + m * seq_stride_o + n]) = pk;
+        } else {
+          params.ptr_O[o_base + m * seq_stride_o + n] =
+              static_cast<Element>(acc_pv(i));
+          params.ptr_O[o_base + get<0>(tOcO(i + 1)) * seq_stride_o +
+                       get<1>(tOcO(i + 1))] =
+              static_cast<Element>(acc_pv(i + 1));
+        }
       }
     }
 
@@ -2737,13 +2767,28 @@ struct FmhaMainloopTmaWarpSpecialized {
                  m_block * MPerWG * seq_stride_o;
     int seqlen_q = get<2>(problem_size);
 
+    // Pair-packed O write: wgmma c-frags hold column pairs (n, n+1) in
+    // consecutive accumulator elements, so pack to one 4B store — halves
+    // the store-instruction count and removes 2B sub-sector RMW churn in
+    // L2 (ncu S57: 2.1M scalar stores were the top L2/L1TEX offender).
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(acc_pv); i++) {
+    for (int i = 0; i < size(acc_pv); i += 2) {
       int m = get<0>(tOcO(i));
       int n = get<1>(tOcO(i));
       if (m + m_block * MPerWG < seqlen_q) {
-        params.ptr_O[o_base + m * seq_stride_o + n] =
-            static_cast<Element>(acc_pv(i));
+        if (get<0>(tOcO(i + 1)) == m && get<1>(tOcO(i + 1)) == n + 1) {
+          uint32_t pk =
+              (uint32_t)static_cast<Element>(acc_pv(i)).storage |
+              ((uint32_t)static_cast<Element>(acc_pv(i + 1)).storage << 16);
+          *reinterpret_cast<uint32_t*>(
+              &params.ptr_O[o_base + m * seq_stride_o + n]) = pk;
+        } else {
+          params.ptr_O[o_base + m * seq_stride_o + n] =
+              static_cast<Element>(acc_pv(i));
+          params.ptr_O[o_base + get<0>(tOcO(i + 1)) * seq_stride_o +
+                       get<1>(tOcO(i + 1))] =
+              static_cast<Element>(acc_pv(i + 1));
+        }
       }
     }
   }
