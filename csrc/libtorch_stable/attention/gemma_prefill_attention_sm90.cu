@@ -213,7 +213,7 @@ static float g_recon_inv_w = 1.f;
 static bool g_v_fill = false;
 static bool g_v_fill_tma = false;   // GEMMA_V_FILL=2: producer-TMA overwrite
 static const cutlass::bfloat16_t* g_v_fill_pool = nullptr;
-static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0;
+static int64_t g_v_fill_sb = 0, g_v_fill_ss = 0, g_v_fill_sh = 0;
 
 template <int HeadDim, bool KEqV = false, bool Overlap = false>
 struct FmhaCachedLauncher {
@@ -425,6 +425,7 @@ struct FmhaCachedLauncher {
           (paged != nullptr && g_v_fill) ? g_v_fill_pool : nullptr;
       p.mainloop.v_fill_stride_block = g_v_fill_sb;
       p.mainloop.v_fill_stride_slot = g_v_fill_ss;
+      p.mainloop.v_fill_stride_head = g_v_fill_sh;
     }
     return FmhaOp::run(
                const_cast<typename Kernel::Params&>(fmha_op.params()), stream)
@@ -515,6 +516,7 @@ bool gemma_prefill_sm90_launcher(
                            : nullptr;
   g_v_fill_sb = value_cache.stride(0);
   g_v_fill_ss = value_cache.stride(1);
+  g_v_fill_sh = value_cache.stride(2);
   // GEMMA_CACHE_V3 640-record pool: K via 4-box TMA; V via the fill path
   // (rotor columns only) sourced from the RECORD pool, regardless of the
   // GEMMA_V_FILL env. Recon has no role in record mode.
@@ -527,6 +529,7 @@ bool gemma_prefill_sm90_launcher(
         reinterpret_cast<const cutlass::bfloat16_t*>(key_cache.data_ptr());
     g_v_fill_sb = key_cache.stride(0);
     g_v_fill_ss = key_cache.stride(1);
+    g_v_fill_sh = key_cache.stride(2);
     g_recon_invfreq = nullptr;
   }
 

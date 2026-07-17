@@ -382,6 +382,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     const Element* v_fill_pool = nullptr;
     int64_t v_fill_stride_block = 0;
     int64_t v_fill_stride_slot = 0;
+    int64_t v_fill_stride_head = 0;
     // GEMMA_CACHE_V3 640-record mode: K via 4 column-box descriptors;
     // V via the fill path (rotor columns only — the unrot columns of the
     // K tile already hold natural-position V values).
@@ -1818,6 +1819,7 @@ struct FmhaMainloopTmaWarpSpecialized {
     [[maybe_unused]] const Element* fill_vbase = nullptr;
     [[maybe_unused]] int64_t fill_tok_stride = 0;
     [[maybe_unused]] int fill_batch = 0;
+    [[maybe_unused]] int64_t fill_head_off = 0;
     [[maybe_unused]] int fill_ps = 64;
     if constexpr (kKEqV) {
       static_assert(kNumMmaThreads == kHeadDim / 2,
@@ -1827,6 +1829,13 @@ struct FmhaMainloopTmaWarpSpecialized {
         recon_t = Fusion{}.get_trip_start(blk_coord, TileShape{}, problem_size);
         fill_paged = params.v_fill_pool != nullptr;
         fill_batch = int(get<1>(get<2>(blk_coord)));
+        // kv-head offset for multi-head pools (kvh>=2: 26B/31B globals).
+        // The legacy fill lacked this term — latent for 12B (kvh==1).
+        fill_head_off = fill_paged
+            ? (int64_t)(int(get<0>(get<2>(blk_coord))) /
+                        (params.gqa_group > 0 ? params.gqa_group : 1)) *
+                  params.v_fill_stride_head
+            : 0;
         if (fill_paged) {
           fill_ps = int(get<1>(TileShapeQK{})) /
                     (params.pages_per_tile > 0 ? params.pages_per_tile : 1);
@@ -1878,7 +1887,7 @@ struct FmhaMainloopTmaWarpSpecialized {
               const Element* src = params.v_fill_pool +
                     (int64_t)phys * params.v_fill_stride_block +
                     (int64_t)(tok % fill_ps) * params.v_fill_stride_slot +
-                    srcc;
+                    fill_head_off + srcc;
               const uint32_t dst = cute::cast_smem_ptr_to_uint(
                   &sK_full(n, dv, stage_idx));
               asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
@@ -1901,7 +1910,7 @@ struct FmhaMainloopTmaWarpSpecialized {
               src = params.v_fill_pool +
                     (int64_t)phys * params.v_fill_stride_block +
                     (int64_t)(tok % fill_ps) * params.v_fill_stride_slot +
-                    c * kVecE;
+                    fill_head_off + c * kVecE;
             } else {
               src = fill_vbase + (int64_t)tok * fill_tok_stride + c * kVecE;
             }
