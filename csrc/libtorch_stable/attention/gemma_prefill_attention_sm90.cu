@@ -940,7 +940,26 @@ bool gemma_prefill_sm90_launcher(
             head_size, max_q_len, min_kv_len, int(use_paged), page_size);
   if (splitkv_enabled && use_paged && head_size == 512 && max_q_len <= 128 &&
       min_kv_len >= 2048 && mm_prefix_ranges.numel() == 0) {
-    const int S = std::min(32, std::max(2, max_kv_len / 512));
+    // WS-decode split count (S73 sweep): the prefill-shaped formula
+    // over-splits short-KV decode (S72: b8/16k 1.213 from 8-tile splits).
+    // Optima track CTA waves on 132 SMs: V ~= 1 full wave (128) for small
+    // problem counts, ~2 waves (256) for large; each split kept >= 16
+    // tiles (1024 tok). Measured: b8/16k S=16 106.8us, b8/64k S=16
+    // 319.7us (0.87x FA4), b32/16k S=8 341.9us, b128/8k S=2 596.9us.
+    // S=1 is INVALID (combine breaks silently, S73 falsification).
+    // GEMMA_WS_SPLITS overrides (clamped 2..32); prefill S is unchanged.
+    static const int ws_splits_env = [] {
+      const char* e = getenv("GEMMA_WS_SPLITS");
+      return e ? atoi(e) : 0;
+    }();
+    int S = std::min(32, std::max(2, max_kv_len / 512));
+    if (ws_decode) {
+      const int prob = std::max(1, num_seqs * num_kv_heads);
+      const int v_target = (prob <= 16) ? 128 : 256;
+      S = std::max(2, std::min({32, v_target / prob, max_kv_len / 1024}));
+      if (ws_splits_env > 0)
+        S = std::max(2, std::min(32, ws_splits_env));
+    }
     const int V = num_seqs * S;
     const int max_q_pad =
         (max_q_len + kAlignment - 1) / kAlignment * kAlignment;
