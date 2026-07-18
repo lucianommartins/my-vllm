@@ -100,11 +100,14 @@ class KVCacheCoordinator(ABC):
         # every other model. Own (absent) metrics collector: block_metrics
         # is keyed by bare block_id, which overlaps across pools.
         self.gemma_global_block_pool: BlockPool | None = None
-        if any(
-            isinstance(g.kv_cache_spec, GemmaGlobalV3Spec)
-            for g in kv_cache_config.kv_cache_groups
-        ):
-            assert kv_cache_config.num_gemma_global_blocks is not None
+        # Keyed on the CONFIG field, not the spec type: under
+        # GEMMA_V3_SINGLE_POOL the record groups live in the shared pool
+        # (LCM-unified page bytes) and num_gemma_global_blocks stays None.
+        if kv_cache_config.num_gemma_global_blocks is not None:
+            assert any(
+                isinstance(g.kv_cache_spec, GemmaGlobalV3Spec)
+                for g in kv_cache_config.kv_cache_groups
+            ), "num_gemma_global_blocks set without a GemmaGlobalV3Spec group"
             assert not any(
                 type(g.kv_cache_spec) is FullAttentionSpec
                 for g in kv_cache_config.kv_cache_groups

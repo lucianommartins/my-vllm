@@ -977,9 +977,10 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
     main_groups, gemma_groups = _split_gemma_v3_groups(kv_cache_groups)
-    if gemma_groups and main_groups:
+    if gemma_groups and main_groups and not _gemma_v3_single_pool():
         # num_gpu_blocks_override applies to BOTH pools; one override block
-        # costs the sum of the per-pool block byte rates.
+        # costs the sum of the per-pool block byte rates. (Single-pool mode
+        # has LCM-uniform pages -> the general formula below is correct.)
         return _pool_bytes_per_block(main_groups) + _pool_bytes_per_block(
             gemma_groups
         )
@@ -1060,35 +1061,88 @@ def _gemma_v3_sliding_budget(
     max_len = vllm_config.model_config.max_model_len
     group_size = max(len(g.layer_names) for g in main_groups)
     page = get_uniform_page_size([g.kv_cache_spec for g in main_groups])
-    live_blocks = 0
+    per_seq_blocks = 0  # steady-state sliding blocks per live request
+    inflight_blocks = 0  # shared per-step transient (one prefill chunk/group)
     for g in main_groups:
         spec = g.kv_cache_spec
         window = getattr(spec, "sliding_window", None)
         if window is None:
             # Non-sliding layer in the shared pool: no window bound; fall
             # back to full-context demand for this group.
-            live_blocks += sched.max_num_seqs * cdiv(max_len, spec.block_size)
+            per_seq_blocks += cdiv(max_len, spec.block_size)
         else:
-            live_blocks += sched.max_num_seqs * (
-                cdiv(window, spec.block_size) + 2
-            ) + cdiv(sched.max_num_batched_tokens, spec.block_size)
+            per_seq_blocks += cdiv(window, spec.block_size) + 2
+            inflight_blocks += cdiv(
+                sched.max_num_batched_tokens, spec.block_size
+            )
+    live_blocks = sched.max_num_seqs * per_seq_blocks + inflight_blocks
     sliding_target = int(1.5 * live_blocks) * page * group_size
 
     gemma_group_size = max(len(g.layer_names) for g in gemma_groups)
     gemma_page = get_uniform_page_size([g.kv_cache_spec for g in gemma_groups])
     gemma_spec = gemma_groups[0].kv_cache_spec
+    rec_blocks_per_seq = cdiv(max_len, gemma_spec.block_size)
     gemma_target = (
-        sched.max_num_seqs
-        * cdiv(max_len, gemma_spec.block_size)
-        * gemma_page
-        * gemma_group_size
+        sched.max_num_seqs * rec_blocks_per_seq * gemma_page * gemma_group_size
     )
 
-    if sliding_target + gemma_target <= available_memory:
-        return sliding_target
-    return int(
-        available_memory * sliding_target / (sliding_target + gemma_target)
+    # GEMMA_V3_SLIDING_FRAC=<0.05..0.95>: pin the sliding pool to this
+    # fraction of available memory under scarcity. The proportional split
+    # below sizes the record pool for max_num_seqs at FULL max_model_len — a
+    # worst case the sliding pool cannot co-support — so when the workload's
+    # real context is far below max_model_len, record memory sits idle while
+    # the sliding pool binds concurrency (measured 26B decode c128:
+    # equilibrium Running 56-59 vs Triton 75-87, TPOT x0.72). No static split
+    # dominates at every context length (maximin-at-max_len trades short-ctx
+    # throughput for a flat floor); the default stays, and the boot log below
+    # reports both pools' worst-case concurrency so the operator can size
+    # max_model_len / the frac deliberately.
+    frac_env = os.environ.get("GEMMA_V3_SLIDING_FRAC")
+    if frac_env is not None:
+        frac = min(0.95, max(0.05, float(frac_env)))
+        budget = int(available_memory * frac)
+    elif sliding_target + gemma_target <= available_memory:
+        budget = sliding_target
+    else:
+        budget = int(
+            available_memory * sliding_target / (sliding_target + gemma_target)
+        )
+
+    # Boot-time two-pool concurrency telemetry: sliding side at window steady
+    # state (context-independent once the window fills), record side at
+    # max_model_len (its worst case). The min is the concurrency this split
+    # can sustain without a preemption carousel. Skipped on the zero-memory
+    # structure-probing call (the manager invokes this twice).
+    if available_memory <= 0:
+        return budget
+    per_seq_bytes = per_seq_blocks * page * group_size
+    inflight_bytes = inflight_blocks * page * group_size
+    rec_per_seq_bytes = rec_blocks_per_seq * gemma_page * gemma_group_size
+    c_slide = max(0, budget - inflight_bytes) / max(per_seq_bytes, 1)
+    c_rec = max(0, available_memory - budget) / max(rec_per_seq_bytes, 1)
+    logger.info(
+        "GEMMA_CACHE_V3 two-pool split: sliding %.2f GiB / records %.2f GiB "
+        "(frac %.3f%s). Worst-case sustainable concurrency: sliding %.0f "
+        "(window steady), records %.0f (@max_model_len=%d).",
+        budget / 2**30,
+        (available_memory - budget) / 2**30,
+        budget / max(available_memory, 1),
+        ", pinned by GEMMA_V3_SLIDING_FRAC" if frac_env is not None else "",
+        c_slide,
+        c_rec,
+        max_len,
     )
+    if min(c_slide, c_rec) < sched.max_num_seqs:
+        logger.warning(
+            "GEMMA_CACHE_V3 split sustains ~%.0f concurrent requests at "
+            "worst case but max_num_seqs=%d: expect preemption/recompute "
+            "churn at saturation. If workload context << max_model_len, "
+            "lower --max-model-len or raise GEMMA_V3_SLIDING_FRAC; if "
+            "long-context, lower max_num_seqs or add memory.",
+            min(c_slide, c_rec),
+            sched.max_num_seqs,
+        )
+    return budget
 
 
 def _get_kv_cache_groups_uniform_spec(
@@ -1137,6 +1191,63 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
 
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
     return len(page_sizes) == 1
+
+
+def _gemma_v3_single_pool() -> bool:
+    """GEMMA_V3_SINGLE_POOL=1: single-arena mode for the gemma-4 v3 cache.
+
+    Instead of two independently sized block pools (sliding pages vs
+    640-channel record pages, non-integer byte ratio), scale every spec's
+    block_size so all page byte sizes meet at their LCM (e.g. 26B: sliding
+    bs 16->80, records 64->256 -> both 640KB pages). One fungible pool via
+    the standard uniform-page machinery: no static split to mis-size, no
+    GEMMA_V3_SLIDING_FRAC, elasticity identical to a plain hybrid model.
+    Kernel block sizes are untouched (16/64) — the manager-vs-kernel
+    block-size translation (`prepare_kernel_block_sizes`) expands tables.
+    Cost: scheduler/hash granularity becomes lcm(block sizes) tokens
+    (~1280), coarsening prefix-cache hits (-1.9% tok/s at 92.1% hit rate,
+    26B aligned-prefix probe). DEFAULT ON (2026-07-18 gates: parity + MTP
+    token-identical; 26B dec c128 0.997 vs Triton with TPOT median equal;
+    12B KV-bound C 94->99, +9.3% tok/s; no cell regressed).
+    GEMMA_V3_SINGLE_POOL=0 reverts to the two-pool split.
+    """
+    return os.environ.get("GEMMA_V3_SINGLE_POOL", "1") != "0"
+
+
+def unify_kv_cache_spec_page_size_lcm(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> dict[str, KVCacheSpec]:
+    """Unify page sizes by scaling every layer's block_size up to the LCM
+    of all page sizes (the plain unifier can only scale smaller pages up to
+    the LARGEST page, which requires an integer ratio — gemma-4 v3 pages
+    have a non-integer ratio, e.g. 640KB vs 512KB per 64/16-token blocks).
+    """
+    page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
+    if len(page_sizes) <= 1:
+        return kv_cache_spec
+    target = math.lcm(*page_sizes)
+    # Paranoia bound: a pathological head/channel combination could blow the
+    # LCM up; refuse anything past 8MB pages (fragmentation/hash granularity
+    # would dwarf the split savings).
+    if target > 8 * 1024 * 1024:
+        raise NotImplementedError(
+            f"GEMMA_V3_SINGLE_POOL: LCM page size {target} B exceeds the 8MB "
+            f"sanity bound (page sizes: {sorted(page_sizes)})."
+        )
+    new_kv_cache_spec = {}
+    for layer_name, layer_spec in kv_cache_spec.items():
+        page = layer_spec.page_size_bytes
+        if page == target:
+            new_kv_cache_spec[layer_name] = layer_spec
+            continue
+        assert target % page == 0, (layer_name, page, target)
+        ratio = target // page
+        new_spec = replace(
+            layer_spec, block_size=layer_spec.block_size * ratio
+        )
+        assert new_spec.page_size_bytes == target
+        new_kv_cache_spec[layer_name] = new_spec
+    return new_kv_cache_spec
 
 
 def unify_kv_cache_spec_page_size(
@@ -1424,10 +1535,12 @@ def get_kv_cache_config_from_groups(
     elif any(
         isinstance(group.kv_cache_spec, GemmaGlobalV3Spec)
         for group in kv_cache_groups
-    ):
+    ) and not _gemma_v3_single_pool():
         # Gemma-4 GEMMA_CACHE_V3 two-pool case: sliding and global-record
         # pages cannot be unified (non-integer byte ratio), so size the two
         # pools independently and never share a tensor across pools.
+        # (GEMMA_V3_SINGLE_POOL=1 skips this: pages were LCM-unified at
+        # grouping time and the general uniform-page case below applies.)
         main_groups, gemma_groups = _split_gemma_v3_groups(kv_cache_groups)
         if not (main_groups and gemma_groups):
             raise ValueError(
@@ -1920,6 +2033,21 @@ def get_kv_cache_groups(
         assert not hidden_specs, (
             "GEMMA_CACHE_V3 is incompatible with hidden-state cache layers"
         )
+        if _gemma_v3_single_pool():
+            # Single-arena mode: LCM block-size scaling makes pages uniform
+            # (26B: sliding 16->80 / records 64->256 -> 640KB) and the model
+            # flows through the STANDARD uniform-page path below — one
+            # fungible pool, num_gemma_global_blocks stays None, all
+            # two-pool machinery is dormant.
+            filtered_spec = unify_kv_cache_spec_page_size_lcm(filtered_spec)
+            logger.info(
+                "GEMMA_V3_SINGLE_POOL: unified page bytes=%d; block sizes: %s",
+                get_uniform_page_size(filtered_spec.values()),
+                sorted({
+                    (type(s).__name__, s.block_size)
+                    for s in filtered_spec.values()
+                }),
+            )
         groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
     else:
         filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)

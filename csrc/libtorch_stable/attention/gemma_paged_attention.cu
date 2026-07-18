@@ -292,6 +292,27 @@ static constexpr int DS_MINCTA_256 = 3;
     }                                                                          \
   } while (0)
 
+// hd512 KEQV=false fused (E-series globals): K and V planes both staged, so
+// the smem budget forces NW4/BN32/NSTG2 (~148KB) regardless of the SM80 NW8
+// default. GEMMA_DECODE_FUSED_NW=8 maps to the single-stage ring (NSTG1,
+// ~153KB) for A/B only.
+#define LAUNCH_GEMMA_FUSED_SB_KEQVF512(GROUP)                                   \
+  do {                                                                          \
+    if (fused_nw_env == 8) {                                                    \
+      if (num_splits > 1) {                                                     \
+        LAUNCH_GEMMA_FUSED(512, GROUP, false, false, true, 8, 1);               \
+      } else {                                                                  \
+        LAUNCH_GEMMA_FUSED(512, GROUP, false, false, false, 8, 1);              \
+      }                                                                         \
+    } else {                                                                    \
+      if (num_splits > 1) {                                                     \
+        LAUNCH_GEMMA_FUSED(512, GROUP, false, false, true, 4, 2);               \
+      } else {                                                                  \
+        LAUNCH_GEMMA_FUSED(512, GROUP, false, false, false, 4, 2);              \
+      }                                                                         \
+    }                                                                           \
+  } while (0)
+
 #define LAUNCH_GEMMA_STREAM_BIGTILE(HEAD, BN, MINCTA, GROUP, KEQV, USW, NST)   \
   do {                                                                         \
     STD_TORCH_CHECK(gqa_group == (GROUP), "bigtile decode expects group ",     \
@@ -558,6 +579,18 @@ void gemma_paged_attention_launcher(
     const char* e = getenv("GEMMA_DECODE_NSTG");
     return e != nullptr && e[0] == '1';
   }();
+  // Gate-D fused decode for the E-series (K_EQ_V=false) lanes: E2B globals
+  // hd512 g8 / locals hd256 g8 (nkv=1), E4B globals hd512 g4 / locals hd256
+  // g4 (nkv=2). hd512 KEQV=false stages BOTH K and V planes, so it pins
+  // NW4/BN32/NSTG2 (~148KB, 1 CTA/SM); NW8/NSTG2 would need 285KB > SM80's
+  // 163KB cap. DEFAULT ON — A/B vs the wmma stream fallback (2026-07-18,
+  // decode 128/2048, parity 38/38): E2B c8/c32/c128 +1.2/+5.2/+10.2%,
+  // E4B +2.1/+14.8/+5.6% -> all 6 cells at or above Triton (was -1..-11%).
+  // GEMMA_DECODE_FUSED_KEQVF=0 reverts to the stream lanes.
+  static const bool fused_keqvf = []() {
+    const char* e = getenv("GEMMA_DECODE_FUSED_KEQVF");
+    return e == nullptr || e[0] != '0';
+  }();
   // Packed multi-query is only implemented by the fused kernel and only
   // where GQA_GROUP*mq fits the M=16 pad:
   //   hd256 sliding GROUP=2  -> mq <= 8 (12B/26B/31B locals)
@@ -572,11 +605,25 @@ void gemma_paged_attention_launcher(
                   "packed multi-query decode requires the fused path with "
                   "GQA_GROUP*mq <= 16");
 
+  // SM80: always 8-warp/BN64. A/B (2026-07-17, decode 128/2048 + mixed
+  // 4096/1024): NW8 >= NW4 in every measured cell where the wide-grid
+  // switch engaged — 26B c32 +0.7%/c128 +0.9%, 31B c32 +3.9%/c128 +1.0%,
+  // 26B mixed c32 +3.9% tok/s (TPOT 29.5->27.7). The >=256 wide-grid NW4
+  // switch stays for SM90+ where it was tuned.
+  static const int cc_major = []() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int v = 8;
+    cudaDeviceGetAttribute(&v, cudaDevAttrComputeCapabilityMajor, dev);
+    return v;
+  }();
   const int fused_nw =
       (fused_nw_env != 0)
           ? fused_nw_env
-          : ((num_seqs * (num_kv_heads > 0 ? num_kv_heads : 1) >= 256) ? 4
-                                                                       : 8);
+          : ((cc_major >= 9 &&
+              num_seqs * (num_kv_heads > 0 ? num_kv_heads : 1) >= 256)
+                 ? 4
+                 : 8);
   static const int decode_bn = []() {
     const char* e = getenv("GEMMA_DECODE_BN");
     const int v = (e != nullptr) ? atoi(e) : 64;
@@ -807,10 +854,36 @@ void gemma_paged_attention_launcher(
           did_stream = true;                                       \
         }                                                          \
       }                                                            \
+      if constexpr (!(KEQV) && !(USW) && (HS) == 512) {            \
+        /* E-series globals (KEQV=false, no window): E2B g8, E4B   \
+           g4. Gated on fused_keqvf until the A/B lands. */        \
+        if (!did_stream && use_stream && decode_fused &&           \
+            fused_keqvf && gqa_group == 8) {                       \
+          LAUNCH_GEMMA_FUSED_SB_KEQVF512(8);                       \
+          did_stream = true;                                       \
+        }                                                          \
+        if (!did_stream && use_stream && decode_fused &&           \
+            fused_keqvf && gqa_group == 4) {                       \
+          LAUNCH_GEMMA_FUSED_SB_KEQVF512(4);                       \
+          did_stream = true;                                       \
+        }                                                          \
+      }                                                            \
       if constexpr (!(KEQV) && (USW) && (HS) == 256) {             \
         if (!did_stream && use_stream && decode_fused &&           \
             gqa_group == 2) {                                      \
           LAUNCH_GEMMA_FUSED_SB(256, 2, false, true);              \
+          did_stream = true;                                       \
+        }                                                          \
+        /* E-series locals: E2B g8 / E4B g4 (window 512). Same     \
+           keqvf gate; NW8/NSTG2 fits at hd256 (~143KB). */        \
+        if (!did_stream && use_stream && decode_fused &&           \
+            fused_keqvf && gqa_group == 8) {                       \
+          LAUNCH_GEMMA_FUSED_SB(256, 8, false, true);              \
+          did_stream = true;                                       \
+        }                                                          \
+        if (!did_stream && use_stream && decode_fused &&           \
+            fused_keqvf && gqa_group == 4) {                       \
+          LAUNCH_GEMMA_FUSED_SB(256, 4, false, true);              \
           did_stream = true;                                       \
         }                                                          \
         if (!did_stream && use_stream && decode_bn != 0 &&         \
