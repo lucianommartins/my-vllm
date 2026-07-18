@@ -716,13 +716,22 @@ class GemmaAttentionImpl(AttentionImpl):
         #   hd512 group 16 (12B globals): never packs -> virtual-seq path.
         group = (self.num_heads // self.num_kv_heads
                  if self.num_kv_heads else 0)
+        # Mirror the KERNEL's packed clauses exactly (gemma_paged_attention
+        # packed-mq TORCH_CHECK): hd256-sliding packs only at GROUP==2 and
+        # hd512-k_eq_v only at GROUP==8. The E-series geometries (E2B g8 /
+        # E4B g4, k_eq_v=false) satisfy group*mq<=16 for small mq but have
+        # no packed kernel route -- they must take the fallbacks below
+        # (2026-07-18 sweep crash: E2B drafter g8*mq2 passed here, kernel
+        # raised "GQA_GROUP*mq <= 16" and killed the engine).
         packed_ok = (
             mqu >= 2
             and group > 0
             and group * mqu <= 16
             and (
-                (self.sliding_window > 0 and self.actual_head_size == 256)
-                or (self.k_eq_v and self.actual_head_size == 512)
+                (self.sliding_window > 0 and self.actual_head_size == 256
+                 and group == 2)
+                or (self.k_eq_v and self.actual_head_size == 512
+                    and group == 8)
             )
         )
         if not packed_ok:
