@@ -43,6 +43,15 @@ logger = init_logger(__name__)
 # shapes). Above it, the prefill paths take over.
 _MQ_DECODE_MAX = int(os.environ.get("GEMMA_MQ_DECODE_MAX", "8"))
 
+# S73: packed multi-query verify on the E-series fused lanes. GROUP==4
+# ONLY (E4B-class: g4 x mq<=4 packs drafter AND verify; parity IDENTICAL;
+# decode c32 +50.8% over the fallback = x1.116 over Triton-MTP, c64 +29.9%).
+# g8 (E2B) measured NET-NEGATIVE (-5%: only mq2 drafter steps fit M=16,
+# verify mq3 = 24 rows cannot; packed mq2 at window-512 locals loses to
+# virtual-seq) -> stays on the fallbacks. Default ON; =0 reverts.
+# Must stay in lockstep with the kernel's mq_pack_eseries gate.
+_MQ_PACK_ESERIES = os.environ.get("GEMMA_MQ_PACK_ESERIES", "1") != "0"
+
 # Contract-v3 gemma-4 cache (640-ch global records + ps64 pools). Dev gate:
 # readers not yet migrated; default OFF.
 # Default ON: the 640-record two-pool cache is the production mode for
@@ -732,6 +741,16 @@ class GemmaAttentionImpl(AttentionImpl):
                  and group == 2)
                 or (self.k_eq_v and self.actual_head_size == 512
                     and group == 8)
+                # E-series packed verify (S73, GEMMA_MQ_PACK_ESERIES=1):
+                # g4 (E4B) / g8 (E2B) rows fit the M=16 pad on both the
+                # hd256-SW and hd512-KEQVF fused lanes; must match the
+                # kernel's mq_pack_eseries clause exactly.
+                or (_MQ_PACK_ESERIES and group == 4
+                    and not self.k_eq_v
+                    and ((self.sliding_window > 0
+                          and self.actual_head_size == 256)
+                         or (self.sliding_window <= 0
+                             and self.actual_head_size == 512)))
             )
         )
         if not packed_ok:

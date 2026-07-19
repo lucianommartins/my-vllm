@@ -595,13 +595,29 @@ void gemma_paged_attention_launcher(
   // where GQA_GROUP*mq fits the M=16 pad:
   //   hd256 sliding GROUP=2  -> mq <= 8 (12B/26B/31B locals)
   //   hd512 k_eq_v  GROUP=8  -> mq <= 2 (26B/31B globals, gamma=1 verify)
+  //   E-series lanes (fused_keqvf + GEMMA_MQ_PACK_ESERIES=1, S73 experiment):
+  //   hd256-SW / hd512-KEQVF at GROUP 4 (E4B, mq <= 4) and GROUP 8 (E2B,
+  //   mq <= 2) — the kernel's row map (r -> position r/GROUP, head r%GROUP)
+  //   is GROUP-generic; only these gates ever blocked it.
   // GROUP=16 (12B globals) can never pack; Python routes it virtual-seq.
+  static const bool mq_pack_eseries = []() {
+    const char* e = getenv("GEMMA_MQ_PACK_ESERIES");
+    return e == nullptr || e[0] != '0';  // default ON; Python routes g4 only
+  }();
+  const bool eseries_group =
+      (num_kv_heads > 0 &&
+       (num_q_heads == 4 * num_kv_heads || num_q_heads == 8 * num_kv_heads));
   STD_TORCH_CHECK(mq == 1 ||
                       (decode_fused && head_size == 256 && sliding_window > 0 &&
                        num_q_heads == 2 * num_kv_heads && mq <= 8) ||
                       (decode_fused && head_size == 512 && k_eq_v &&
                        sliding_window <= 0 &&
-                       num_q_heads == 8 * num_kv_heads && mq <= 2),
+                       num_q_heads == 8 * num_kv_heads && mq <= 2) ||
+                      (decode_fused && fused_keqvf && mq_pack_eseries &&
+                       eseries_group && !k_eq_v &&
+                       num_q_heads * mq <= 16 * num_kv_heads &&
+                       ((head_size == 256 && sliding_window > 0) ||
+                        (head_size == 512 && sliding_window <= 0))),
                   "packed multi-query decode requires the fused path with "
                   "GQA_GROUP*mq <= 16");
 
