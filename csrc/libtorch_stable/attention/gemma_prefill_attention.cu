@@ -46,7 +46,8 @@ static constexpr int PF_MINCTA_256 = 3;
         max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
         kv_stride_slot, kv_stride_head, sliding_window,                        \
         mm_prefix_ranges_ptr, max_mm_ranges,                                   \
-        non_causal, lse_out_ptr, num_tokens, record640, ldgsts_overlap);       \
+        non_causal, lse_out_ptr, num_tokens, record640, ldgsts_overlap,        \
+        rescale_skip);                                                         \
   } while (0)
 
 #define LAUNCH_PREFILL_V2_GROUP(HEAD, NW, MINCTA, MMPF, KEQV, USW)             \
@@ -205,6 +206,12 @@ void gemma_prefill_launcher(
   // re-enables the early-issue variant for experiments.
   static const bool ldgsts_overlap = []() {
     const char* e = getenv("GEMMA_PREFILL_LDGSTS_OVERLAP");
+    return e != nullptr && e[0] == '1';
+  }();
+  // 3b identity elision (spec: docs/gemma_prefill_3b_spec.md). Default OFF
+  // until the §4 protocol gates pass (bitwise parity -> skip-rate -> A/B).
+  static const bool rescale_skip = []() {
+    const char* e = getenv("GEMMA_PREFILL_RESCALE_SKIP");
     return e != nullptr && e[0] == '1';
   }();
 

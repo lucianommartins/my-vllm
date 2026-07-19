@@ -68,7 +68,16 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     // Issue V-plane cp.async before the softmax phase (overlap) vs staging it
     // post-softmax behind its own barrier (legacy order). Bisect knob:
     // GEMMA_PREFILL_LDGSTS_OVERLAP.
-    const bool v_overlap = true) {
+    const bool v_overlap = true,
+    // 3b identity elision (GEMMA_PREFILL_RESCALE_SKIP): skip the O-rescale
+    // FMULs for an m-tile when every published alpha is exactly 1.0f
+    // (warp-voted). x * 1.0f is the IEEE-754 RN identity for all finite
+    // values incl. denormals PROVIDED this TU builds without
+    // --use_fast_math/-ftz=true — bit-exact by construction, no deferral
+    // bookkeeping. alpha == 0.0f is deliberately NOT skippable: the publish
+    // site folds virgin rows (O provably +0) and exp2f underflow (O holds
+    // stale nonzero values the baseline flushes) into the same 0.0f.
+    const bool rescale_skip = false) {
   constexpr int MT = BLOCK_M / 16;            // M tiles
   constexpr int NT = BLOCK_N / 16;            // QK N tiles
   constexpr int DT = HEAD_SIZE / 16;          // total head tiles
@@ -379,12 +388,21 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, MIN_CTA)
     for (int m = 0; m < MT; m++) {
       const float a_lo = sA[m * 16 + gid];
       const float a_hi = sA[m * 16 + gid + 8];
+      // Vote on the PUBLISHED alphas (captures exp2f args that round to
+      // exactly 1.0f). rescale_skip is a warp-uniform kernel argument and
+      // the m-loop has no divergent control flow above this point, so the
+      // short-circuited __any_sync is convergent (all 32 lanes arrive).
+      const bool do_rescale =
+          !rescale_skip ||
+          __any_sync(0xffffffffu, (a_lo != 1.0f) || (a_hi != 1.0f));
 #pragma unroll
       for (int j = 0; j < HNT_W; j++) {
-        Ofrag[m][j].x[0] *= a_lo; Ofrag[m][j].x[1] *= a_lo;
-        Ofrag[m][j].x[2] *= a_hi; Ofrag[m][j].x[3] *= a_hi;
-        Ofrag[m][j].x[4] *= a_lo; Ofrag[m][j].x[5] *= a_lo;
-        Ofrag[m][j].x[6] *= a_hi; Ofrag[m][j].x[7] *= a_hi;
+        if (do_rescale) {
+          Ofrag[m][j].x[0] *= a_lo; Ofrag[m][j].x[1] *= a_lo;
+          Ofrag[m][j].x[2] *= a_hi; Ofrag[m][j].x[3] *= a_hi;
+          Ofrag[m][j].x[4] *= a_lo; Ofrag[m][j].x[5] *= a_lo;
+          Ofrag[m][j].x[6] *= a_hi; Ofrag[m][j].x[7] *= a_hi;
+        }
         const int ht = warp * HNT_W + j;
 #pragma unroll
         for (int kt = 0; kt < NT; kt++) {
