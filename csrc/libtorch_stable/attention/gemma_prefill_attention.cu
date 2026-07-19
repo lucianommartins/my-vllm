@@ -4,6 +4,7 @@
 #include "../torch_utils.h"
 #include "gemma_prefill_attention.cuh"
 #include "gemma_prefill_fused.cuh"
+#include "gemma_prefill_ws.cuh"
 #include "../../cuda_compat.h"
 
 #include <cuda_runtime.h>
@@ -22,6 +23,11 @@ static constexpr int PF_NW_V2_256 = 8;    // warps/CTA for hd=256 (sweep knob)
 // Pushing further (hd512=3 / hd256=4) is smem-capped and only cuts ILP -> worse.
 static constexpr int PF_MINCTA_512 = 2;
 static constexpr int PF_MINCTA_256 = 3;
+// Warp-specialized hd512 prefill (GEMMA_PREFILL_FUSED=3, 3a/S1): 16 consumer
+// warps (v2-identical compute) + 4 producer warps (3-stage BN32 K-ring), 1 CTA/SM.
+static constexpr int PF_WS_NC = 16;    // consumer warps
+static constexpr int PF_WS_NP = 4;     // producer warps
+static constexpr int PF_WS_NSTG = 3;   // K-ring stages
 
 // v2: register-resident O, head-split warps. NW = warps/CTA (per head size).
 // MINCTA = __launch_bounds__ min CTA/SM target (drives register allocation).
@@ -154,6 +160,54 @@ static constexpr int PF_MINCTA_256 = 3;
     case 16: LAUNCH_PREFILL_FUSED2(16); break;                                 \
     default:                                                                   \
       STD_TORCH_CHECK(false, "Unsupported fused2 GQA group: ", gqa_group);     \
+  }
+
+// WS (warp-specialized, GEMMA_PREFILL_FUSED=3): hd512 k_eq_v full-attn only.
+// NW20/640thr, 1 CTA/SM; 3-stage BN32 K-ring. smem ~141KB. Kernel is passed by
+// function pointer (loses C++ default args) so every arg is explicit.
+#define LAUNCH_PREFILL_WS(GROUP)                                               \
+  do {                                                                         \
+    auto kern = vllm::gemma_prefill::gemma_prefill_ws_kernel<                  \
+        T, CACHE_T, 512, PF_BM, PF_BN, PF_WS_NC, PF_WS_NP, PF_WS_NSTG, GROUP,  \
+        /*K_EQ_V=*/true, /*USE_SLIDING_WINDOW=*/false,                         \
+        /*USE_MM_PREFIX=*/false>;                                              \
+    constexpr int WLDH = 512 + 8;                                              \
+    constexpr int WLDN = PF_BN + 8;                                            \
+    size_t smem =                                                             \
+        (size_t)(PF_BM * WLDH + PF_WS_NSTG * PF_BN * WLDH + PF_BM * WLDN)      \
+            * sizeof(CACHE_T)                                                  \
+        + (size_t)(PF_BM * WLDN + 3 * PF_BM) * sizeof(float)                   \
+        + (size_t)(32 * 2) * sizeof(int);  /* sMM: MM_RANGE_CAP*2 */           \
+    {                                                                          \
+      static bool _a = false;                                                  \
+      if (!_a) {                                                               \
+        if (smem > 48 * 1024)                                                  \
+          cudaFuncSetAttribute(                                                \
+              kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);        \
+        cudaFuncSetAttribute(                                                  \
+            kern, cudaFuncAttributePreferredSharedMemoryCarveout, 100);        \
+        _a = true;                                                             \
+      }                                                                        \
+    }                                                                          \
+    dim3 grid(PF_CDIV(max_q_len, PF_BM), num_q_heads, num_seqs);              \
+    kern<<<grid, (PF_WS_NC + PF_WS_NP) * 32, smem, stream>>>(                 \
+        out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,            \
+        block_tables_ptr, seq_lens_ptr, cu_seqlens_q_ptr,                      \
+        max_num_blocks_per_seq, page_size, q_stride, kv_stride_block,          \
+        kv_stride_slot, kv_stride_head, sliding_window,                        \
+        mm_prefix_ranges_ptr, max_mm_ranges,                                   \
+        non_causal, lse_out_ptr, num_tokens, record640);                       \
+  } while (0)
+
+#define LAUNCH_PREFILL_WS_GROUP()                                             \
+  switch (gqa_group) {                                                         \
+    case 1: LAUNCH_PREFILL_WS(1); break;                                       \
+    case 2: LAUNCH_PREFILL_WS(2); break;                                       \
+    case 4: LAUNCH_PREFILL_WS(4); break;                                       \
+    case 8: LAUNCH_PREFILL_WS(8); break;                                       \
+    case 16: LAUNCH_PREFILL_WS(16); break;                                     \
+    default:                                                                   \
+      STD_TORCH_CHECK(false, "Unsupported WS prefill GQA group: ", gqa_group); \
   }
 
 // SM90 prefill launcher — defined in gemma_prefill_attention_sm90.cu.
@@ -296,12 +350,19 @@ void gemma_prefill_launcher(
   static const int prefill_fused_mode = []() {
     const char* e = getenv("GEMMA_PREFILL_FUSED");
     if (e == nullptr) return 0;
-    return e[0] == '2' ? 2 : (e[0] == '1' ? 1 : 0);
+    return e[0] == '3' ? 3 : e[0] == '2' ? 2 : (e[0] == '1' ? 1 : 0);
   }();
   const bool prefill_fused = prefill_fused_mode == 1;
   if (prefill_fused_mode == 2 && head_size == 512 && k_eq_v && !use_sw &&
       max_mm_ranges == 0) {
     LAUNCH_PREFILL_FUSED2_GROUP();
+    return;
+  }
+  // 3a/S1 warp-specialized prefill: hd512 k_eq_v full-attn only (record640 or
+  // non-record k_eq_v). All other shapes fall through to v2.
+  if (prefill_fused_mode == 3 && head_size == 512 && k_eq_v && !use_sw &&
+      max_mm_ranges == 0) {
+    LAUNCH_PREFILL_WS_GROUP();
     return;
   }
   static const int fused_nw256 = []() {
