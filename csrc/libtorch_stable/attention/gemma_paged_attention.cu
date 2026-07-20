@@ -82,12 +82,12 @@ static constexpr int DS_MINCTA_256 = 3;
       vllm::gemma::gemma_split_reduce_v2_kernel<T, HEAD, TPART>                \
           <<<cg3, 64, 0, stream>>>(out_ptr, TMPPTR, exp_sums_ptr,             \
                                    max_logits_ptr, num_splits, max_parts,     \
-                                   LSE);                                       \
+                                   LSE, combine_prefix, mq);                   \
     } else {                                                                   \
       vllm::gemma::gemma_split_reduce_kernel<T, HEAD, TPART>                   \
           <<<CG, WARP_SIZE, 0, stream>>>(out_ptr, TMPPTR, exp_sums_ptr,       \
                                          max_logits_ptr, num_splits,          \
-                                         max_parts, LSE);                     \
+                                         max_parts, LSE, combine_prefix, mq); \
     }                                                                          \
   } while (0)
 // Legacy (bf16-partial) producers: stream/bigtile/simt revert paths.
@@ -259,7 +259,7 @@ static constexpr int DS_MINCTA_256 = 3;
         kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,       \
         num_splits, max_parts, (SPLITB) ? nullptr : lse_out_ptr, mq,          \
         recon_invfreq_ptr, recon_inv_w_f, record640,                           \
-        record640 && g_strip_derive);                                          \
+        record640 && g_strip_derive, nullptr, 0);                              \
     if (SPLITB) {                                                              \
       const dim3 fcg(num_kv_heads * (GROUP), num_seqs * mq);                   \
       LAUNCH_GEMMA_COMBINE_T(HEAD, fcg, lse_out_ptr, float,                    \
@@ -311,6 +311,55 @@ static constexpr int DS_MINCTA_256 = 3;
         LAUNCH_GEMMA_FUSED(512, GROUP, false, false, false, 4, 2);              \
       }                                                                         \
     }                                                                           \
+  } while (0)
+
+// A1 Stream-K / LeanAttention persistent-CTA decode. Fixed grid of
+// num_sms*occ CTAs grid-strides (kv_head, seq, chunk) work-units sized by the
+// prep kernel from seq_lens (C tiles/chunk, chunks_per_seq<=max_parts). SPLIT
+// path always: writes fp32 partials, then the chunk-count-aware combine (given
+// g_streamk_prefix) reduces only the real chunks per seq. Grid size is
+// batch/ctx-independent -> CUDA-graph stable; num_splits/E4B-floor/force are
+// bypassed. Matches the covered lane's NW/NSTG so smem/occupancy are unchanged.
+#define LAUNCH_GEMMA_FUSED_STREAMK(HEAD, GROUP, KEQV, USW, NW, NSTGV)          \
+  do {                                                                         \
+    constexpr int FLDH = (HEAD) + 8;                                          \
+    constexpr int FBN = 8 * (NW);                                             \
+    constexpr int FLDN = FBN + 8;                                             \
+    constexpr int FSTAGE = FBN * FLDH * ((KEQV) ? 1 : 2);                     \
+    constexpr int FNSTG = (NSTGV);                                            \
+    size_t fsmem = (size_t)(16 * FLDH + FNSTG * FSTAGE + 16 * FLDN)           \
+                       * sizeof(CACHE_T)                                      \
+                   + (size_t)(2 * (NW) * 16 + ((KEQV) ? (HEAD) / 2 : 0))      \
+                       * sizeof(float);                                       \
+    auto skk = vllm::gemma::gemma_decode_fused_kernel<                        \
+        T, CACHE_T, HEAD, GROUP, KEQV, USW, true, NW, NSTGV, true>;           \
+    static int sk_P = 0;                                                      \
+    if (sk_P == 0) {                                                          \
+      if (fsmem > 48 * 1024)                                                  \
+        cudaFuncSetAttribute(                                                 \
+            skk, cudaFuncAttributeMaxDynamicSharedMemorySize, fsmem);         \
+      cudaFuncSetAttribute(                                                   \
+          skk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);         \
+      int occ = 1;                                                            \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, skk, (NW) * 32,    \
+                                                    fsmem);                   \
+      sk_P = num_sms * (occ > 0 ? occ : 1);                                   \
+    }                                                                         \
+    vllm::gemma::gemma_streamk_prep_kernel<<<1, 256, 0, stream>>>(            \
+        g_streamk_prefix, seq_lens_ptr, num_seqs, num_kv_heads, 8 * (NW),     \
+        max_parts, (USW) ? sliding_window : 0,                               \
+        (int)(streamk_cta_per_sm * num_sms), streamk_tgt_tokens);            \
+    combine_prefix = g_streamk_prefix;                                        \
+    skk<<<dim3(sk_P), (NW) * 32, fsmem, stream>>>(                            \
+        tmp_out_ptr, exp_sums_ptr, max_logits_ptr, query_ptr, key_cache_ptr,  \
+        value_cache_ptr, num_kv_heads, scale, block_tables_ptr,              \
+        seq_lens_ptr, max_num_blocks_per_seq, BLOCK_SIZE, q_stride,          \
+        kv_stride_block, kv_stride_slot, kv_stride_head, sliding_window,     \
+        max_parts, max_parts, nullptr, mq, recon_invfreq_ptr, recon_inv_w_f, \
+        record640, record640 && g_strip_derive, g_streamk_prefix, num_seqs); \
+    const dim3 fcg(num_kv_heads * (GROUP), num_seqs * mq);                   \
+    LAUNCH_GEMMA_COMBINE_T(HEAD, fcg, lse_out_ptr, float,                    \
+                           reinterpret_cast<float*>(tmp_out_ptr));           \
   } while (0)
 
 #define LAUNCH_GEMMA_STREAM_BIGTILE(HEAD, BN, MINCTA, GROUP, KEQV, USW, NST)   \
@@ -591,6 +640,41 @@ void gemma_paged_attention_launcher(
     const char* e = getenv("GEMMA_DECODE_FUSED_KEQVF");
     return e == nullptr || e[0] != '0';
   }();
+  // A1 Stream-K / LeanAttention persistent-CTA decode (opt-in, default OFF).
+  // Replaces the per-(seq,head) split heuristic with a fixed persistent grid
+  // that grid-strides (kv_head, seq, chunk) work-units — fills SMs at low/mid
+  // batch (kills the underfill band) with a work-adaptive combine cost.
+  static const bool streamk_env = []() {
+    const char* e = getenv("GEMMA_DECODE_STREAMK");
+    return e != nullptr && e[0] == '1';
+  }();
+  // Batch-adaptive chunk sizing = classic wave-law (GEMMA_SPLIT_CTA_PER_SM) +
+  // collapse-gated ctx floor (GEMMA_TARGET_TOKENS_PER_SPLIT), re-read here so
+  // the prep kernel sizes chunks-per-seq like the classic num_splits.
+  static const float streamk_cta_per_sm = []() {
+    const char* e = getenv("GEMMA_SPLIT_CTA_PER_SM");
+    return e != nullptr ? (float)atof(e) : 1.5f;
+  }();
+  static const int streamk_tgt_tokens = []() {
+    const char* e = getenv("GEMMA_TARGET_TOKENS_PER_SPLIT");
+    return e != nullptr ? atoi(e) : 4096;
+  }();
+  static const int streamk_max_seqs = []() {
+    const char* e = getenv("GEMMA_STREAMK_MAX_SEQS");
+    const int v = (e != nullptr) ? atoi(e) : 4096;
+    return v > 0 ? v : 4096;
+  }();
+  // Persistent per-(seq,head) work prefix (prep-kernel output). Allocated once
+  // during eager warmup (dummy_run precedes CUDA-graph capture, where cudaMalloc
+  // is illegal); the baked pointer stays valid across graph replay.
+  static int* g_streamk_prefix = nullptr;
+  if (streamk_env && g_streamk_prefix == nullptr) {
+    cudaMalloc(&g_streamk_prefix,
+               (size_t)(streamk_max_seqs + 2) * sizeof(int));
+  }
+  const int* combine_prefix = nullptr;  // set on the STREAMK path only
+  const bool sk_on = streamk_env && g_streamk_prefix != nullptr &&
+                     num_seqs <= streamk_max_seqs;
   // Packed multi-query is only implemented by the fused kernel and only
   // where GQA_GROUP*mq fits the M=16 pad:
   //   hd256 sliding GROUP=2  -> mq <= 8 (12B/26B/31B locals)
@@ -674,6 +758,33 @@ void gemma_paged_attention_launcher(
                      ? (desired_ctas + total_ctas - 1) / total_ctas
                      : 1;
     num_splits = target < 1 ? 1 : target;
+    // ctx-tokens split FLOOR (E-series hd512 k_eq_v=false globals only). At high
+    // batch the wave-fill target above collapses to 1, but long-ctx decode on
+    // this lane is HBM-bandwidth-bound and gains from extra split parallelism
+    // even when the batch already fills the machine. Floor num_splits so each
+    // split covers at most ~GEMMA_TARGET_TOKENS_PER_SPLIT KV tokens; applied via
+    // max() so it only RAISES the count (low batch, where wave-fill already
+    // dominates, is untouched). Measured (deep-analysis §18, E4B c128): longdec
+    // +10.8%, no short-ctx penalty (+1.45% @2K), monotonic across ctx. Gated to
+    // hd512 !k_eq_v so the tuned bigtile path (record640 hd512 k_eq_v; overwritten
+    // at the block below) and every hd256 lane are unaffected. =0 disables (the
+    // A/B baseline / old behavior).
+    static const int target_tokens_per_split = []() {
+      const char* e = getenv("GEMMA_TARGET_TOKENS_PER_SPLIT");
+      return e != nullptr ? atoi(e) : 4096;  // 4096 -> 4 splits at 16K ctx
+    }();
+    // COLLAPSE-gated: only lift when the wave-fill count has collapsed to 1
+    // (high batch, where the machine is nominally full yet long-ctx decode is
+    // still HBM-bandwidth-starved). A healthy mid-batch wave-fill (>=2) is left
+    // alone — A/B round 1 (deep-analysis §18) showed an UNCONDITIONAL max()
+    // over-splits E4B longdec c32 by -4.8% (its wave-fill 2-3 was already
+    // near-optimal), while E4B c128 (wave-fill=1) gains +11.6%.
+    if (actual_head_size == 512 && !k_eq_v && target_tokens_per_split > 0 &&
+        num_splits <= 1) {
+      const int ctx_floor =
+          (eff_seq + target_tokens_per_split - 1) / target_tokens_per_split;
+      if (ctx_floor > num_splits) num_splits = ctx_floor;
+    }
     // Pipeline guard: never split so finely that a split gets < min tiles.
     const int max_splits_by_tiles =
         (min_tiles_per_split > 0)
@@ -839,6 +950,16 @@ void gemma_paged_attention_launcher(
     bool did_stream = false;                                       \
     if constexpr (DS_DTYPE_OK) {                                   \
       if constexpr ((KEQV) && !(USW) && (HS) == 512) {             \
+        if (sk_on && !did_stream && use_stream && decode_fused &&  \
+            gqa_group == 16) {                                     \
+          LAUNCH_GEMMA_FUSED_STREAMK(512, 16, true, false, 8, 2);  \
+          did_stream = true;                                       \
+        }                                                          \
+        if (sk_on && !did_stream && use_stream && decode_fused &&  \
+            gqa_group == 8) {                                      \
+          LAUNCH_GEMMA_FUSED_STREAMK(512, 8, true, false, 8, 2);   \
+          did_stream = true;                                       \
+        }                                                          \
         if (!did_stream && use_stream && decode_fused &&           \
             gqa_group == 16) {                                     \
           LAUNCH_GEMMA_FUSED_SB(512, 16, true, false);             \
@@ -873,6 +994,16 @@ void gemma_paged_attention_launcher(
       if constexpr (!(KEQV) && !(USW) && (HS) == 512) {            \
         /* E-series globals (KEQV=false, no window): E2B g8, E4B   \
            g4. Gated on fused_keqvf until the A/B lands. */        \
+        if (sk_on && !did_stream && use_stream && decode_fused &&  \
+            fused_keqvf && gqa_group == 8) {                       \
+          LAUNCH_GEMMA_FUSED_STREAMK(512, 8, false, false, 4, 2);  \
+          did_stream = true;                                       \
+        }                                                          \
+        if (sk_on && !did_stream && use_stream && decode_fused &&  \
+            fused_keqvf && gqa_group == 4) {                       \
+          LAUNCH_GEMMA_FUSED_STREAMK(512, 4, false, false, 4, 2);  \
+          did_stream = true;                                       \
+        }                                                          \
         if (!did_stream && use_stream && decode_fused &&           \
             fused_keqvf && gqa_group == 8) {                       \
           LAUNCH_GEMMA_FUSED_SB_KEQVF512(8);                       \

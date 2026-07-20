@@ -1646,6 +1646,90 @@ gemma_decode_mma_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Stream-K (A1 / LeanAttention) prep: from seq_lens at LAUNCH/replay, size the
+// per-(seq,head) work-units for the persistent-CTA decode grid. Writes
+//   prefix[0..num_seqs]   = exclusive scan of chunks_per_seq(s)  (prefix[ns]=total)
+//   prefix[num_seqs+1]    = C  (tiles per chunk)
+// BATCH-ADAPTIVE C: target_chunks tracks the classic wave-law split count
+// (desired_ctas / total_ctas) + the collapse-gated ctx floor (fire only when
+// the batch already fills the machine, exactly the §18 E-series floor). This is
+// what keeps STREAMK from over-combining at mid batch (a fixed ctx-only C
+// produced ~32 chunks at c32 -> a 32-way combine that cost -12% on the fast
+// E2B; matching the wave-law gives ~6). C = ceil(max_n_tiles / target_chunks),
+// clamped so chunks_per_seq(s) <= max_parts. Single block; n_tiles recomputed
+// twice (cheap) to avoid a num_seqs-sized smem array. All on-device so a
+// captured CUDA graph re-sizes at replay.
+// ---------------------------------------------------------------------------
+__global__ void gemma_streamk_prep_kernel(
+    int* __restrict__ prefix,          // [num_seqs + 2]
+    const int* __restrict__ seq_lens,  // [num_seqs]
+    const int num_seqs, const int num_kv_heads, const int block_n,
+    const int max_parts, const int sliding_window, const int desired_ctas,
+    const int target_tokens_per_split) {
+  __shared__ int s_max[256];
+  int local_max = 0;
+  for (int s = threadIdx.x; s < num_seqs; s += blockDim.x) {
+    const int sl = seq_lens[s];
+    int kv_begin = 0;
+    if (sliding_window > 0) {
+      const int lo = sl - sliding_window;
+      kv_begin = (lo > 0) ? (lo / block_n) * block_n : 0;
+    }
+    int nt = (sl - kv_begin + block_n - 1) / block_n;
+    if (nt < 1) nt = 1;
+    if (nt > local_max) local_max = nt;
+  }
+  s_max[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (threadIdx.x < off)
+      s_max[threadIdx.x] = max(s_max[threadIdx.x], s_max[threadIdx.x + off]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const int max_nt = s_max[0];
+    // Wave-law target chunks-per-seq (mirrors the classic num_splits): fill the
+    // machine to ~desired_ctas, spread over total_ctas = num_seqs*num_kv_heads.
+    const int total_ctas = num_seqs * (num_kv_heads > 0 ? num_kv_heads : 1);
+    int target_chunks =
+        (total_ctas > 0) ? (desired_ctas + total_ctas - 1) / total_ctas : 1;
+    if (target_chunks < 1) target_chunks = 1;
+    // COLLAPSE-gated bandwidth floor (§18): only when wave-fill collapsed to 1
+    // (high batch, long-ctx HBM-starved) — raise so each chunk covers at most
+    // ~target_tokens_per_split KV tokens. Mid batch (target_chunks>=2, already
+    // near-optimal) is left alone, avoiding the round-1 over-split regression.
+    if (target_chunks <= 1 && target_tokens_per_split > 0) {
+      const int ctx_floor =
+          (max_nt * block_n + target_tokens_per_split - 1) /
+          target_tokens_per_split;
+      if (ctx_floor > target_chunks) target_chunks = ctx_floor;
+    }
+    if (target_chunks > max_parts) target_chunks = max_parts;
+    if (target_chunks > max_nt) target_chunks = max_nt;  // <=1 chunk/tile max
+    if (target_chunks < 1) target_chunks = 1;
+    int C = (max_nt + target_chunks - 1) / target_chunks;  // tiles per chunk
+    if (C < 1) C = 1;
+    int acc = 0;
+    for (int s = 0; s < num_seqs; s++) {
+      prefix[s] = acc;
+      const int sl = seq_lens[s];
+      int kv_begin = 0;
+      if (sliding_window > 0) {
+        const int lo = sl - sliding_window;
+        kv_begin = (lo > 0) ? (lo / block_n) * block_n : 0;
+      }
+      int nt = (sl - kv_begin + block_n - 1) / block_n;
+      if (nt < 1) nt = 1;
+      int ch = (nt + C - 1) / C;
+      if (ch < 1) ch = 1;
+      acc += ch;
+    }
+    prefix[num_seqs] = acc;
+    prefix[num_seqs + 1] = C;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Gate D: fused mma.sync decode (register softmax). Differences vs the wmma
 // stream kernel: S never touches smem (each warp owns an 8-column slice of
 // S[16, BLOCK_N] in mma.sync c-frags with a DOCUMENTED thread layout, so the
@@ -1658,7 +1742,7 @@ gemma_decode_mma_kernel(
 // ---------------------------------------------------------------------------
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int GQA_GROUP,
           bool K_EQ_V, bool USE_SLIDING_WINDOW, bool SPLIT, int NWARP_T = 8,
-          int NSTG_T = 2>
+          int NSTG_T = 2, bool STREAMK = false>
 __global__ void __launch_bounds__(NWARP_T * 32, NSTG_T == 1 ? 2 : 1)
 gemma_decode_fused_kernel(
     scalar_t* __restrict__ out_or_tmp,
@@ -1679,7 +1763,12 @@ gemma_decode_fused_kernel(
     const float* __restrict__ recon_invfreq = nullptr,
     const float recon_inv_w = 1.f,
     const bool record640 = false,
-    const bool strip_derive = false) {
+    const bool strip_derive = false,
+    // A1 Stream-K: prefix[0..num_seqs]=excl-scan of chunks_per_seq,
+    // prefix[num_seqs]=total_chunks, prefix[num_seqs+1]=C (tiles/chunk).
+    // nullptr / STREAMK=false -> classic 3-D (kv_head, seq, split) grid.
+    const int* __restrict__ streamk_prefix = nullptr,
+    const int streamk_num_seqs = 0) {
   // mq: query positions PACKED into the M dim (MTP/spec-verify: one KV read
   // serves all positions). Row r = (position r/GROUP, gqa head r%GROUP);
   // requires GQA_GROUP*mq <= 16. mq==1 is the classic decode layout.
@@ -1704,54 +1793,96 @@ gemma_decode_fused_kernel(
   constexpr int NSTG = NSTG_T;
   static_assert(GQA_GROUP <= 16 && HEAD_SIZE % (16 * NWARP) == 0);
 
-  const int kv_head = blockIdx.x;
-  const int seq_idx = blockIdx.y;
-  const int split_idx = SPLIT ? blockIdx.z : 0;
-  const int nsplits = SPLIT ? num_splits : 1;
-  const int num_q_heads = gridDim.x * GQA_GROUP;
   const int tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
   const int group = lane >> 2, tg = lane & 3;   // c-frag: rows {group, group+8}
-  const int seq_len = seq_lens[seq_idx];
   const int nthreads = NWARP * 32;
-
-#define DFUSED_PART(tok, qh) \
-  (((int64_t)(tok) * num_q_heads + (qh)) * max_parts + split_idx)
-
-  int kv_begin = 0;
-  if (USE_SLIDING_WINDOW && sliding_window > 0) {
-    const int lo = seq_len - sliding_window;
-    kv_begin = (lo > 0) ? (lo / BLOCK_N) * BLOCK_N : 0;
-  }
-  const int n_tiles = GEMMA_CDIV(seq_len - kv_begin, BLOCK_N);
-  const int tiles_per_split = GEMMA_CDIV(n_tiles, nsplits);
-  const int tile_lo = split_idx * tiles_per_split;
-  int tile_hi = tile_lo + tiles_per_split;
-  if (tile_hi > n_tiles) tile_hi = n_tiles;
+  // gridDim.x == num_kv_heads on the classic 3-D grid; the STREAMK 1-D grid
+  // has no such mapping, so derive num_q_heads from the param instead.
+  const int num_q_heads = num_kv_heads * GQA_GROUP;
   const int hvps = HEAD_SIZE / VEC;
 
-  if (SPLIT && tile_lo >= tile_hi) {
-    for (int g = warp; g < GQA_GROUP * mq; g += NWARP)
-      if (lane == 0) {
-        const int tok = seq_idx * mq + g / GQA_GROUP;
-        const int qh = kv_head * GQA_GROUP + g % GQA_GROUP;
-        max_logits[DFUSED_PART(tok, qh)] = -FLT_MAX;
-        exp_sums[DFUSED_PART(tok, qh)] = 0.f;
+#define DFUSED_PART(tok, qh) \
+  (((int64_t)(tok) * num_q_heads + (qh)) * max_parts + part_idx)
+
+  // A1 Stream-K unit space: units = num_kv_heads * total_chunks, each a
+  // (kv_head, seq, chunk) of C contiguous BLOCK_N tiles. The classic path is
+  // one "unit" per CTA (its blockIdx); STREAMK grid-strides the whole unit
+  // space over a fixed persistent grid (batch/ctx-independent -> graph-stable).
+  const int sk_total_chunks = STREAMK ? streamk_prefix[streamk_num_seqs] : 0;
+  const int sk_C = STREAMK ? streamk_prefix[streamk_num_seqs + 1] : 0;
+  const int sk_u_end = STREAMK ? (num_kv_heads * sk_total_chunks) : 1;
+
+  for (int u = (STREAMK ? (int)blockIdx.x : 0); u < sk_u_end;
+       u += (STREAMK ? (int)gridDim.x : 1)) {
+    if constexpr (STREAMK) __syncthreads();  // guard smem reuse across units
+
+    int kv_head, seq_idx, part_idx;
+    if constexpr (STREAMK) {
+      kv_head = u / sk_total_chunks;
+      const int gchunk = u - kv_head * sk_total_chunks;
+      // seq_idx = upper_bound(streamk_prefix[0..num_seqs], gchunk) - 1
+      int blo = 0, bhi = streamk_num_seqs;
+      while (blo + 1 < bhi) {
+        const int mid = (blo + bhi) >> 1;
+        if (streamk_prefix[mid] <= gchunk) blo = mid; else bhi = mid;
       }
-    // tmp partials are FP32 (bf16 partials made split-count transitions
-    // visible as batch-wide greedy-stream forks; see SESSION_19 notes)
-    float* tmpf = reinterpret_cast<float*>(out_or_tmp);
-    constexpr int F4 = HEAD_SIZE / 4;
-    for (int iv = tid; iv < GQA_GROUP * mq * F4; iv += nthreads) {
-      const int r = iv / F4, dv = (iv - r * F4) * 4;
-      const int tok = seq_idx * mq + r / GQA_GROUP;
-      const int qh = kv_head * GQA_GROUP + r % GQA_GROUP;
-      *reinterpret_cast<float4*>(
-          tmpf + DFUSED_PART(tok, qh) * HEAD_SIZE + dv) =
-          float4{0.f, 0.f, 0.f, 0.f};
+      seq_idx = blo;
+      part_idx = gchunk - streamk_prefix[seq_idx];
+    } else {
+      kv_head = blockIdx.x;
+      seq_idx = blockIdx.y;
+      part_idx = SPLIT ? blockIdx.z : 0;
     }
-    return;
-  }
+    const int seq_len = seq_lens[seq_idx];
+
+    int kv_begin = 0;
+    if (USE_SLIDING_WINDOW && sliding_window > 0) {
+      const int lo = seq_len - sliding_window;
+      kv_begin = (lo > 0) ? (lo / BLOCK_N) * BLOCK_N : 0;
+    }
+    const int n_tiles = GEMMA_CDIV(seq_len - kv_begin, BLOCK_N);
+    int tile_lo, tile_hi;
+    if constexpr (STREAMK) {
+      tile_lo = part_idx * sk_C;
+      tile_hi = tile_lo + sk_C;
+      if (tile_hi > n_tiles) tile_hi = n_tiles;
+    } else {
+      const int nsplits = SPLIT ? num_splits : 1;
+      const int tiles_per_split = GEMMA_CDIV(n_tiles, nsplits);
+      tile_lo = part_idx * tiles_per_split;
+      tile_hi = tile_lo + tiles_per_split;
+      if (tile_hi > n_tiles) tile_hi = n_tiles;
+    }
+
+    // Empty split (classic path only): a split past the sequence end writes
+    // neutral partials so the fixed-count combine sees a full set. STREAMK
+    // never enumerates empty units (chunk < chunks_per_seq => tile_lo < n_tiles)
+    // and its combine is chunk-count-aware, so no neutral write is needed.
+    if constexpr (!STREAMK) {
+      if (SPLIT && tile_lo >= tile_hi) {
+        for (int g = warp; g < GQA_GROUP * mq; g += NWARP)
+          if (lane == 0) {
+            const int tok = seq_idx * mq + g / GQA_GROUP;
+            const int qh = kv_head * GQA_GROUP + g % GQA_GROUP;
+            max_logits[DFUSED_PART(tok, qh)] = -FLT_MAX;
+            exp_sums[DFUSED_PART(tok, qh)] = 0.f;
+          }
+        // tmp partials are FP32 (bf16 partials made split-count transitions
+        // visible as batch-wide greedy-stream forks; see SESSION_19 notes)
+        float* tmpf = reinterpret_cast<float*>(out_or_tmp);
+        constexpr int F4 = HEAD_SIZE / 4;
+        for (int iv = tid; iv < GQA_GROUP * mq * F4; iv += nthreads) {
+          const int r = iv / F4, dv = (iv - r * F4) * 4;
+          const int tok = seq_idx * mq + r / GQA_GROUP;
+          const int qh = kv_head * GQA_GROUP + r % GQA_GROUP;
+          *reinterpret_cast<float4*>(
+              tmpf + DFUSED_PART(tok, qh) * HEAD_SIZE + dv) =
+              float4{0.f, 0.f, 0.f, 0.f};
+        }
+        return;
+      }
+    }
 
   extern __shared__ char df_smem[];
   cache_t* sQ = reinterpret_cast<cache_t*>(df_smem);        // [16, LDH]
@@ -2166,6 +2297,7 @@ gemma_decode_fused_kernel(
       }
     }
   }
+  }  // end Stream-K / single-unit loop (STREAMK grid-stride, else 1 iteration)
 #undef DFUSED_PART
 }
 
@@ -2476,7 +2608,9 @@ __global__ void gemma_split_reduce_kernel(
     const float* __restrict__ max_logits,  // [num_seqs, num_q_heads, max_parts] (M)
     const int num_splits,
     const int max_parts,
-    float* __restrict__ lse_out = nullptr) {  // [num_q_heads,num_seqs] natural-log
+    float* __restrict__ lse_out = nullptr,  // [num_q_heads,num_seqs] natural-log
+    const int* __restrict__ seq_prefix = nullptr,  // STREAMK chunk-count prefix
+    const int mq = 1) {
   const int q_head = blockIdx.x;
   const int seq = blockIdx.y;
   const int num_q_heads = gridDim.x;
@@ -2484,16 +2618,23 @@ __global__ void gemma_split_reduce_kernel(
   constexpr int ELEMS = HEAD_SIZE / WARP_SIZE;
   static_assert(HEAD_SIZE % WARP_SIZE == 0);
   const int dim_start = lane * ELEMS;
+  // STREAMK writes a VARIABLE chunk count per seq; the cached, un-zeroed
+  // partition buffers would otherwise leak stale slots into the fixed-count
+  // loop. Derive the real count from the prep prefix. nullptr -> classic path
+  // (n_parts == num_splits), byte-identical.
+  const int n_parts = (seq_prefix != nullptr)
+                          ? (seq_prefix[seq / mq + 1] - seq_prefix[seq / mq])
+                          : num_splits;
 
   const int64_t base = static_cast<int64_t>(seq) * num_q_heads + q_head;
   const float* m_ptr = max_logits + base * max_parts;
   const float* l_ptr = exp_sums + base * max_parts;
 
   float M_g = -FLT_MAX;
-  for (int s = 0; s < num_splits; s++) M_g = fmaxf(M_g, m_ptr[s]);
+  for (int s = 0; s < n_parts; s++) M_g = fmaxf(M_g, m_ptr[s]);
 
   float denom = 0.f;
-  for (int s = 0; s < num_splits; s++) {
+  for (int s = 0; s < n_parts; s++) {
     if (m_ptr[s] > -FLT_MAX) denom += l_ptr[s] * exp2f(m_ptr[s] - M_g);
   }
   const float inv = (denom > 0.f) ? (1.f / denom) : 0.f;
@@ -2511,7 +2652,7 @@ __global__ void gemma_split_reduce_kernel(
   for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
   const tpart_t* o_base = tmp_out + base * max_parts * HEAD_SIZE;
-  for (int s = 0; s < num_splits; s++) {
+  for (int s = 0; s < n_parts; s++) {
     if (!(m_ptr[s] > -FLT_MAX)) continue;
     const float w = l_ptr[s] * exp2f(m_ptr[s] - M_g) * inv;
     if (w == 0.f) continue;
@@ -2545,7 +2686,9 @@ __global__ void gemma_split_reduce_v2_kernel(
     const float* __restrict__ max_logits,  // [num_seqs, num_q_heads, max_parts] (M)
     const int num_splits,
     const int max_parts,
-    float* __restrict__ lse_out = nullptr) {  // [num_q_heads,num_seqs] natural-log
+    float* __restrict__ lse_out = nullptr,  // [num_q_heads,num_seqs] natural-log
+    const int* __restrict__ seq_prefix = nullptr,  // STREAMK chunk-count prefix
+    const int mq = 1) {
   const int q_head = blockIdx.x;
   const int seq = blockIdx.y;
   const int num_q_heads = gridDim.x;
@@ -2555,6 +2698,12 @@ __global__ void gemma_split_reduce_v2_kernel(
   static_assert(HEAD_SIZE % 128 == 0);
   // This CTA's dim-pair: blockIdx.z selects the 128-dim chunk.
   const int pair = blockIdx.z * NTHREADS + tid;
+  // STREAMK: variable chunk count per seq; loop the REAL count (prep prefix)
+  // so the cached, un-zeroed buffers never leak stale slots. nullptr -> classic
+  // (n_parts == num_splits), byte-identical. n_parts <= max_parts <= 128 < 256.
+  const int n_parts = (seq_prefix != nullptr)
+                          ? (seq_prefix[seq / mq + 1] - seq_prefix[seq / mq])
+                          : num_splits;
 
   const int64_t base = static_cast<int64_t>(seq) * num_q_heads + q_head;
   const float* m_ptr = max_logits + base * max_parts;
@@ -2562,18 +2711,18 @@ __global__ void gemma_split_reduce_v2_kernel(
 
   __shared__ float s_m[MAX_SPLITS_V2];
   __shared__ float s_l[MAX_SPLITS_V2];
-  for (int s = tid; s < num_splits; s += NTHREADS) {
+  for (int s = tid; s < n_parts; s += NTHREADS) {
     s_m[s] = m_ptr[s];
     s_l[s] = l_ptr[s];
   }
   __syncthreads();
 
   // Every thread derives M_g/denom redundantly from smem — same float order
-  // as v1 (s = 0..num_splits-1), so weights are bit-identical.
+  // as v1 (s = 0..n_parts-1), so weights are bit-identical.
   float M_g = -FLT_MAX;
-  for (int s = 0; s < num_splits; s++) M_g = fmaxf(M_g, s_m[s]);
+  for (int s = 0; s < n_parts; s++) M_g = fmaxf(M_g, s_m[s]);
   float denom = 0.f;
-  for (int s = 0; s < num_splits; s++) {
+  for (int s = 0; s < n_parts; s++) {
     if (s_m[s] > -FLT_MAX) denom += s_l[s] * exp2f(s_m[s] - M_g);
   }
   const float inv = (denom > 0.f) ? (1.f / denom) : 0.f;
@@ -2591,7 +2740,7 @@ __global__ void gemma_split_reduce_v2_kernel(
   // loads are safe (tmp_out is fully allocated and empty splits wrote O=0,
   // w=0) and w=0 contributions add +0.0f — v1-bitwise output preserved.
   __syncthreads();
-  for (int s = tid; s < num_splits; s += NTHREADS) {
+  for (int s = tid; s < n_parts; s += NTHREADS) {
     s_l[s] = (s_m[s] > -FLT_MAX) ? s_l[s] * exp2f(s_m[s] - M_g) * inv : 0.f;
   }
   __syncthreads();
@@ -2599,7 +2748,7 @@ __global__ void gemma_split_reduce_v2_kernel(
   float acc0 = 0.f, acc1 = 0.f;
   const tpart_t* o_base = tmp_out + base * max_parts * HEAD_SIZE + 2 * pair;
 #pragma unroll 4
-  for (int s = 0; s < num_splits; s++) {
+  for (int s = 0; s < n_parts; s++) {
     tpart_t o2[2];
     if constexpr (sizeof(tpart_t) == 2) {
       *reinterpret_cast<uint32_t*>(o2) = *reinterpret_cast<const uint32_t*>(
