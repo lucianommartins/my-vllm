@@ -67,18 +67,13 @@ _CACHE_V3 = os.environ.get("GEMMA_CACHE_V3", "1") != "0"
 # of demoting every decode onto the prefill kernel. Enabling sets
 # reorder_batch_threshold=1 so the runner orders the batch decodes-first and the
 # split is contiguous slicing. Gated off under spec-decode (uniform multi-query
-# steps are owned by the tiny_extend path).
-#   GEMMA_MIXED_SPLIT: "auto" (default) = on for DENSE models (measured net win
-#     across decode/mixed/*512 at every batch), off for MoE. MoE (26B-A4B) is
-#     opt-in: it wins decode512 (+~6%) and c128 (+~2-3%) but regresses mixed512
-#     at large per-step prefill volume (mbt~32K, ~-4..-8% engine tok/s), and the
-#     regime is per-step-prefill-driven (not batch-count) so it has no clean
-#     runtime gate — so it stays opt-in until a validated gate or unified kernel.
-#     "1"/"on" = force on for ALL models incl. MoE (opt in after A/B). "0"/"off"
-#     = disabled everywhere (byte-identical to the pre-split demotion behavior).
-_MIXED_SPLIT_MODE = os.environ.get("GEMMA_MIXED_SPLIT", "auto").lower()
-_MIXED_SPLIT = _MIXED_SPLIT_MODE not in ("0", "off", "false", "no")
-_MIXED_SPLIT_FORCE = _MIXED_SPLIT_MODE in ("1", "on", "true", "yes")
+# steps are owned by the tiny_extend path). Default ON: measured a net win on all
+# gemma-4 models (dense and 26B-A4B MoE) across decode/mixed/*512 at every batch,
+# with low-batch flat and parity no-worse-than-demotion. GEMMA_MIXED_SPLIT=0
+# disables it (byte-identical to the pre-split demotion behavior).
+_MIXED_SPLIT = os.environ.get("GEMMA_MIXED_SPLIT", "1") not in (
+    "0", "off", "false", "no"
+)
 
 PARTITION_SIZE = 512
 # Upper bound on split-KV partitions the decode kernel may use. The partition
@@ -232,17 +227,6 @@ class GemmaAttentionMetadataBuilder(
         )
         self.head_size = model_config.get_head_size()
 
-        # MoE detection (e.g. 26B-A4B: num_experts>0). The split is a net win on
-        # dense models but regresses MoE at large per-step prefill volume
-        # (mixed512), so in "auto" MoE is opt-in (GEMMA_MIXED_SPLIT=1 forces it).
-        hf_text = getattr(
-            model_config.hf_config, "text_config", model_config.hf_config
-        )
-        self.is_moe = int(getattr(hf_text, "num_experts", 0) or 0) > 0
-        self.mixed_split_enabled = _MIXED_SPLIT and (
-            _MIXED_SPLIT_FORCE or not self.is_moe
-        )
-
         # Mixed-batch decode/prefill split: a non-None threshold makes the
         # runner reorder the batch decodes-first (utils.reorder_batch_to_
         # split_decodes_and_prefills) so build() can split by contiguous
@@ -250,8 +234,7 @@ class GemmaAttentionMetadataBuilder(
         # uniform multi-query steps). None ⇒ no reorder, demotion behavior.
         self.reorder_batch_threshold = (
             1
-            if (self.mixed_split_enabled
-                and vllm_config.speculative_config is None)
+            if (_MIXED_SPLIT and vllm_config.speculative_config is None)
             else None
         )
 
@@ -378,7 +361,7 @@ class GemmaAttentionMetadataBuilder(
             suffix_kv_lens=suffix_kv_lens,
         )
         if (
-            self.mixed_split_enabled
+            _MIXED_SPLIT
             and md.max_query_len > 1
             and mm_range_tensor is None
             and tiny_extend_plan is None
