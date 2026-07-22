@@ -8,7 +8,7 @@ and falls back to Triton prefill for non-decode requests.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import torch
@@ -30,6 +30,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_kv_cache_layout,
+    split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -59,6 +60,25 @@ _MQ_PACK_ESERIES = os.environ.get("GEMMA_MQ_PACK_ESERIES", "1") != "0"
 # faster decode+prefill). GEMMA_CACHE_V3=0 reverts to the two-plane
 # legacy cache (recon/V_FILL correct mode).
 _CACHE_V3 = os.environ.get("GEMMA_CACHE_V3", "1") != "0"
+
+# Mixed-batch decode/prefill split. When a step contains BOTH decode (q_len==1)
+# and prefill/recompute (q_len>1) sequences, route the decodes to the fused
+# split-KV decode kernel and only the prefills to the prefill kernel — instead
+# of demoting every decode onto the prefill kernel. Enabling sets
+# reorder_batch_threshold=1 so the runner orders the batch decodes-first and the
+# split is contiguous slicing. Gated off under spec-decode (uniform multi-query
+# steps are owned by the tiny_extend path).
+#   GEMMA_MIXED_SPLIT: "auto" (default) = on for DENSE models (measured net win
+#     across decode/mixed/*512 at every batch), off for MoE. MoE (26B-A4B) is
+#     opt-in: it wins decode512 (+~6%) and c128 (+~2-3%) but regresses mixed512
+#     at large per-step prefill volume (mbt~32K, ~-4..-8% engine tok/s), and the
+#     regime is per-step-prefill-driven (not batch-count) so it has no clean
+#     runtime gate — so it stays opt-in until a validated gate or unified kernel.
+#     "1"/"on" = force on for ALL models incl. MoE (opt in after A/B). "0"/"off"
+#     = disabled everywhere (byte-identical to the pre-split demotion behavior).
+_MIXED_SPLIT_MODE = os.environ.get("GEMMA_MIXED_SPLIT", "auto").lower()
+_MIXED_SPLIT = _MIXED_SPLIT_MODE not in ("0", "off", "false", "no")
+_MIXED_SPLIT_FORCE = _MIXED_SPLIT_MODE in ("1", "on", "true", "yes")
 
 PARTITION_SIZE = 512
 # Upper bound on split-KV partitions the decode kernel may use. The partition
@@ -171,6 +191,19 @@ class GemmaAttentionMetadata:
     cu_prefix_query_lens: torch.Tensor | None = None
     prefix_kv_lens: torch.Tensor | None = None
     suffix_kv_lens: torch.Tensor | None = None
+    # Mixed-batch split (GEMMA_MIXED_SPLIT): counts from
+    # split_decodes_and_prefills over the decodes-first reordered batch, and
+    # two sub-metadata VIEWS (contiguous slices) so forward() can run the
+    # decode subset on the fused decode kernel and the prefill subset on the
+    # prefill kernel. decode_view/prefill_view are non-None only for a genuine
+    # mixed step (num_decodes>0 and num_prefills>0); otherwise all paths are
+    # unchanged.
+    num_decodes: int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    num_prefill_tokens: int = 0
+    decode_view: "GemmaAttentionMetadata | None" = None
+    prefill_view: "GemmaAttentionMetadata | None" = None
 
 
 class GemmaAttentionMetadataBuilder(
@@ -198,6 +231,29 @@ class GemmaAttentionMetadataBuilder(
             vllm_config.parallel_config
         )
         self.head_size = model_config.get_head_size()
+
+        # MoE detection (e.g. 26B-A4B: num_experts>0). The split is a net win on
+        # dense models but regresses MoE at large per-step prefill volume
+        # (mixed512), so in "auto" MoE is opt-in (GEMMA_MIXED_SPLIT=1 forces it).
+        hf_text = getattr(
+            model_config.hf_config, "text_config", model_config.hf_config
+        )
+        self.is_moe = int(getattr(hf_text, "num_experts", 0) or 0) > 0
+        self.mixed_split_enabled = _MIXED_SPLIT and (
+            _MIXED_SPLIT_FORCE or not self.is_moe
+        )
+
+        # Mixed-batch decode/prefill split: a non-None threshold makes the
+        # runner reorder the batch decodes-first (utils.reorder_batch_to_
+        # split_decodes_and_prefills) so build() can split by contiguous
+        # slicing. Disabled under spec-decode (the tiny_extend path owns
+        # uniform multi-query steps). None ⇒ no reorder, demotion behavior.
+        self.reorder_batch_threshold = (
+            1
+            if (self.mixed_split_enabled
+                and vllm_config.speculative_config is None)
+            else None
+        )
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         # Decode-only cascade for now: the prefix pass treats every 1-token
@@ -291,7 +347,7 @@ class GemmaAttentionMetadataBuilder(
             mq_uniform = int(mql) if bool((q_lens == mql).all()) else 0
             tiny_extend_plan = mq_uniform if mq_uniform > 1 else None
 
-        return GemmaAttentionMetadata(
+        md = GemmaAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
@@ -320,6 +376,73 @@ class GemmaAttentionMetadataBuilder(
             cu_prefix_query_lens=cu_prefix_query_lens,
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
+        )
+        if (
+            self.mixed_split_enabled
+            and md.max_query_len > 1
+            and mm_range_tensor is None
+            and tiny_extend_plan is None
+        ):
+            self._maybe_split_mixed(md, common_attn_metadata)
+        return md
+
+    def _maybe_split_mixed(
+        self,
+        md: GemmaAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> None:
+        """Populate decode/prefill counts + sub-metadata views for a mixed step.
+
+        Assumes a decodes-first reordered batch (reorder_batch_threshold=1).
+        Only q_len==1 rows go to the decode view (decode_threshold=1); the
+        views are contiguous slices, so this is O(1) view creation plus one
+        query_start_loc rebase. Views stay None unless the step is genuinely
+        mixed (num_decodes>0 and num_prefills>0).
+        """
+        nd, npf, ndt, npt = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=1,
+            treat_short_extends_as_decodes=True,
+        )
+        md.num_decodes = nd
+        md.num_prefills = npf
+        md.num_decode_tokens = ndt
+        md.num_prefill_tokens = npt
+        if nd == 0 or npf == 0:
+            return
+        slc = md.seq_lens_cpu
+        qsc = md.query_start_loc_cpu
+        pos = md.positions
+        md.decode_view = replace(
+            md,
+            num_actual_tokens=ndt,
+            max_query_len=1,
+            query_start_loc=md.query_start_loc[: nd + 1],
+            seq_lens=md.seq_lens[:nd],
+            block_table=md.block_table[:nd],
+            slot_mapping=md.slot_mapping[:ndt],
+            seq_lens_cpu=slc[:nd] if slc is not None else None,
+            query_start_loc_cpu=qsc[: nd + 1] if qsc is not None else None,
+            positions=pos[:ndt] if pos is not None else None,
+            tiny_extend_plan=None,
+            use_cascade=False,
+            decode_view=None,
+            prefill_view=None,
+        )
+        md.prefill_view = replace(
+            md,
+            num_actual_tokens=npt,
+            query_start_loc=md.query_start_loc[nd:] - ndt,
+            seq_lens=md.seq_lens[nd:],
+            block_table=md.block_table[nd:],
+            slot_mapping=md.slot_mapping[ndt:],
+            seq_lens_cpu=slc[nd:] if slc is not None else None,
+            query_start_loc_cpu=(qsc[nd:] - ndt) if qsc is not None else None,
+            positions=pos[ndt:] if pos is not None else None,
+            tiny_extend_plan=None,
+            use_cascade=False,
+            decode_view=None,
+            prefill_view=None,
         )
 
 
@@ -625,6 +748,19 @@ class GemmaAttentionImpl(AttentionImpl):
                     attn_metadata, record=True,
                 )
             if (
+                _MIXED_SPLIT
+                and _V3_RECORD_DECODE
+                and _V3_RECORD_PREFILL
+                and attn_metadata.decode_view is not None
+            ):
+                # Mixed step: run the decode subset on the record decode
+                # kernel and the prefill subset on the record prefill kernel,
+                # instead of demoting all decodes onto the prefill kernel.
+                return self._forward_mixed_split(
+                    layer, query, kv_cache, kv_cache, output,
+                    attn_metadata, record=True,
+                )
+            if (
                 _V3_RECORD_PREFILL
                 and attn_metadata.max_query_len > 1
                 and attn_metadata.tiny_extend_plan is None
@@ -669,6 +805,13 @@ class GemmaAttentionImpl(AttentionImpl):
                 return self._forward_tiny_extend(
                     layer, query, key_cache, value_cache, output,
                     attn_metadata)
+            if _MIXED_SPLIT and attn_metadata.decode_view is not None:
+                # Mixed step: decodes → fused decode kernel, prefills →
+                # prefill kernel (no whole-batch demotion).
+                return self._forward_mixed_split(
+                    layer, query, key_cache, value_cache, output,
+                    attn_metadata, record=False,
+                )
             return self._forward_prefill(
                 query[:num_actual_tokens],
                 key_cache,
@@ -1154,6 +1297,43 @@ class GemmaAttentionImpl(AttentionImpl):
             self._empty_f32,
             1.0,
         )
+        return output
+
+    def _forward_mixed_split(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: GemmaAttentionMetadata,
+        record: bool,
+    ) -> torch.Tensor:
+        """Mixed prefill+decode step: decodes on the fused split-KV decode
+        kernel, prefills on the prefill kernel, into disjoint output rows.
+
+        Runs only on genuinely ragged mixed steps (never uniform_decode), so it
+        never executes under a captured pure-decode cudagraph — assert the
+        tripwire. The two ops are sequential on one stream and each fully
+        reduces before returning, so they share no live scratch.
+        """
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "GEMMA_MIXED_SPLIT fired under graph capture (should be eager)"
+        )
+        dv = attn_metadata.decode_view
+        pv = attn_metadata.prefill_view
+        ndt = attn_metadata.num_decode_tokens
+        n = attn_metadata.num_actual_tokens
+        if record:
+            self._forward_decode_record(
+                layer, query[:ndt], key_cache, output, dv)
+            self._forward_prefill_record(
+                query[ndt:n], key_cache, output[ndt:n], pv)
+        else:
+            self._forward_decode(
+                layer, query[:ndt], key_cache, value_cache, output[:ndt], dv)
+            self._forward_prefill(
+                query[ndt:n], key_cache, value_cache, output[ndt:n], pv)
         return output
 
     def _vrecon_args(self, layer, dev):
