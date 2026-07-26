@@ -52,6 +52,22 @@ _MQ_DECODE_MAX = int(os.environ.get("GEMMA_MQ_DECODE_MAX", "8"))
 # virtual-seq) -> stays on the fallbacks. Default ON; =0 reverts.
 # Must stay in lockstep with the kernel's mq_pack_eseries gate.
 _MQ_PACK_ESERIES = os.environ.get("GEMMA_MQ_PACK_ESERIES", "1") != "0"
+# T2.2 (default OFF): let hd256 lanes that fail the packed-mq gate take the
+# virtual-seq decode path instead of the wmma prefill fallback, but ONLY where
+# that is actually cheaper (mqu < group). E2B-shaped by construction.
+_MQ_VSEQ_HD256 = os.environ.get("GEMMA_MQ_VSEQ_HD256", "0") != "0"
+# T2.4 (default OFF): under spec-decode, treat uniform (gamma+1)-length rows as
+# DECODES for batch reordering / mixed-split, instead of demoting the whole
+# mixed batch to the prefill kernel.
+_SPEC_AS_DECODE = os.environ.get("GEMMA_SPEC_AS_DECODE", "0") != "0"
+# T1.2 (default ON): reserve worst-case split-KV partition buffers at warmup.
+# This is THE fix for the E4B+MTP decode-saturation crash: regrow reallocates
+# and rebinds, so CUDA graphs captured earlier dereference freed memory
+# ("illegal memory access", 3/3 reps). Pre-sizing drives regrow count to 0, so
+# there is nothing to retain and nothing to dangle. Measured cost: -1.5% KV
+# cache (928,665 vs 942,908 tokens on E4B/16k), and the crashing cell then
+# completes 500/500 on 3/3 reps. Set =0 only to reproduce the old behaviour.
+_PRESIZE_PARTITIONS = os.environ.get("GEMMA_PRESIZE_PARTITIONS", "1") != "0"
 
 # Contract-v3 gemma-4 cache (640-ch global records + ps64 pools). Dev gate:
 # readers not yet migrated; default OFF.
@@ -82,6 +98,33 @@ PARTITION_SIZE = 512
 # available KV blocks).
 SPLIT_PARTITION_CAP = 128
 TOKENS_PER_SPLIT = 256
+# Max distinct (n, mqu) virtual-seq expansion entries kept per impl. Bounds the
+# device memory held by the tiny-extend expansion buffers, which are O(n *
+# block_table_width) and would otherwise accumulate one entry per distinct
+# batch size seen above the largest captured CUDA graph.
+_MQ_EXPAND_CACHE_MAX = 16
+
+
+def _is_sm90() -> bool:
+    """True on Hopper+, where the prefill launcher consumes seq_lens_cpu.
+
+    Computed once, lazily (no CUDA context at import time). On SM80 the v2
+    prefill kernel ignores the host-side seq_lens entirely (the consumer at
+    gemma_prefill_attention.cu:314 sits inside the ENABLE_GEMMA_ATTN_SM90 +
+    runtime is_sm90 guard), so the tensor can be left unmaterialised there.
+    """
+    global _IS_SM90
+    if _IS_SM90 is None:
+        try:
+            from vllm.platforms import current_platform
+            cap = current_platform.get_device_capability()
+            _IS_SM90 = bool(cap is not None and cap[0] >= 9)
+        except Exception:
+            _IS_SM90 = True  # fail safe: keep the (correct) sync
+    return _IS_SM90
+
+
+_IS_SM90: bool | None = None
 
 
 # Split-KV scratch is pure per-step working memory: each decode op writes its
@@ -96,6 +139,13 @@ TOKENS_PER_SPLIT = 256
 _DECODE_PARTITION_CACHE: dict[
     tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
+# Superseded partition buffers are kept alive (never freed) so that CUDA graphs
+# captured against them stay valid. Bounded: growth is monotonic, so this holds
+# at most a handful of entries per key and should stay empty once the buffers
+# are pre-sized (see _presize_decode_partition_buffers).
+_DECODE_PARTITION_RETAINED: list[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = []
 
 
 def _get_decode_partition_buffers(
@@ -120,14 +170,35 @@ def _get_decode_partition_buffers(
         or cached[0].shape[0] < num_seqs
         or cached[0].shape[2] < max_num_partitions
     ):
-        # Grow monotonically: never shrink a dimension, so buffers captured by an
-        # existing CUDA graph stay valid.
+        # Growing REALLOCATES: the previous tensors are rebound in the cache and
+        # freed once the last Python reference drops. A CUDA graph captured
+        # earlier baked the OLD device pointers, so replaying it after a regrow
+        # dereferences freed memory -> "illegal memory access". (Observed 3/3 on
+        # E4B+MTP decode @ concurrency 256, where n = num_reqs * (gamma+1)
+        # oscillates across the largest captured size.) Two defences:
+        #   1. _presize_decode_partition_buffers() reserves the worst case up
+        #      front from static config, so this branch should never run in
+        #      steady state;
+        #   2. if it does run, the superseded buffers are RETAINED so any
+        #      captured graph keeps a valid (and still exclusively its own)
+        #      scratch region. These are write-then-read scratch partials
+        #      consumed inside the same op, so a replaying graph that uses the
+        #      old region stays numerically correct.
         ns = num_seqs if cached is None else max(num_seqs, cached[0].shape[0])
         mp = (
             max_num_partitions
             if cached is None
             else max(max_num_partitions, cached[0].shape[2])
         )
+        if cached is not None:
+            _DECODE_PARTITION_RETAINED.append(cached)
+            logger.warning(
+                "GEMMA_ATTN: decode partition buffers regrew to "
+                "(ns=%d, mp=%d) for key=%s; retaining the superseded buffers "
+                "to keep captured CUDA graphs valid. This should not happen "
+                "in steady state -- raise the pre-size bounds.",
+                ns, mp, (head_size, num_heads, dtype),
+            )
         exp_sums = torch.zeros(
             ns, num_heads, mp, dtype=torch.float32, device=device
         )
@@ -232,11 +303,24 @@ class GemmaAttentionMetadataBuilder(
         # split_decodes_and_prefills) so build() can split by contiguous
         # slicing. Disabled under spec-decode (the tiny_extend path owns
         # uniform multi-query steps). None ⇒ no reorder, demotion behavior.
-        self.reorder_batch_threshold = (
-            1
-            if (_MIXED_SPLIT and vllm_config.speculative_config is None)
-            else None
-        )
+        # T2.4: with spec-decode, every verify row has q_len = gamma+1, so a
+        # threshold of 1 classifies them all as prefills -> nd == 0 -> the whole
+        # mixed batch is demoted to the prefill kernel. Raising the threshold to
+        # gamma+1 (vLLM's "spec as decode" convention, cf.
+        # AttentionMetadataBuilder._init_reorder_batch_threshold) lets the
+        # uniform verify rows be reordered and split as decodes.
+        _spec_cfg = vllm_config.speculative_config
+        _spec_tokens = (
+            getattr(_spec_cfg, "num_speculative_tokens", 0) or 0
+        ) if _spec_cfg is not None else 0
+        self._decode_threshold = 1
+        if _MIXED_SPLIT and _spec_cfg is None:
+            self.reorder_batch_threshold = 1
+        elif _MIXED_SPLIT and _SPEC_AS_DECODE and _spec_tokens > 0:
+            self._decode_threshold = 1 + _spec_tokens
+            self.reorder_batch_threshold = self._decode_threshold
+        else:
+            self.reorder_batch_threshold = None
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         # Decode-only cascade for now: the prefix pass treats every 1-token
@@ -318,10 +402,13 @@ class GemmaAttentionMetadataBuilder(
         tiny_extend_plan = None
         mql = common_attn_metadata.max_query_len
         if 1 < mql <= _MQ_DECODE_MAX and mm_range_tensor is None:
-            dev = common_attn_metadata.query_start_loc.device
             cu = common_attn_metadata.query_start_loc_cpu.to(torch.int64)
             q_lens = cu[1:] - cu[:-1]
-            slc = common_attn_metadata.seq_lens_cpu.to(torch.int64)
+            # NOTE: do NOT touch common_attn_metadata.seq_lens_cpu here. It is a
+            # lazy property (= self.seq_lens.to("cpu")); under async spec decode
+            # the runner leaves _seq_lens_cpu unset, so reading it is a blocking
+            # D2H that drains CPU run-ahead on EVERY verify step. Nothing in
+            # this block consumes it (the plan is just the uniform mq int).
             # spec-decode steps may pad tokens beyond cu[-1]
             # Graph-safe: the plan is just the uniform mq (an int). The
             # forward derives everything from PERSISTENT metadata
@@ -344,9 +431,18 @@ class GemmaAttentionMetadataBuilder(
             # only on prefill-shaped steps (the only consumer). Fetching it
             # unconditionally cost -12% decode tok/s at L=16k (one sync per
             # decode step).
+            # Spec-decode verify steps have max_query_len = gamma+1 > 1, so the
+            # guard above did NOT protect them: every verify step paid the
+            # sync, and under async spec decode the runner leaves _seq_lens_cpu
+            # unset so it is a genuine blocking D2H that drains CPU run-ahead.
+            # The only consumer is the SM90 prefill launcher, so on SM80 a
+            # uniform multi-query step can skip it entirely (the fallback to
+            # _forward_prefill substitutes empty_i32, which is already the
+            # shipped behaviour on every max_query_len == 1 step).
             seq_lens_cpu=(
                 common_attn_metadata.seq_lens_cpu
-                if common_attn_metadata.max_query_len > 1
+                if (common_attn_metadata.max_query_len > 1
+                    and (tiny_extend_plan is None or _is_sm90()))
                 else None
             ),
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
@@ -376,15 +472,16 @@ class GemmaAttentionMetadataBuilder(
     ) -> None:
         """Populate decode/prefill counts + sub-metadata views for a mixed step.
 
-        Assumes a decodes-first reordered batch (reorder_batch_threshold=1).
-        Only q_len==1 rows go to the decode view (decode_threshold=1); the
-        views are contiguous slices, so this is O(1) view creation plus one
+        Assumes a decodes-first reordered batch (reorder_batch_threshold ==
+        self._decode_threshold). Rows with q_len <= that threshold go to the
+        decode view -- 1 normally, gamma+1 under T2.4 spec-as-decode; the views
+        are contiguous slices, so this is O(1) view creation plus one
         query_start_loc rebase. Views stay None unless the step is genuinely
         mixed (num_decodes>0 and num_prefills>0).
         """
         nd, npf, ndt, npt = split_decodes_and_prefills(
             common_attn_metadata,
-            decode_threshold=1,
+            decode_threshold=self._decode_threshold,
             treat_short_extends_as_decodes=True,
         )
         md.num_decodes = nd
@@ -393,13 +490,24 @@ class GemmaAttentionMetadataBuilder(
         md.num_prefill_tokens = npt
         if nd == 0 or npf == 0:
             return
+        # T2.4: with decode_threshold = gamma+1 the decode view can hold
+        # multi-query verify rows, which the q_len==1 decode kernel cannot
+        # consume. Only claim them as decodes when they are exactly uniform at
+        # the threshold; then hand the view a tiny_extend_plan so the forward
+        # routes it to the packed/virtual-seq multi-query path instead. Any
+        # ragged remainder falls back to the whole-batch prefill demotion.
+        dv_mq = 1
+        if self._decode_threshold > 1:
+            if ndt != nd * self._decode_threshold:
+                return  # not uniform -> do not split; keep prior behaviour
+            dv_mq = self._decode_threshold
         slc = md.seq_lens_cpu
         qsc = md.query_start_loc_cpu
         pos = md.positions
         md.decode_view = replace(
             md,
             num_actual_tokens=ndt,
-            max_query_len=1,
+            max_query_len=dv_mq,
             query_start_loc=md.query_start_loc[: nd + 1],
             seq_lens=md.seq_lens[:nd],
             block_table=md.block_table[:nd],
@@ -407,7 +515,7 @@ class GemmaAttentionMetadataBuilder(
             seq_lens_cpu=slc[:nd] if slc is not None else None,
             query_start_loc_cpu=qsc[: nd + 1] if qsc is not None else None,
             positions=pos[:ndt] if pos is not None else None,
-            tiny_extend_plan=None,
+            tiny_extend_plan=(dv_mq if dv_mq > 1 else None),
             use_cascade=False,
             decode_view=None,
             prefill_view=None,
@@ -683,6 +791,33 @@ class GemmaAttentionImpl(AttentionImpl):
         self._cached_part: tuple[torch.Tensor, ...] | None = None
         self._cached_part_ns: int = 0
         self._cached_part_mp: int = 0
+        # Worst-case query rows this impl can ever be asked for: every running
+        # sequence contributing (gamma+1) rows on a spec-decode verify step.
+        # Used to pre-size the split-KV partition buffers so they never regrow
+        # (a regrow invalidates already-captured CUDA graphs -> illegal access).
+        sched = getattr(vllm_config, "scheduler_config", None)
+        spec = getattr(vllm_config, "speculative_config", None)
+        max_num_seqs = getattr(sched, "max_num_seqs", 0) or 0
+        num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+        self._max_partition_rows = max_num_seqs * (1 + num_spec)
+        self._max_partition_seq_len = getattr(
+            vllm_config.model_config, "max_model_len", 0) or 0
+
+    def _presize_partition_buffers(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        """Reserve the worst-case split-KV partition buffers once.
+
+        Called before CUDA-graph capture so that no later step can trigger a
+        reallocation. See _get_decode_partition_buffers for why a regrow after
+        capture is fatal.
+        """
+        if not self._max_partition_rows or not self._max_partition_seq_len:
+            return
+        _get_decode_partition_buffers(
+            self._max_partition_rows, self.num_heads, self.head_size,
+            self._max_partition_seq_len, dtype, device,
+        )
 
     def _ensure_partition_buffers(
         self, num_seqs: int, max_seq_len: int,
@@ -692,6 +827,11 @@ class GemmaAttentionImpl(AttentionImpl):
                 and self._cached_part_ns >= num_seqs
                 and self._cached_part_mp >= max_seq_len):
             return self._cached_part  # type: ignore[return-value]
+        if _PRESIZE_PARTITIONS and self._cached_part is None:
+            # First use happens during warmup, before graph capture, so this
+            # removes regrow (and therefore the dangling-pointer crash)
+            # entirely. Retain stays as a belt-and-braces fallback.
+            self._presize_partition_buffers(dtype, device)
         result = _get_decode_partition_buffers(
             num_seqs, self.num_heads, self.head_size,
             max_seq_len, dtype, device,
@@ -880,18 +1020,41 @@ class GemmaAttentionImpl(AttentionImpl):
             )
         )
         if not packed_ok:
-            if mqu >= 2 and self.actual_head_size == 512:
+            # T2.2: hd256 lanes that cannot pack fall through to the wmma
+            # PREFILL kernel below, which re-reads the KV tile once per query
+            # head -> GROUP x amplification (8x on E2B). The virtual-seq path
+            # amplifies by mqu instead, so it is a win exactly when
+            # mqu < group -- true for E2B (g8, mqu 3: 8x -> 3x) and false for
+            # E4B (g4, mqu 5: 4x -> 5x, which would REGRESS the worst measured
+            # cell). The gate encodes that condition rather than dropping the
+            # head-size test outright.
+            _vseq_hd256 = (_MQ_VSEQ_HD256 and self.actual_head_size == 256
+                           and group > 0 and mqu < group)
+            if mqu >= 2 and (self.actual_head_size == 512 or _vseq_hd256):
                 # hd512 verify: virtual-seq decode via PERSISTENT buffers
                 # (graph-safe: out=/copy_ only, constants cached at warmup;
                 # the decode kernel beats wmma by an order at kv >> q).
                 num_real = attn_metadata.seq_lens.shape[0]
                 n = num_real * mqu
+                # A short slice with a long grid is an OOB read/write: the
+                # kernel is launched for n rows, so query/output must have at
+                # least that many. Python slicing clamps silently, so assert.
+                assert n <= query.shape[0], (
+                    f"tiny-extend virtual-seq: need {n} query rows "
+                    f"(seqs={num_real} x mq={mqu}) but query has "
+                    f"{query.shape[0]}")
                 key = (n, mqu, query.device)
                 cached = self._mq_expand_cache.get(key)
                 if cached is None:
                     if torch.cuda.is_current_stream_capturing():
                         raise RuntimeError(
                             "mq expand constants missing during capture")
+                    # NOTE: do NOT evict from this cache. bt_buf/sl_buf are
+                    # written via index_select(out=...) and are referenced by
+                    # captured CUDA graphs; freeing one poisons a later replay
+                    # (observed: ~TensorImpl in the fault stack). The original
+                    # OOM concern was refuted -- the crash is an illegal access,
+                    # not exhaustion -- so the growth is left unbounded here.
                     seq_idx = (
                         torch.arange(n, device=query.device) // mqu
                     ).to(torch.int64)
@@ -950,6 +1113,11 @@ class GemmaAttentionImpl(AttentionImpl):
             )
         num_real = attn_metadata.seq_lens.shape[0]
         n = num_real * mqu  # uniform: query rows = seqs * mq
+        # See the virtual-seq path: the kernel grid is sized from n, so a short
+        # query/output slice would be an OOB access rather than a shape error.
+        assert n <= query.shape[0], (
+            f"tiny-extend packed: need {n} query rows (seqs={num_real} x "
+            f"mq={mqu}) but query has {query.shape[0]}")
         exp_sums, max_logits, tmp_out = self._ensure_partition_buffers(
             n, attn_metadata.max_seq_len, query.dtype, query.device,
         )
@@ -1307,14 +1475,25 @@ class GemmaAttentionImpl(AttentionImpl):
         pv = attn_metadata.prefill_view
         ndt = attn_metadata.num_decode_tokens
         n = attn_metadata.num_actual_tokens
-        if record:
+        # T2.4: a decode view carrying uniform (gamma+1)-length verify rows must
+        # go to the multi-query path, not the q_len==1 decode kernel.
+        if dv is not None and dv.tiny_extend_plan is not None:
+            # In record mode the record pool is passed as both caches, matching
+            # the non-split record call site.
+            self._forward_tiny_extend(
+                layer, query[:ndt], key_cache,
+                key_cache if record else value_cache,
+                output[:ndt], dv, record)
+        elif record:
             self._forward_decode_record(
                 layer, query[:ndt], key_cache, output, dv)
-            self._forward_prefill_record(
-                query[ndt:n], key_cache, output[ndt:n], pv)
         else:
             self._forward_decode(
                 layer, query[:ndt], key_cache, value_cache, output[:ndt], dv)
+        if record:
+            self._forward_prefill_record(
+                query[ndt:n], key_cache, output[ndt:n], pv)
+        else:
             self._forward_prefill(
                 query[ndt:n], key_cache, value_cache, output[ndt:n], pv)
         return output
