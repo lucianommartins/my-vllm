@@ -1002,6 +1002,71 @@ class Gemma4MultimodalEmbedder(nn.Module):
         return embs_proj
 
 
+def _optimize_hf_multimodal_tower(tower: nn.Module) -> None:
+    """Optimize HF multimodal tower with fused Triton kernels (RMSNorm, 2D RoPE)."""
+    from vllm.model_executor.layers.fused_gemma4_ops import (
+        fused_vision_2d_rope,
+        fused_vision_rmsnorm,
+    )
+
+    for module in tower.modules():
+        name = module.__class__.__name__
+        if name == "Gemma4RMSNorm":
+            orig_rmsnorm_forward = module.forward
+
+            def _fused_rmsnorm_forward(
+                hidden_states: torch.Tensor,
+                _m=module,
+                _orig=orig_rmsnorm_forward,
+            ) -> torch.Tensor:
+                if hidden_states.is_cuda:
+                    weight = _m.weight if getattr(_m, "with_scale", True) else None
+                    return fused_vision_rmsnorm(hidden_states, weight, eps=_m.eps)
+                return _orig(hidden_states)
+
+            module.forward = _fused_rmsnorm_forward
+
+        elif name == "Gemma4VisionAttention":
+            import sys
+
+            mod: Any = sys.modules.get(module.__module__)
+            orig_rope = (
+                getattr(mod, "apply_multidimensional_rope", None)
+                if mod is not None
+                else None
+            )
+            if orig_rope is not None and not getattr(
+                mod, "_fused_2d_rope_patched", False
+            ):
+
+                def _patched_multidimensional_rope(
+                    x: torch.Tensor,
+                    cos: torch.Tensor,
+                    sin: torch.Tensor,
+                    position_ids: torch.Tensor | None = None,
+                    unsqueeze_dim: int = 2,
+                    _orig=orig_rope,
+                ) -> torch.Tensor:
+                    if (
+                        x.is_cuda
+                        and x.ndim == 4
+                        and position_ids is not None
+                        and position_ids.shape[-1] == 2
+                        and x.shape[-1] % 4 == 0
+                    ):
+                        return fused_vision_2d_rope(x, cos, sin)
+                    return _orig(
+                        x,
+                        cos,
+                        sin,
+                        position_ids=position_ids,
+                        unsqueeze_dim=unsqueeze_dim,
+                    )
+
+                mod.apply_multidimensional_rope = _patched_multidimensional_rope
+                mod._fused_2d_rope_patched = True
+
+
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
@@ -1107,6 +1172,7 @@ class Gemma4ForConditionalGeneration(
                 tower_quant,
                 prefix=maybe_prefix(prefix, "vision_tower"),
             )
+            _optimize_hf_multimodal_tower(self.vision_tower)
 
         # ---- Audio tower (variants with audio_config) ----
         self.embed_audio: Gemma4MultimodalEmbedder | None
@@ -1129,6 +1195,7 @@ class Gemma4ForConditionalGeneration(
                     tower_quant,
                     prefix=maybe_prefix(prefix, "audio_tower"),
                 )
+                _optimize_hf_multimodal_tower(self.audio_tower)
         else:
             self.audio_tower = None
             self.embed_audio = None
@@ -1163,6 +1230,7 @@ class Gemma4ForConditionalGeneration(
 
         # --- Precompute full-attention layer indices for bidi clearing ---
         self._full_attn_layer_idxs: frozenset[int] = frozenset()
+        self._cached_full_attn_layer_names: dict[tuple[str, ...], list[str]] = {}
         text_config = config.text_config
         if getattr(text_config, "use_bidirectional_attention", None) == "vision":
             layer_types = getattr(text_config, "layer_types", None)
@@ -1412,35 +1480,40 @@ class Gemma4ForConditionalGeneration(
                 for i, (orig_idx, _, _) in enumerate(chunk_items):
                     last_hidden_states_map[orig_idx] = hidden_states[i]
 
-        # Pool per image to strip padding and reduce spatial resolution.
+        # Pool across same-resolution images in batched calls
+        length_groups: dict[int, list[int]] = {}
+        for orig_idx in range(total_images):
+            seq_len = last_hidden_states_map[orig_idx].shape[0]
+            length_groups.setdefault(seq_len, []).append(orig_idx)
+
         all_valid_states: list[torch.Tensor] = [None] * total_images  # type: ignore[list-item]
         valid_lens = [0] * total_images
 
-        for orig_idx in range(total_images):
-            chunk_hidden = last_hidden_states_map[orig_idx]
-            output_length = chunk_hidden.shape[0] // pooling_k2
+        for seq_len, orig_indices in length_groups.items():
+            output_length = seq_len // pooling_k2
+            batch_hidden = torch.stack(
+                [last_hidden_states_map[idx] for idx in orig_indices], dim=0
+            )
+            batch_pos_ids = torch.stack(
+                [pool_position_ids[idx] for idx in orig_indices], dim=0
+            )
+            padding_positions = (batch_pos_ids == -1).all(dim=-1)
 
-            single_hidden = chunk_hidden.unsqueeze(0)
-            single_pos_ids = pool_position_ids[orig_idx].unsqueeze(0)
-            padding_positions = (single_pos_ids == -1).all(dim=-1)
-
-            # The pooler goes through HuggingFace's mask builder, which probes
-            # `padding_mask.all()`, and the mask indexing below needs the
-            # selected count on the host.
             with gpu_sync_allowed():
                 pooled_states, valid_mask = vt.pooler(
-                    hidden_states=single_hidden,
-                    pixel_position_ids=single_pos_ids,
+                    hidden_states=batch_hidden,
+                    pixel_position_ids=batch_pos_ids,
                     padding_positions=padding_positions,
                     output_length=output_length,
                 )
-                valid_states = pooled_states[valid_mask]
-
-            if getattr(vt.config, "standardize", False):
-                valid_states = (valid_states - vt.std_bias) * vt.std_scale
-
-            all_valid_states[orig_idx] = valid_states
-            valid_lens[orig_idx] = valid_states.shape[0]
+                group_valid_lens = valid_mask.sum(dim=-1).tolist()
+                for b_idx, orig_idx in enumerate(orig_indices):
+                    mask_b = valid_mask[b_idx]
+                    valid_states = pooled_states[b_idx, mask_b]
+                    if getattr(vt.config, "standardize", False):
+                        valid_states = (valid_states - vt.std_bias) * vt.std_scale
+                    all_valid_states[orig_idx] = valid_states
+                    valid_lens[orig_idx] = group_valid_lens[b_idx]
 
         # Project all images in a single batched call.
         flat_valid_states = torch.cat(all_valid_states, dim=0).to(self.model_dtype)
@@ -1528,36 +1601,23 @@ class Gemma4ForConditionalGeneration(
 
         last_hidden_states = torch.cat(last_hidden_states_list, dim=0)
 
-        # Pool per frame to strip padding and reduce spatial resolution.
+        # Pool all frames in a single batched call to strip padding and reduce
+        # spatial resolution.
         output_length = pixel_values.shape[1] // pooling_k2
-        all_frame_valid_states: list[torch.Tensor] = []
-        frame_valid_lens: list[int] = []
 
-        for i in range(total_frames):
-            single_hidden = last_hidden_states[i].unsqueeze(0)
-            single_pos_ids = pixel_position_ids[i].unsqueeze(0)
-            single_pad_pos = padding_positions[i].unsqueeze(0)
+        with gpu_sync_allowed():
+            pooled_states, valid_mask = vt.pooler(
+                hidden_states=last_hidden_states,
+                pixel_position_ids=pixel_position_ids,
+                padding_positions=padding_positions,
+                output_length=output_length,
+            )
+            frame_valid_lens: list[int] = valid_mask.sum(dim=-1).tolist()
+            flat_valid_states = pooled_states[valid_mask]
 
-            # As above, plus mask indexing that needs the count on the host.
-            with gpu_sync_allowed():
-                pooled_states, valid_mask = vt.pooler(
-                    hidden_states=single_hidden,
-                    pixel_position_ids=single_pos_ids,
-                    padding_positions=single_pad_pos,
-                    output_length=output_length,
-                )
-                valid_states = pooled_states[valid_mask]
-
-            if getattr(vt.config, "standardize", False):
-                valid_states = (valid_states - vt.std_bias) * vt.std_scale
-
-            all_frame_valid_states.append(valid_states)
-            frame_valid_lens.append(valid_states.shape[0])
-
-        # Project all frames in a single batched call.
-        flat_valid_states = torch.cat(all_frame_valid_states, dim=0).to(
-            self.model_dtype
-        )
+        if getattr(vt.config, "standardize", False):
+            flat_valid_states = (flat_valid_states - vt.std_bias) * vt.std_scale
+        flat_valid_states = flat_valid_states.to(self.model_dtype)
         flat_proj_embs = self.embed_vision(
             inputs_embeds=flat_valid_states.unsqueeze(0)
         ).squeeze(0)
@@ -2181,14 +2241,25 @@ class Gemma4ForConditionalGeneration(
             return
 
         def _process(metadata_dict: dict) -> None:
-            for layer_name, metadata in metadata_dict.items():
-                if ".layers." not in layer_name:
-                    continue
-                try:
-                    layer_idx = int(layer_name.split(".layers.")[1].split(".")[0])
-                except (ValueError, IndexError):
-                    continue
-                if layer_idx in self._full_attn_layer_idxs:
+            keys_tuple = tuple(metadata_dict.keys())
+            matching_keys = self._cached_full_attn_layer_names.get(keys_tuple)
+            if matching_keys is None:
+                matching_keys = []
+                for layer_name in keys_tuple:
+                    if ".layers." in layer_name:
+                        try:
+                            layer_idx = int(
+                                layer_name.split(".layers.")[1].split(".")[0]
+                            )
+                            if layer_idx in self._full_attn_layer_idxs:
+                                matching_keys.append(layer_name)
+                        except (ValueError, IndexError):
+                            pass
+                self._cached_full_attn_layer_names[keys_tuple] = matching_keys
+
+            for key in matching_keys:
+                metadata = metadata_dict.get(key)
+                if metadata is not None:
                     if hasattr(metadata, "mm_prefix_range"):
                         metadata.mm_prefix_range = None
                     if hasattr(metadata, "mm_prefix_range_tensor"):

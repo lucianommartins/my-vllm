@@ -230,44 +230,51 @@ class Gemma4Config(VerifyAndUpdateConfig):
             for i in range(min(arch_config.total_num_hidden_layers, len(layer_types)))
         }
 
-        if len(set(head_dims.values())) <= 1:
-            return
+        if len(set(head_dims.values())) > 1:
+            from vllm.platforms import current_platform
+            from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        from vllm.platforms import current_platform
-        from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+            max_head_dim = max(head_dims.values())
 
-        max_head_dim = max(head_dims.values())
+            if is_fa_version_supported(4) and max_head_dim <= 512:
+                if (
+                    vllm_config.attention_config.flash_attn_version is None
+                    and vllm_config.attention_config.backend
+                    in (None, AttentionBackendEnum.FLASH_ATTN)
+                ):
+                    use_per_layer_fa = current_platform.is_device_capability_family(
+                        90
+                    ) and vllm_config.cache_config.cache_dtype.startswith("fp8")
+                    if use_per_layer_fa:
+                        logger.info(
+                            "Gemma4 model has heterogeneous head dimensions %s. Using "
+                            "per-layer FA3/FA4 selection for FP8 KV cache on SM90.",
+                            head_dims,
+                        )
+                    else:
+                        vllm_config.attention_config.flash_attn_version = 4
+                        logger.info(
+                            "Gemma4 model has heterogeneous head dimensions %s. "
+                            "Using FA4 for all layers to avoid mixed FA3/FA4 penalty.",
+                            head_dims,
+                        )
+            elif vllm_config.attention_config.backend is None:
+                vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions "
+                    "%s. FA4 not available, forcing TRITON_ATTN backend.",
+                    head_dims,
+                )
 
-        if is_fa_version_supported(4) and max_head_dim <= 512:
-            if (
-                vllm_config.attention_config.flash_attn_version is None
-                and vllm_config.attention_config.backend
-                in (None, AttentionBackendEnum.FLASH_ATTN)
-            ):
-                use_per_layer_fa = current_platform.is_device_capability_family(
-                    90
-                ) and vllm_config.cache_config.cache_dtype.startswith("fp8")
-                if use_per_layer_fa:
-                    logger.info(
-                        "Gemma4 model has heterogeneous head dimensions %s. Using "
-                        "per-layer FA3/FA4 selection for FP8 KV cache on SM90.",
-                        head_dims,
-                    )
-                else:
-                    vllm_config.attention_config.flash_attn_version = 4
-                    logger.info(
-                        "Gemma4 model has heterogeneous head dimensions %s. Using FA4 "
-                        "for all layers to avoid mixed FA3/FA4 penalty.",
-                        head_dims,
-                    )
-        elif vllm_config.attention_config.backend is None:
-            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
-            logger.info(
-                "Gemma4 model has heterogeneous head dimensions "
-                "%s. FA4 not available, forcing TRITON_ATTN backend.",
-                head_dims,
-            )
+        hf_text_config = vllm_config.model_config.hf_text_config
+        if (
+            getattr(hf_text_config, "num_kv_shared_layers", 0) > 0
+            and vllm_config.speculative_config is None
+            and "DiffusionGemmaForBlockDiffusion"
+            not in getattr(vllm_config.model_config, "architectures", [])
+        ):
+            vllm_config.cache_config.kv_sharing_fast_prefill = True
 
 
 class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):

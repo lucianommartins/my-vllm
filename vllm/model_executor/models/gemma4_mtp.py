@@ -32,6 +32,12 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_gemma4_ops import (
+    fused_mlp_ple_epilogue,
+    fused_mtp_sparse_gather_gemv,
+    fused_post_attn_add_pre_ff_norm,
+    fused_qkv_norm_rope,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -114,13 +120,11 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
             self.vocab_size_per_centroid,
         )
         selected = clusters[top_k_indices]
-        embeddings = lm_head_weight[selected.reshape(-1)].view(
-            num_tokens,
-            self.num_selected,
-            self.hidden_size,
+        selected_flat = selected.view(num_tokens, -1)
+        logits = fused_mtp_sparse_gather_gemv(
+            hidden_states, lm_head_weight, selected_flat
         )
-        logits = torch.einsum("td,tsd->ts", hidden_states, embeddings)
-        return logits, selected.view(num_tokens, -1)
+        return logits, selected_flat
 
     def forward(
         self,
@@ -241,11 +245,18 @@ class Gemma4MTPAttention(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.q_proj(hidden_states)
 
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
-
-        q, _ = self.rotary_emb(positions, q, None)
+        q, _, _ = fused_qkv_norm_rope(
+            q,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.q_norm.weight,
+            self.q_norm.weight,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            is_kv_shared_layer=True,
+        )
 
         # Attention reads K/V from the target's cache via KV sharing.
         attn_output = self.attn(q, None, None)
@@ -308,11 +319,13 @@ class Gemma4MTPDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        residual: torch.Tensor | None = None,
+        next_norm_weight: torch.Tensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(residual)
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(residual)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -320,18 +333,32 @@ class Gemma4MTPDecoderLayer(nn.Module):
             **kwargs,
         )
 
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
+        pre_ff, residual = fused_post_attn_add_pre_ff_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            eps=self.post_attention_layernorm.variance_epsilon,
+        )
+        mlp_out = self.mlp(pre_ff)
 
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-
-        hidden_states = hidden_states * self.layer_scalar
-        return hidden_states, None
+        epilogue_out = fused_mlp_ple_epilogue(
+            mlp_out,
+            residual,
+            self.post_feedforward_layernorm.weight,
+            per_layer_input=None,
+            per_layer_input_gate=None,
+            per_layer_projection=None,
+            post_ple_weight=None,
+            layer_scalar=self.layer_scalar,
+            next_norm_weight=next_norm_weight,
+            eps=self.post_feedforward_layernorm.variance_epsilon,
+        )
+        if next_norm_weight is not None:
+            hidden_states, residual = epilogue_out
+        else:
+            hidden_states, residual = epilogue_out, None
+        return hidden_states, residual
 
 
 class Gemma4MultiTokenPredictor(nn.Module):
@@ -424,14 +451,24 @@ class Gemma4MultiTokenPredictor(nn.Module):
         hidden_states, _ = self.pre_projection(combined)
 
         residual = None
-        for layer in self.layers:
+        num_layers = len(self.layers)
+        for idx, layer in enumerate(self.layers):
+            layer_next_norm_w = (
+                self.layers[idx + 1].input_layernorm.weight
+                if idx + 1 < num_layers
+                else self.norm.weight
+            )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                next_norm_weight=layer_next_norm_w,
             )
 
-        draft_hidden_states = self.norm(hidden_states)
+        if residual is None:
+            draft_hidden_states = self.norm(hidden_states)
+        else:
+            draft_hidden_states = hidden_states
 
         backbone_hidden_states, _ = self.post_projection(draft_hidden_states)
         return draft_hidden_states, backbone_hidden_states

@@ -95,15 +95,31 @@ class DiffusionGemmaSelfConditioning(nn.Module):
         self.up_proj = nn.Linear(hidden_size, self_conditioning_size, bias=False)
         self.down_proj = nn.Linear(self_conditioning_size, hidden_size, bias=False)
 
+    def _get_merged_gate_up_weight(self) -> torch.Tensor:
+        gw = self.gate_proj.weight
+        uw = self.up_proj.weight
+        key = (
+            gw._version,
+            uw._version,
+            gw.data_ptr(),
+            uw.data_ptr(),
+            gw.device,
+            gw.dtype,
+        )
+        if getattr(self, "_merged_gate_up_key", None) != key:
+            self._merged_gate_up_w = torch.cat([gw, uw], dim=0)
+            self._merged_gate_up_key = key
+        return self._merged_gate_up_w
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
         soft_embeds: torch.Tensor,
     ) -> torch.Tensor:
         x = self.pre_norm(soft_embeds)
-        sc_signal = self.down_proj(
-            F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x)
-        )
+        gate_up = F.linear(x, self._get_merged_gate_up_weight())
+        gate, up = gate_up.chunk(2, dim=-1)
+        sc_signal = self.down_proj(F.gelu(gate, approximate="tanh") * up)
         return self.post_norm(inputs_embeds + sc_signal)
 
 
@@ -1024,6 +1040,29 @@ class DiffusionGemmaModelState(ModelState):
         # positions. sc_embeds already holds probs @ embed_weight from the prior
         # denoise step, masked to zero by the sampler for slots not denoising
         # this step; only the MLP runs here. CPU metadata -> no GPU syncs.
+        n_dec = len(decode_slots_np)
+        if n_dec == 0:
+            return
+        cl = sc_embeds.shape[1]
+        if n_dec > 1:
+            starts = query_start_loc_np[decode_idx_np]
+            ends = query_start_loc_np[decode_idx_np + 1]
+            start_0 = int(starts[0])
+            end_last = int(ends[-1])
+            if end_last - start_0 == n_dec * cl and bool((ends - starts == cl).all()):
+                slots_t = torch.as_tensor(
+                    decode_slots_np, dtype=torch.long, device=sc_embeds.device
+                )
+                soft_batch = (
+                    sc_embeds.index_select(0, slots_t)
+                    .reshape(n_dec * cl, -1)
+                    .to(inputs_embeds.dtype)
+                )
+                span = slice(start_0, end_last)
+                inputs_embeds[span] = self.model.self_conditioning(
+                    inputs_embeds[span], soft_batch
+                )
+                return
         for slot, idx in zip(decode_slots_np.tolist(), decode_idx_np.tolist()):
             start = int(query_start_loc_np[idx])
             end = int(query_start_loc_np[idx + 1])

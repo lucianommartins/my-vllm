@@ -2432,7 +2432,11 @@ class GPUModelRunner(
                 :num_reqs_padded
             ]
 
-        if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
+        if (
+            logits_indices is not None
+            and self.cache_config.kv_sharing_fast_prefill
+            and max_query_len > 1
+        ):
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.max_logits_per_req = max_num_sampled_tokens
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(

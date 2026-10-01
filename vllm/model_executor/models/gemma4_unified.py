@@ -104,32 +104,25 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
 
     def _factorized_posemb(self, positions_xy: torch.Tensor) -> torch.Tensor:
         clamped_pos = positions_xy.clamp(min=0).long()
-        valid_mask = positions_xy != -1
-
-        pos_embs = torch.zeros(
-            *positions_xy.shape[:-1],
-            self.pos_embedding.shape[-1],
-            device=positions_xy.device,
-            dtype=self.pos_embedding.dtype,
+        return (
+            self.pos_embedding[clamped_pos[..., 0], 0, :]
+            + self.pos_embedding[clamped_pos[..., 1], 1, :]
         )
-        for i in range(2):
-            axis_pe = self.pos_embedding[:, i, :][clamped_pos[..., i]]
-            mask = valid_mask[..., i].unsqueeze(-1).to(axis_pe.dtype)
-            pos_embs = pos_embs + (axis_pe * mask)
-        return pos_embs
 
     def forward(
         self,
         pixel_values: torch.Tensor,
         pixel_position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.patch_ln1(pixel_values.to(self.pos_embedding.dtype))
+        dtype = self.pos_embedding.dtype
+        if pixel_values.dtype != dtype:
+            pixel_values = pixel_values.to(dtype)
+        hidden_states = self.patch_ln1(pixel_values)
         hidden_states, _ = self.patch_dense(hidden_states)
         hidden_states = self.patch_ln2(hidden_states)
 
         pos_embs = self._factorized_posemb(pixel_position_ids)
-        hidden_states = hidden_states + pos_embs
-        hidden_states = self.pos_norm(hidden_states)
+        hidden_states = self.pos_norm(hidden_states + pos_embs)
         return hidden_states
 
 
@@ -361,24 +354,38 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         target_dtype = self.embed_vision.embedding_projection.weight.dtype
 
         per_image_features: list[torch.Tensor] = []
-        for pv, pp in zip(pixel_values, pixel_position_ids, strict=True):
-            pv = pv.unsqueeze(0)
-            pp = pp.unsqueeze(0)
-            embedded = self.vision_embedder(pv, pp)
-            projected = self.embed_vision(embedded.to(target_dtype))
-            padding_mask = (pp.squeeze(0) == -1).all(dim=-1)
-            valid_features = projected.squeeze(0)[~padding_mask]
-            per_image_features.append(valid_features)
+        if isinstance(pixel_values, torch.Tensor) and pixel_values.ndim == 3:
+            embedded = self.vision_embedder(pixel_values, pixel_position_ids)
+            if embedded.dtype != target_dtype:
+                embedded = embedded.to(target_dtype)
+            projected = self.embed_vision(embedded)
+            padding_mask = (pixel_position_ids == -1).all(dim=-1)
+            if pixel_values.shape[0] == 1:
+                return [projected[0][~padding_mask[0]]]
+            return [
+                projected[i][~padding_mask[i]] for i in range(pixel_values.shape[0])
+            ]
+        else:
+            for pv, pp in zip(pixel_values, pixel_position_ids, strict=True):
+                pv = pv.unsqueeze(0)
+                pp = pp.unsqueeze(0)
+                embedded = self.vision_embedder(pv, pp)
+                if embedded.dtype != target_dtype:
+                    embedded = embedded.to(target_dtype)
+                projected = self.embed_vision(embedded)
+                padding_mask = (pp.squeeze(0) == -1).all(dim=-1)
+                valid_features = projected.squeeze(0)[~padding_mask]
+                per_image_features.append(valid_features)
         return per_image_features
 
     def _process_video_input(
         self,
         video_input: Gemma4VideoInputs,
     ) -> list[torch.Tensor]:
-        """Project video frames to LM space, one frame at a time.
+        """Project video frames to LM space in batched chunks.
 
-        Frames are split per video, each frame is embedded + projected,
-        and per-frame valid embeddings are concatenated per video.
+        Frames are split per video, embedded + projected in batches,
+        and per-video valid embeddings are extracted with padding stripped.
         """
         pixel_values = video_input["pixel_values_videos"]
         pixel_position_ids = video_input["pixel_position_ids_videos"]
@@ -395,15 +402,12 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
 
         per_video_embeddings: list[torch.Tensor] = []
         for pv_chunk, pp_chunk in zip(pv_per_video, pp_per_video):
-            frame_embs: list[torch.Tensor] = []
-            for i in range(pv_chunk.shape[0]):
-                pv = pv_chunk[i].unsqueeze(0)
-                pp = pp_chunk[i].unsqueeze(0)
-                embedded = self.vision_embedder(pv, pp)
-                projected = self.embed_vision(embedded.to(target_dtype))
-                padding_mask = (pp.squeeze(0) == -1).all(dim=-1)
-                frame_embs.append(projected.squeeze(0)[~padding_mask])
-            per_video_embeddings.append(torch.cat(frame_embs, dim=0))
+            embedded = self.vision_embedder(pv_chunk, pp_chunk)
+            if embedded.dtype != target_dtype:
+                embedded = embedded.to(target_dtype)
+            projected = self.embed_vision(embedded)
+            padding_mask = (pp_chunk == -1).all(dim=-1)
+            per_video_embeddings.append(projected[~padding_mask])
         return per_video_embeddings
 
     def _process_audio_input(
