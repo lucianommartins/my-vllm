@@ -2134,10 +2134,11 @@ class VllmConfig:
                     "for prompt tokens."
                 )
 
-            logger.warning_once(
-                "--kv-sharing-fast-prefill requires changes on model side for "
-                "correctness and to realize prefill savings."
-            )
+            if self.cache_config.user_specified_kv_sharing_fast_prefill:
+                logger.warning_once(
+                    "--kv-sharing-fast-prefill requires changes on model side for "
+                    "correctness and to realize prefill savings."
+                )
 
         if (
             self.model_config

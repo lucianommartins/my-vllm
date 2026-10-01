@@ -2229,9 +2229,7 @@ class EngineCoreProc(EngineCore):
             cache_config_info=self.vllm_config.cache_config.metrics_info(),
             config_hash=self._config_hash(),
             enable_expert_parallel=parallel_config.enable_expert_parallel,
-            supports_prompt_logprobs=(
-                not self.vllm_config.cache_config.kv_sharing_fast_prefill
-            ),
+            supports_prompt_logprobs=True,
             allow_missing_mm_embeddings=(
                 mm_config is not None and mm_config.allow_missing_mm_embeddings
             ),

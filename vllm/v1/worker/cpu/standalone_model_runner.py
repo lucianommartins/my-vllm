@@ -846,10 +846,36 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
 
         fast_prefill = None
         if self.fast_prefill is not None:
+            needs_prompt_logprobs = False
+            if (
+                batch_req_state.has_prefill
+                and self.prompt_logprobs_worker is not None
+                and (
+                    self.prompt_logprobs_worker.in_progress_prompt_logprobs
+                    or self.prompt_logprobs_worker.token_id_scores
+                )
+            ):
+                in_progress = self.prompt_logprobs_worker.in_progress_prompt_logprobs
+                token_scores = self.prompt_logprobs_worker.token_id_scores
+                needs_prompt_logprobs = any(
+                    req_id in in_progress or req_id in token_scores
+                    for req_id, is_prefill in zip(
+                        req_ids, batch_req_state.is_prefilling_np
+                    )
+                    if is_prefill
+                )
+            num_active_loras = (
+                len(self.lora_state.get_activate_loras(req_ids))
+                if self.lora_config
+                else 0
+            )
             fast_prefill = self.fast_prefill.prepare(
                 logits_indices,
                 cu_num_logits_np,
                 batch_req_state.has_prefill,
+                num_active_loras=num_active_loras,
+                num_tokens=num_tokens,
+                needs_prompt_logprobs=needs_prompt_logprobs,
             )
 
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]

@@ -1497,6 +1497,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_req_state: "BatchReqState",
         batch_desc: BatchExecutionDescriptor,
         num_active_loras: int,
+        allow_cudagraph: bool = True,
     ) -> InputBatch:
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
@@ -1628,6 +1629,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         fast_prefill = None
         if self.fast_prefill is not None:
+            needs_prompt_logprobs = False
+            if (
+                batch_req_state.has_prefill
+                and self.prompt_logprobs_worker is not None
+                and (
+                    self.prompt_logprobs_worker.in_progress_prompt_logprobs
+                    or self.prompt_logprobs_worker.token_id_scores
+                )
+            ):
+                in_progress = self.prompt_logprobs_worker.in_progress_prompt_logprobs
+                token_scores = self.prompt_logprobs_worker.token_id_scores
+                needs_prompt_logprobs = any(
+                    req_id in in_progress or req_id in token_scores
+                    for req_id, is_prefill in zip(
+                        req_ids, batch_req_state.is_prefilling_np
+                    )
+                    if is_prefill
+                )
             fast_prefill = self.fast_prefill.prepare(
                 logits_indices,
                 num_reqs,
@@ -1635,6 +1654,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_req_state.has_prefill,
                 batch_desc,
                 num_active_loras=num_active_loras,
+                num_tokens=num_tokens,
+                needs_prompt_logprobs=needs_prompt_logprobs,
+                allow_cudagraph=allow_cudagraph,
+                allow_host_cu_num_logits=(adaptive_verification is None),
             )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
@@ -1961,7 +1984,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc, num_active_loras
+                scheduler_output,
+                batch_req_state,
+                batch_desc,
+                num_active_loras,
+                allow_cudagraph=not (is_profile or skip_compiled),
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba prefix-cache pre-copy: migrate recurrent state across block

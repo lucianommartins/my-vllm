@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import nullcontext
-from typing import Literal
+from typing import Any, Literal
 from unittest.mock import patch
 
 import pytest
@@ -867,3 +867,228 @@ def test_gemma4_without_fa4_backend(architecture, kv_cache_dtype, expected):
     ):
         Gemma4Config.verify_and_update_config(config)
     assert config.attention_config.backend == AttentionBackendEnum[expected]
+
+
+def test_cache_config_kv_sharing_fast_prefill_tristate():
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    default_cfg = CacheConfig()
+    assert default_cfg.kv_sharing_fast_prefill is False
+    assert default_cfg.user_specified_kv_sharing_fast_prefill is False
+
+    explicit_false = CacheConfig(kv_sharing_fast_prefill=False)
+    assert explicit_false.kv_sharing_fast_prefill is False
+    assert explicit_false.user_specified_kv_sharing_fast_prefill is True
+
+    explicit_true = CacheConfig(kv_sharing_fast_prefill=True)
+    assert explicit_true.kv_sharing_fast_prefill is True
+    assert explicit_true.user_specified_kv_sharing_fast_prefill is True
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    default_args = EngineArgs.from_cli_args(parser.parse_args([]))
+    assert default_args.kv_sharing_fast_prefill is None
+
+    opt_out_args = EngineArgs.from_cli_args(
+        parser.parse_args(["--no-kv-sharing-fast-prefill"])
+    )
+    assert opt_out_args.kv_sharing_fast_prefill is False
+
+
+def _make_gemma4_verify_config(**overrides):
+    from types import SimpleNamespace
+
+    arch_layers = [SimpleNamespace(head_size=16) for _ in range(4)]
+
+    class _ArchConfig:
+        total_num_hidden_layers = 4
+
+        def __getitem__(self, idx):
+            return arch_layers[idx]
+
+    hf_text_config = SimpleNamespace(
+        layer_types=["sliding_attention"] * 4,
+        num_kv_shared_layers=2,
+    )
+    model_config = SimpleNamespace(
+        architecture="Gemma4ForConditionalGeneration",
+        architectures=["Gemma4ForConditionalGeneration"],
+        hf_text_config=hf_text_config,
+        model_arch_config=_ArchConfig(),
+        is_diffusion=False,
+        runner_type="generate",
+        convert_type="none",
+        pooler_config=None,
+    )
+    cache_config = CacheConfig()
+    parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+    attention_config = SimpleNamespace(
+        backend=AttentionBackendEnum.FLASH_ATTN,
+        flash_attn_version=None,
+    )
+    cfg = SimpleNamespace(
+        model_config=model_config,
+        cache_config=cache_config,
+        parallel_config=parallel_config,
+        attention_config=attention_config,
+        speculative_config=None,
+        aux_output_config=SimpleNamespace(enabled=False),
+        lora_config=None,
+    )
+    for key, value in overrides.items():
+        if key in (
+            "model_config",
+            "cache_config",
+            "parallel_config",
+            "attention_config",
+        ) and isinstance(value, dict):
+            for k, v in value.items():
+                setattr(getattr(cfg, key), k, v)
+        elif key == "hf_text_config" and isinstance(value, dict):
+            for k, v in value.items():
+                setattr(hf_text_config, k, v)
+        else:
+            setattr(cfg, key, value)
+    return cfg
+
+
+def test_gemma4_kv_sharing_fast_prefill_auto_enable_and_opt_out(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.config import Gemma4Config
+
+    # Eligible Gemma4 E2B/E4B-like config auto-enables when user did not specify.
+    for arch in (
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
+    ):
+        cfg = _make_gemma4_verify_config(model_config={"architecture": arch})
+        Gemma4Config.verify_and_update_config(cfg)
+        assert cfg.cache_config.kv_sharing_fast_prefill is True
+
+    # Both Hopper (TRITON_FLASH_ATTN) and Blackwell (TRITON_FLASHINFER)
+    # composite backends support kv_sharing_fast_prefill.
+    for backend in (
+        AttentionBackendEnum.TRITON_FLASH_ATTN,
+        AttentionBackendEnum.TRITON_FLASHINFER,
+    ):
+        cfg = _make_gemma4_verify_config(attention_config={"backend": backend})
+        Gemma4Config.verify_and_update_config(cfg)
+        assert cfg.cache_config.kv_sharing_fast_prefill is True, backend
+
+    # Explicit user opt-out (--no-kv-sharing-fast-prefill) is never overridden.
+    opt_out_cfg = _make_gemma4_verify_config(
+        cache_config=CacheConfig(kv_sharing_fast_prefill=False)
+    )
+    Gemma4Config.verify_and_update_config(opt_out_cfg)
+    assert opt_out_cfg.cache_config.kv_sharing_fast_prefill is False
+
+    # num_kv_shared_layers == 0 disables even if user set True, and warns.
+    zero_shared_cfg = _make_gemma4_verify_config(
+        hf_text_config={"num_kv_shared_layers": 0},
+        cache_config=CacheConfig(kv_sharing_fast_prefill=True),
+    )
+    Gemma4Config.verify_and_update_config(zero_shared_cfg)
+    assert zero_shared_cfg.cache_config.kv_sharing_fast_prefill is False
+
+    # Heterogeneous fallback when num_kv_shared_layers == 0 never auto-enables.
+    zero_shared_default = _make_gemma4_verify_config(
+        hf_text_config={"num_kv_shared_layers": 0}
+    )
+    Gemma4Config.verify_and_update_config(zero_shared_default)
+    assert zero_shared_default.cache_config.kv_sharing_fast_prefill is False
+
+    # Negative eligibility checks:
+    disqualifiers = [
+        {"model_config": {"architecture": "EmbeddingGemma2Model"}},
+        {"model_config": {"architecture": "DiffusionGemmaForBlockDiffusion"}},
+        {"model_config": {"is_diffusion": True}},
+        {"model_config": {"runner_type": "pooling"}},
+        {"model_config": {"convert_type": "embed"}},
+        {"model_config": {"pooler_config": object()}},
+        {"speculative_config": object()},
+        {"parallel_config": {"pipeline_parallel_size": 2}},
+        {"parallel_config": {"prefill_context_parallel_size": 2}},
+        {"parallel_config": {"decode_context_parallel_size": 2}},
+        {"aux_output_config": SimpleNamespace(enabled=True)},
+        {"attention_config": {"backend": AttentionBackendEnum.FLEX_ATTENTION}},
+    ]
+    for override in disqualifiers:
+        cfg = _make_gemma4_verify_config(**override)
+        Gemma4Config.verify_and_update_config(cfg)
+        assert cfg.cache_config.kv_sharing_fast_prefill is False, override
+
+    # VLLM_BATCH_INVARIANT=1 prevents auto-enablement.
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_BATCH_INVARIANT", "1")
+        cfg = _make_gemma4_verify_config()
+        Gemma4Config.verify_and_update_config(cfg)
+        assert cfg.cache_config.kv_sharing_fast_prefill is False
+
+    # Standalone CPU + LoRA prevents auto-enablement.
+    with patch.object(
+        current_platform, "uses_standalone_cpu_model_runner", return_value=True
+    ):
+        cfg = _make_gemma4_verify_config(lora_config=object())
+        Gemma4Config.verify_and_update_config(cfg)
+        assert cfg.cache_config.kv_sharing_fast_prefill is False
+
+    # Explicit user --kv-sharing-fast-prefill (True) MUST be force-disabled on
+    # hard architectural/platform disqualifiers (eliminating split-brain).
+    hard_disqualifiers: list[dict[str, Any]] = [
+        {"parallel_config": {"pipeline_parallel_size": 2}},
+        {"parallel_config": {"enable_expert_parallel": True}},
+        {
+            "parallel_config": {"data_parallel_size": 2},
+            "model_config": {"is_moe": True},
+        },
+        {"model_config": {"is_diffusion": True}},
+        {"model_config": {"runner_type": "pooling"}},
+        {
+            "cache_config": CacheConfig(
+                kv_sharing_fast_prefill=True, cache_dtype="turboquant_k8v4"
+            )
+        },
+        {
+            "cache_config": CacheConfig(
+                kv_sharing_fast_prefill=True, cache_dtype="ultraquant_4bit"
+            )
+        },
+        {"attention_config": {"backend": AttentionBackendEnum.FLEX_ATTENTION}},
+    ]
+    for override in hard_disqualifiers:
+        if "cache_config" not in override:
+            override = {
+                **override,
+                "cache_config": CacheConfig(kv_sharing_fast_prefill=True),
+            }
+        cfg = _make_gemma4_verify_config(**override)
+        Gemma4Config.verify_and_update_config(cfg)
+        assert cfg.cache_config.kv_sharing_fast_prefill is False, override
+
+    # Unsupported platform also disables explicit True.
+    with (
+        patch.object(current_platform, "is_cuda_alike", return_value=False),
+        patch.object(current_platform, "is_cpu", return_value=False),
+    ):
+        cfg = _make_gemma4_verify_config(
+            cache_config=CacheConfig(kv_sharing_fast_prefill=True)
+        )
+        Gemma4Config.verify_and_update_config(cfg)
+        assert cfg.cache_config.kv_sharing_fast_prefill is False
+
+    # compile_factors distinguishes kv_sharing_fast_prefill True vs False,
+    # while ignoring user_specified_kv_sharing_fast_prefill.
+    from vllm.config.utils import hash_config
+
+    assert hash_config(CacheConfig()) == hash_config(
+        CacheConfig(kv_sharing_fast_prefill=False)
+    )
+    assert hash_config(CacheConfig(kv_sharing_fast_prefill=False)) != hash_config(
+        CacheConfig(kv_sharing_fast_prefill=True)
+    )

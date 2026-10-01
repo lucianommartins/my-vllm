@@ -978,6 +978,9 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
             **kwargs,
         )
 
+        if num_logits_indices == 0:
+            return torch.zeros_like(self_decoder_hidden_states)
+
         if logits_indices_padded is None:
             logits_indices_padded = torch.arange(
                 positions.size(0),

@@ -4,7 +4,7 @@ import functools
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,6 +19,7 @@ from typing_extensions import runtime_checkable
 
 from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import _layout_from_name
+from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv, round_down
@@ -796,46 +797,74 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
     # query_start_loc: [0, 15, 20, 28]
     # seq_lens:        [41, 31, 40]
 
-    # Find how many decode indices belong to each request
-    # request_ids: [0, 1, 1, 2]
-    request_ids = torch.bucketize(logits_indices, query_start_loc[1:], right=True)
-
-    # Figure out how many tokens are in each request
-    # num_decode_tokens: [1, 2, 1]
-    # Avoid `torch.bincount` here — on CUDA it forces a sync to determine
-    # the output size (even with `minlength`, the kernel must confirm no
-    # value exceeds the bound). `scatter_add_` into a preallocated buffer
-    # is equivalent and stays async.
-    num_decode_tokens = torch.zeros(
-        num_reqs, dtype=request_ids.dtype, device=request_ids.device
-    )
-    num_decode_tokens.scatter_add_(
-        0, request_ids.to(num_decode_tokens.dtype), torch.ones_like(request_ids)
-    )
-
-    # Calculate new query_start_loc with tokens in generation_indices
-    # decode_query_start_loc: [0, 1, 3, 4]
-    decode_query_start_loc = torch.empty(
-        num_reqs + 1, device=query_start_loc.device, dtype=query_start_loc.dtype
-    )
-
-    decode_query_start_loc[:1].fill_(0)  # Avoid sync from scalar assignment.
-    decode_query_start_loc[1:] = torch.cumsum(num_decode_tokens, dim=0)
-
-    # `num_decode_tokens` is a histogram over `logits_indices`, so its total is
-    # just how many there were -- already known as a Python int.
-    total_num_decode_tokens = num_logits_indices
-
-    # Largest per-request logits count.
-    decode_max_query_len = common_attn_metadata.max_logits_per_req
-    assert decode_max_query_len is not None
-
-    if decode_max_query_len == 1 and total_num_decode_tokens == num_reqs:
-        # One logit per request: the offsets are [0, 1, ..., num_reqs].
-        decode_query_start_loc_cpu = torch.arange(
-            num_reqs + 1, dtype=decode_query_start_loc.dtype, device="cpu"
+    # When there are zero logits, all requests have 0 query tokens.
+    # When each request samples a single token, query_start_loc is a unit-step range.
+    decode_max_query_len: int
+    if num_logits_indices == 0:
+        decode_query_start_loc = torch.zeros(
+            num_reqs + 1, device=query_start_loc.device, dtype=query_start_loc.dtype
         )
+        decode_query_start_loc_cpu = torch.zeros(
+            num_reqs + 1, device="cpu", dtype=query_start_loc.dtype
+        )
+        decode_max_query_len = 0
+        total_num_decode_tokens = 0
+    elif (
+        common_attn_metadata.max_logits_per_req == 1 and num_logits_indices == num_reqs
+    ):
+        decode_query_start_loc = torch.arange(
+            0, num_reqs + 1, device=query_start_loc.device, dtype=query_start_loc.dtype
+        )
+        decode_query_start_loc_cpu = torch.arange(
+            0, num_reqs + 1, device="cpu", dtype=query_start_loc.dtype
+        )
+        decode_max_query_len = 1
+        total_num_decode_tokens = num_reqs
+    elif (
+        common_attn_metadata.cu_num_logits_np is not None
+        and len(common_attn_metadata.cu_num_logits_np) >= num_reqs + 1
+    ):
+        # Host cumulative logit offsets are known without a GPU sync (except
+        # adaptive verification, which passes cu_num_logits_np=None).
+        cu_np = np.ascontiguousarray(
+            common_attn_metadata.cu_num_logits_np[: num_reqs + 1]
+        )
+        decode_query_start_loc_cpu = torch.from_numpy(cu_np).to(
+            dtype=query_start_loc.dtype
+        )
+        if query_start_loc.device.type == "cpu":
+            decode_query_start_loc = decode_query_start_loc_cpu
+        else:
+            decode_query_start_loc = async_tensor_h2d(
+                cu_np, device=query_start_loc.device, dtype=query_start_loc.dtype
+            )
+        total_num_decode_tokens = num_logits_indices
+        assert common_attn_metadata.max_logits_per_req is not None
+        decode_max_query_len = common_attn_metadata.max_logits_per_req
     else:
+        # Multiple decode indices per request (e.g. speculative decode)
+        # Find how many decode indices belong to each request.
+        # Avoid `torch.bincount` here — on CUDA it forces a sync to determine
+        # the output size. `scatter_add_` into a preallocated buffer stays async.
+        request_ids = torch.bucketize(logits_indices, query_start_loc[1:], right=True)
+
+        num_decode_tokens = torch.zeros(
+            num_reqs, dtype=request_ids.dtype, device=request_ids.device
+        )
+        num_decode_tokens.scatter_add_(
+            0, request_ids.to(num_decode_tokens.dtype), torch.ones_like(request_ids)
+        )
+
+        decode_query_start_loc = torch.empty(
+            num_reqs + 1, device=query_start_loc.device, dtype=query_start_loc.dtype
+        )
+
+        decode_query_start_loc[:1].fill_(0)  # Avoid sync from scalar assignment.
+        decode_query_start_loc[1:] = torch.cumsum(num_decode_tokens, dim=0)
+
+        total_num_decode_tokens = num_logits_indices
+        assert common_attn_metadata.max_logits_per_req is not None
+        decode_max_query_len = common_attn_metadata.max_logits_per_req
         # TODO fix this sync
         with gpu_sync_allowed():
             decode_query_start_loc_cpu = decode_query_start_loc.cpu()
@@ -850,8 +879,24 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         max_seq_len=common_attn_metadata.max_seq_len,
         block_table_tensor=common_attn_metadata.block_table_tensor,
         slot_mapping=common_attn_metadata.slot_mapping,
-        causal=True,
+        causal=common_attn_metadata.causal,
+        logits_cg_mode=common_attn_metadata.logits_cg_mode,
+        encoder_seq_lens=common_attn_metadata.encoder_seq_lens,
+        encoder_seq_lens_cpu=common_attn_metadata.encoder_seq_lens_cpu,
+        dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+        dcp_local_seq_lens_cpu_upper_bound=(
+            common_attn_metadata.dcp_local_seq_lens_cpu_upper_bound
+        ),
+        positions=(
+            common_attn_metadata.positions[logits_indices]
+            if common_attn_metadata.positions is not None
+            else None
+        ),
+        is_prefilling=common_attn_metadata.is_prefilling,
         seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
+        req_idx=common_attn_metadata.req_idx,
+        mm_req_doc_ranges=None,
+        rswa_prefix_lens=common_attn_metadata.rswa_prefix_lens,
     )
     return common_attn_metadata
 
@@ -1075,8 +1120,124 @@ def reshape_attn_output_for_spec_decode(attn_output: torch.Tensor) -> torch.Tens
 class KVSharingFastPrefillMetadata(Protocol):
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
+    logits_cg_mode: CUDAGraphMode | None = None
 
 
+@dataclass
+class _EmptyFastPrefillAttentionMetadata(
+    AttentionMetadata, KVSharingFastPrefillMetadata
+):
+    logits_indices_padded: torch.Tensor | None = None
+    num_logits_indices: int | None = 0
+    logits_cg_mode: CUDAGraphMode | None = CUDAGraphMode.NONE
+
+
+def _compact_zero_logit_reqs(
+    fast_meta: CommonAttentionMetadata,
+) -> CommonAttentionMetadata:
+    """Drop requests with 0 query tokens so attention backends never inspect
+    unassigned block-table rows for empty queries."""
+    q_lens_cpu = fast_meta.query_start_loc_cpu[1:] - fast_meta.query_start_loc_cpu[:-1]
+    if q_lens_cpu.numel() == 0 or int(q_lens_cpu.min().item()) > 0:
+        return fast_meta
+
+    keep_cpu = q_lens_cpu > 0
+    idx_cpu = torch.nonzero(keep_cpu, as_tuple=False).squeeze(-1)
+    idx_np = idx_cpu.numpy()
+    num_active_reqs = int(idx_cpu.numel())
+    active_q_lens_cpu = q_lens_cpu[idx_cpu]
+    active_qsl_cpu = torch.empty(
+        num_active_reqs + 1,
+        dtype=fast_meta.query_start_loc_cpu.dtype,
+        device="cpu",
+    )
+    active_qsl_cpu[0] = 0
+    torch.cumsum(active_q_lens_cpu, dim=0, out=active_qsl_cpu[1:])
+
+    device = fast_meta.query_start_loc.device
+    if device.type == "cpu":
+        active_qsl_gpu = active_qsl_cpu
+        idx_gpu = idx_cpu
+    else:
+        active_qsl_gpu = async_tensor_h2d(
+            active_qsl_cpu.numpy(),
+            device=device,
+            dtype=active_qsl_cpu.dtype,
+        )
+        idx_gpu = async_tensor_h2d(
+            idx_cpu,
+            device=device,
+            dtype=torch.int64,
+        )
+
+    def _slice_device(t: torch.Tensor | None) -> torch.Tensor | None:
+        if t is None:
+            return None
+        return t[idx_cpu if t.device.type == "cpu" else idx_gpu]
+
+    causal = fast_meta.causal
+    if (
+        isinstance(causal, torch.Tensor)
+        and causal.ndim >= 1
+        and causal.shape[0] >= fast_meta.num_reqs
+    ):
+        causal = causal[idx_cpu if causal.device.type == "cpu" else idx_gpu]
+
+    return replace(
+        fast_meta,
+        query_start_loc=active_qsl_gpu,
+        query_start_loc_cpu=active_qsl_cpu,
+        seq_lens=fast_meta.seq_lens[idx_gpu],
+        num_reqs=num_active_reqs,
+        block_table_tensor=fast_meta.block_table_tensor[idx_gpu],
+        causal=causal,
+        encoder_seq_lens=_slice_device(fast_meta.encoder_seq_lens),
+        encoder_seq_lens_cpu=(
+            fast_meta.encoder_seq_lens_cpu[idx_np]
+            if fast_meta.encoder_seq_lens_cpu is not None
+            else None
+        ),
+        dcp_local_seq_lens=_slice_device(fast_meta.dcp_local_seq_lens),
+        dcp_local_seq_lens_cpu_upper_bound=(
+            fast_meta.dcp_local_seq_lens_cpu_upper_bound[idx_cpu]
+            if fast_meta.dcp_local_seq_lens_cpu_upper_bound is not None
+            else None
+        ),
+        is_prefilling=_slice_device(fast_meta.is_prefilling),
+        seq_lens_cpu_upper_bound=(
+            fast_meta.seq_lens_cpu_upper_bound[idx_cpu]
+            if fast_meta.seq_lens_cpu_upper_bound is not None
+            else None
+        ),
+        req_idx=(fast_meta.req_idx[idx_np] if fast_meta.req_idx is not None else None),
+        rswa_prefix_lens=_slice_device(fast_meta.rswa_prefix_lens),
+        _num_computed_tokens_cache=None,
+        _token_to_req_indices_cache=None,
+    )
+
+
+@functools.lru_cache
+def _get_fast_prefill_metadata_cls(metadata_cls: type) -> type:
+    field_names = tuple(f.name for f in fields(metadata_cls))
+
+    class KVSharingFastPrefillAttentionMetadata(
+        metadata_cls,  # type: ignore
+        KVSharingFastPrefillMetadata,
+    ):
+        def __init__(self, metadata, common_attn_metadata):
+            for name in field_names:
+                setattr(self, name, getattr(metadata, name))
+            self.logits_indices_padded = common_attn_metadata.logits_indices_padded
+            self.num_logits_indices = common_attn_metadata.num_logits_indices
+            self.logits_cg_mode = common_attn_metadata.logits_cg_mode
+            self._attention_backend_variant = getattr(
+                metadata, "_attention_backend_variant", 0
+            )
+
+    return KVSharingFastPrefillAttentionMetadata
+
+
+@functools.lru_cache
 def create_fast_prefill_custom_backend(
     prefix: str,
     underlying_attn_backend: type[AttentionBackend],
@@ -1090,37 +1251,37 @@ def create_fast_prefill_custom_backend(
             common_attn_metadata: CommonAttentionMetadata,
             fast_build: bool = False,
         ) -> AttentionMetadata:
+            if (
+                common_attn_metadata.logits_indices_padded is not None
+                and common_attn_metadata.num_logits_indices == 0
+            ):
+                return _EmptyFastPrefillAttentionMetadata(
+                    logits_indices_padded=common_attn_metadata.logits_indices_padded,
+                    num_logits_indices=0,
+                    logits_cg_mode=common_attn_metadata.logits_cg_mode,
+                )
             new_common_attn_metadata = (
                 make_kv_sharing_fast_prefill_common_attn_metadata(common_attn_metadata)
             )
+            if (
+                common_attn_metadata.logits_indices_padded is not None
+                and (common_attn_metadata.num_logits_indices or 0) > 0
+            ):
+                new_common_attn_metadata = _compact_zero_logit_reqs(
+                    new_common_attn_metadata
+                )
             metadata = super().build(
                 common_prefix_len, new_common_attn_metadata, fast_build
             )
-
-            class KVSharingFastPrefillAttentionMetadata(
-                metadata.__class__,  #  type: ignore
-                KVSharingFastPrefillMetadata,
-            ):
-                def __init__(self, metadata, common_attn_metadata):
-                    # Shallow copy all fields in metadata cls
-                    for _field in fields(metadata.__class__):
-                        setattr(self, _field.name, getattr(metadata, _field.name))
-
-                    self.logits_indices_padded = (
-                        common_attn_metadata.logits_indices_padded
-                    )
-                    self.num_logits_indices = common_attn_metadata.num_logits_indices
-                    self._attention_backend_variant = getattr(
-                        metadata, "_attention_backend_variant", 0
-                    )
-
-            return KVSharingFastPrefillAttentionMetadata(metadata, common_attn_metadata)
+            wrapper_cls = _get_fast_prefill_metadata_cls(metadata.__class__)
+            return wrapper_cls(metadata, common_attn_metadata)
 
     attn_backend = subclass_attention_backend(
         name_prefix=prefix,
         attention_backend_cls=underlying_attn_backend,
         builder_cls=FastPrefillAttentionBuilder,
     )
+    attn_backend._underlying_attn_backend = underlying_attn_backend  # type: ignore[attr-defined]
 
     return attn_backend
 

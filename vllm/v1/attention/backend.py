@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
 import numpy as np
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic64Sym,
     kFp8Dynamic128Sym,
@@ -440,6 +441,8 @@ class CommonAttentionMetadata:
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
     max_logits_per_req: int | None = None
+    logits_cg_mode: CUDAGraphMode | None = None
+    cu_num_logits_np: np.ndarray | None = None
 
     # Needed by CrossAttentionBuilder
     encoder_seq_lens: torch.Tensor | None = None
@@ -548,6 +551,12 @@ class CommonAttentionMetadata:
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
             max_logits_per_req=self.max_logits_per_req,
+            logits_cg_mode=self.logits_cg_mode,
+            cu_num_logits_np=(
+                self.cu_num_logits_np[: num_actual_reqs + 1]
+                if self.cu_num_logits_np is not None
+                else None
+            ),
             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),

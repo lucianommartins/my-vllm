@@ -13,6 +13,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -46,6 +47,8 @@ class FastPrefillBatchMetadata:
     logits_indices_padded: torch.Tensor
     num_logits_indices: int
     max_logits_per_req: int
+    logits_cg_mode: CUDAGraphMode = CUDAGraphMode.NONE
+    cu_num_logits_np: np.ndarray | None = None
 
 
 class FastPrefillHelper:
@@ -56,17 +59,35 @@ class FastPrefillHelper:
         logits_indices: torch.Tensor,
         cu_num_logits_np: np.ndarray,
         has_prefill: bool,
+        num_active_loras: int = 0,
+        num_tokens: int | None = None,
+        needs_prompt_logprobs: bool = False,
+        allow_cudagraph: bool = True,
+        allow_host_cu_num_logits: bool = True,
     ) -> FastPrefillBatchMetadata | None:
-        if not has_prefill:
+        del allow_cudagraph
+        if not has_prefill or num_active_loras > 0 or needs_prompt_logprobs:
             return None
 
         num_logits = logits_indices.shape[0]
-        assert num_logits > 0
+        if num_tokens is not None and num_logits >= num_tokens:
+            return None
+        host_cu_num_logits = cu_num_logits_np if allow_host_cu_num_logits else None
+        if num_logits == 0:
+            return FastPrefillBatchMetadata(
+                logits_indices_padded=logits_indices[:0],
+                num_logits_indices=0,
+                max_logits_per_req=0,
+                logits_cg_mode=CUDAGraphMode.NONE,
+                cu_num_logits_np=host_cu_num_logits,
+            )
         return FastPrefillBatchMetadata(
             logits_indices_padded=logits_indices,
             num_logits_indices=num_logits,
             # Largest per-request logits count, known on the host.
             max_logits_per_req=int(np.diff(cu_num_logits_np).max()),
+            logits_cg_mode=CUDAGraphMode.NONE,
+            cu_num_logits_np=host_cu_num_logits,
         )
 
 
@@ -177,7 +198,11 @@ def init_attn_backend(
             key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
             if key not in group_map:
                 group_map[key] = AttentionGroup(
-                    attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
+                    attn_backend,
+                    [layer_name],
+                    layer_kv_cache_spec,
+                    kv_cache_group_id,
+                    num_heads_q=num_heads_q,
                 )
                 group_order.append(key)
             else:
@@ -275,6 +300,7 @@ def build_attn_metadata(
     # Mamba groups with the same spec and builder differ only in their state
     # indices, so later groups re-gather those from the first group's metadata.
     cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    same_group_decode_cache: dict[tuple[Any, ...], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
@@ -296,6 +322,8 @@ def build_attn_metadata(
                 logits_indices_padded=fast_prefill.logits_indices_padded,
                 num_logits_indices=fast_prefill.num_logits_indices,
                 max_logits_per_req=fast_prefill.max_logits_per_req,
+                logits_cg_mode=fast_prefill.logits_cg_mode,
+                cu_num_logits_np=fast_prefill.cu_num_logits_np,
             )
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc,
@@ -325,10 +353,42 @@ def build_attn_metadata(
                 attn_group.kv_cache_spec, MambaSpec
             ):
                 reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+            same_group_key = None
+            if (
+                reuse_key is None
+                and fast_prefill is None
+                and model_specific_attn_metadata is None
+                and max_query_len == 1
+            ):
+                underlying_backend = getattr(
+                    attn_group.backend,
+                    "_underlying_attn_backend",
+                    attn_group.backend,
+                )
+                same_group_key = (
+                    0,
+                    i,
+                    underlying_backend.full_cls_name(),
+                    attn_group.kv_cache_spec,
+                    attn_group.num_heads_q,
+                    attn_group.kernel_block_size,
+                    attn_group.kernel_block_stride,
+                )
+            cached_same_group = (
+                same_group_decode_cache.get(same_group_key)
+                if same_group_key is not None
+                else None
+            )
             if reuse_key in cached_metadata:
                 metadata = attn_metadata_builder.update_block_table(
                     cached_metadata[reuse_key], block_table, slot_mapping
                 )
+            elif (
+                cached_same_group is not None
+                and getattr(cached_same_group, "k_scale", None) is None
+                and getattr(cached_same_group, "v_scale", None) is None
+            ):
+                metadata = cached_same_group
             else:
                 attn_metadata_extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
@@ -343,6 +403,13 @@ def build_attn_metadata(
                 )
             if reuse_key is not None and reuse_key not in cached_metadata:
                 cached_metadata[reuse_key] = metadata
+            if (
+                same_group_key is not None
+                and same_group_key not in same_group_decode_cache
+                and getattr(metadata, "k_scale", None) is None
+                and getattr(metadata, "v_scale", None) is None
+            ):
+                same_group_decode_cache[same_group_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache

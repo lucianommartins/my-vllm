@@ -691,6 +691,400 @@ def test_fast_prefill_skips_lora_batches():
             assert metadata.max_logits_per_req == 1
 
 
+def test_fast_prefill_helper_guards_and_logits_cg_mode():
+    manager = MagicMock(device="cpu", use_breakable_cg=False)
+    helper = FastPrefillHelper(manager, max_num_tokens=8)
+    base_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=8, num_reqs=2
+    )
+    logits_indices = torch.tensor([3, 7], dtype=torch.int32)
+    cu_num_logits = np.array([0, 1, 2], dtype=np.int32)
+
+    # 1. num_logits >= num_tokens skips fast prefill (e.g. 1-token prefill/extend).
+    assert (
+        helper.prepare(
+            logits_indices,
+            num_reqs=2,
+            cu_num_logits_np=cu_num_logits,
+            has_prefill=True,
+            batch_desc=base_desc,
+            num_tokens=2,
+        )
+        is None
+    )
+
+    # 2. needs_prompt_logprobs skips fast prefill.
+    assert (
+        helper.prepare(
+            logits_indices,
+            num_reqs=2,
+            cu_num_logits_np=cu_num_logits,
+            has_prefill=True,
+            batch_desc=base_desc,
+            needs_prompt_logprobs=True,
+        )
+        is None
+    )
+
+    # 3. use_breakable_cg=True skips fast prefill.
+    manager.use_breakable_cg = True
+    assert (
+        helper.prepare(
+            logits_indices,
+            num_reqs=2,
+            cu_num_logits_np=cu_num_logits,
+            has_prefill=True,
+            batch_desc=base_desc,
+        )
+        is None
+    )
+    manager.use_breakable_cg = False
+
+    # 4. num_logits == 0 returns empty metadata cleanly without crashing.
+    empty_meta = helper.prepare(
+        torch.empty(0, dtype=torch.int32),
+        num_reqs=2,
+        cu_num_logits_np=np.array([0, 0, 0], dtype=np.int32),
+        has_prefill=True,
+        batch_desc=base_desc,
+    )
+    assert empty_meta is not None
+    assert empty_meta.num_logits_indices == 0
+    assert empty_meta.logits_indices_padded.numel() == 0
+    assert empty_meta.max_logits_per_req == 0
+    assert empty_meta.logits_cg_mode == CUDAGraphMode.NONE
+
+    # 5. Captured PIECEWISE size sets logits_cg_mode=PIECEWISE and pads.
+    manager.dispatch.return_value = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=4, num_reqs=None
+    )
+    pw_meta = helper.prepare(
+        logits_indices,
+        num_reqs=2,
+        cu_num_logits_np=cu_num_logits,
+        has_prefill=True,
+        batch_desc=base_desc,
+        num_tokens=8,
+        allow_cudagraph=True,
+    )
+    assert pw_meta is not None
+    assert pw_meta.logits_cg_mode == CUDAGraphMode.PIECEWISE
+    assert pw_meta.logits_indices_padded.shape[0] == 4
+
+    # 6. allow_cudagraph=False or non-PIECEWISE dispatch keeps unpadded NONE mode.
+    eager_meta = helper.prepare(
+        logits_indices,
+        num_reqs=2,
+        cu_num_logits_np=cu_num_logits,
+        has_prefill=True,
+        batch_desc=base_desc,
+        num_tokens=8,
+        allow_cudagraph=False,
+    )
+    assert eager_meta is not None
+    assert eager_meta.logits_cg_mode == CUDAGraphMode.NONE
+    assert eager_meta.logits_indices_padded.shape[0] == 2
+
+    manager.dispatch.return_value = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE, num_tokens=2, num_reqs=2
+    )
+    uncaptured_meta = helper.prepare(
+        logits_indices,
+        num_reqs=2,
+        cu_num_logits_np=cu_num_logits,
+        has_prefill=True,
+        batch_desc=base_desc,
+        num_tokens=8,
+        allow_cudagraph=True,
+    )
+    assert uncaptured_meta is not None
+    assert uncaptured_meta.logits_cg_mode == CUDAGraphMode.NONE
+    assert uncaptured_meta.logits_indices_padded.shape[0] == 2
+
+    # Oversized dispatch (> max_num_tokens) must also stay NONE and unpadded.
+    manager.dispatch.return_value = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=16, num_reqs=None
+    )
+    oversized_meta = helper.prepare(
+        logits_indices,
+        num_reqs=2,
+        cu_num_logits_np=cu_num_logits,
+        has_prefill=True,
+        batch_desc=base_desc,
+        num_tokens=8,
+        allow_cudagraph=True,
+    )
+    assert oversized_meta is not None
+    assert oversized_meta.logits_cg_mode == CUDAGraphMode.NONE
+    assert oversized_meta.logits_indices_padded.shape[0] == 2
+
+    # 7. allow_host_cu_num_logits toggles cu_num_logits_np propagation.
+    assert pw_meta.cu_num_logits_np is not None
+    assert pw_meta.cu_num_logits_np.tolist() == [0, 1, 2]
+    no_host_cu_meta = helper.prepare(
+        logits_indices,
+        num_reqs=2,
+        cu_num_logits_np=cu_num_logits,
+        has_prefill=True,
+        batch_desc=base_desc,
+        num_tokens=8,
+        allow_host_cu_num_logits=False,
+    )
+    assert no_host_cu_meta is not None
+    assert no_host_cu_meta.cu_num_logits_np is None
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_build_attn_metadata_same_group_decode_cache(for_capture: bool):
+    from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+    from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
+
+    class _BaseBackend(AttentionBackend):
+        @staticmethod
+        def get_name() -> str:
+            return "BASE"
+
+        @staticmethod
+        def get_impl_cls():
+            raise NotImplementedError
+
+        @staticmethod
+        def get_builder_cls():
+            return MagicMock
+
+    class _OtherBackend(AttentionBackend):
+        @staticmethod
+        def get_name() -> str:
+            return "OTHER"
+
+        @staticmethod
+        def get_impl_cls():
+            raise NotImplementedError
+
+        @staticmethod
+        def get_builder_cls():
+            return MagicMock
+
+    fast_backend = create_fast_prefill_custom_backend("FastPrefill", _BaseBackend)
+    spec = new_kv_cache_spec(block_size=16)
+    kv_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[new_kv_cache_group(["l0", "l1"], spec)],
+    )
+
+    def _make_group(
+        backend,
+        layers,
+        num_heads_q=8,
+        kernel_block_size=None,
+        kernel_block_stride=0,
+        build_extra=None,
+    ):
+        builder = MagicMock()
+        builder.supports_update_block_table = False
+        builder.kv_sharing_workspace = None
+
+        def _make_built(*a, **k):
+            obj = SimpleNamespace(layer=layers[0])
+            if build_extra:
+                for ek, ev in build_extra.items():
+                    setattr(obj, ek, ev)
+            return obj
+
+        builder.build.side_effect = _make_built
+        builder.build_for_cudagraph_capture.side_effect = lambda *a, **k: (
+            SimpleNamespace(layer=layers[0], capture=True, **(build_extra or {}))
+        )
+        group = AttentionGroup(
+            backend=backend,
+            layer_names=layers,
+            kv_cache_spec=spec,
+            kv_cache_group_id=0,
+            kernel_block_size=kernel_block_size,
+            kernel_block_stride=kernel_block_stride,
+            num_heads_q=num_heads_q,
+        )
+        if kernel_block_size is not None:
+            group.kernel_block_table = torch.zeros((1, 1, 4), dtype=torch.int32)
+            group.kernel_block_offsets = torch.arange(2, dtype=torch.int32)
+        group.metadata_builders = [builder]
+        return group, builder
+
+    g0, b0 = _make_group(_BaseBackend, ["l0"], num_heads_q=8, kernel_block_size=None)
+    g1, b1 = _make_group(fast_backend, ["l1"], num_heads_q=8, kernel_block_size=None)
+
+    qsl = torch.tensor([0, 1], dtype=torch.int32)
+    seq_lens = torch.tensor([4], dtype=torch.int32)
+    block_tables = [torch.zeros((1, 2), dtype=torch.int32)]
+    slot_mappings = torch.zeros((1, 1), dtype=torch.int64)
+
+    # When fast_prefill is None, g1 reuses g0's metadata in BOTH capture and replay!
+    meta = attn_utils.build_attn_metadata(
+        attn_groups=[[g0, g1]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=qsl,
+        query_start_loc_cpu=qsl,
+        max_query_len=1,
+        seq_lens=seq_lens,
+        max_seq_len=4,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_config,
+        for_cudagraph_capture=for_capture,
+        fast_prefill=None,
+    )
+    assert meta["l0"] is meta["l1"]
+    if for_capture:
+        assert b0.build_for_cudagraph_capture.call_count == 1
+        assert b1.build_for_cudagraph_capture.call_count == 0
+    else:
+        assert b0.build.call_count == 1
+        assert b1.build.call_count == 0
+
+    # Differing num_heads_q, kernel_block_size, or backend must NOT share.
+    g_diff_heads, b_diff_heads = _make_group(
+        fast_backend, ["l1"], num_heads_q=16, kernel_block_size=None
+    )
+    b0.build.reset_mock()
+    b0.build_for_cudagraph_capture.reset_mock()
+    meta_diff = attn_utils.build_attn_metadata(
+        attn_groups=[[g0, g_diff_heads]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=qsl,
+        query_start_loc_cpu=qsl,
+        max_query_len=1,
+        seq_lens=seq_lens,
+        max_seq_len=4,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_config,
+        for_cudagraph_capture=for_capture,
+        fast_prefill=None,
+    )
+    assert meta_diff["l0"] is not meta_diff["l1"]
+    if for_capture:
+        assert b_diff_heads.build_for_cudagraph_capture.call_count == 1
+    else:
+        assert b_diff_heads.build.call_count == 1
+
+    # Differing underlying backend must NOT share.
+    g_diff_backend, b_diff_backend = _make_group(
+        _OtherBackend, ["l1"], num_heads_q=8, kernel_block_size=None
+    )
+    meta_diff_backend = attn_utils.build_attn_metadata(
+        attn_groups=[[g0, g_diff_backend]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=qsl,
+        query_start_loc_cpu=qsl,
+        max_query_len=1,
+        seq_lens=seq_lens,
+        max_seq_len=4,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_config,
+        for_cudagraph_capture=for_capture,
+        fast_prefill=None,
+    )
+    assert meta_diff_backend["l0"] is not meta_diff_backend["l1"]
+
+    # When fast_prefill is armed, g1 builds its own metadata and sees logits_cg_mode.
+    if not for_capture:
+        b0.build.reset_mock()
+        b1.build.reset_mock()
+        fp = FastPrefillBatchMetadata(
+            logits_indices_padded=torch.tensor([0], dtype=torch.int32),
+            num_logits_indices=1,
+            max_logits_per_req=1,
+            logits_cg_mode=CUDAGraphMode.PIECEWISE,
+        )
+        meta_fp = attn_utils.build_attn_metadata(
+            attn_groups=[[g0, g1]],
+            num_reqs=1,
+            num_tokens=4,
+            query_start_loc_gpu=torch.tensor([0, 4], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+            max_query_len=4,
+            seq_lens=seq_lens,
+            max_seq_len=4,
+            block_tables=block_tables,
+            slot_mappings=torch.zeros((1, 4), dtype=torch.int64),
+            kv_cache_config=kv_config,
+            fast_prefill=fp,
+        )
+        assert meta_fp["l0"] is not meta_fp["l1"]
+        assert b0.build.call_count == 1
+        assert b1.build.call_count == 1
+        passed_common = b1.build.call_args.args[1]
+        assert passed_common.logits_cg_mode == CUDAGraphMode.PIECEWISE
+
+    # Differing kernel_block_stride must NOT share.
+    g_diff_stride, _ = _make_group(
+        fast_backend,
+        ["l1"],
+        num_heads_q=8,
+        kernel_block_size=None,
+        kernel_block_stride=2,
+    )
+    meta_diff_stride = attn_utils.build_attn_metadata(
+        attn_groups=[[g0, g_diff_stride]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=qsl,
+        query_start_loc_cpu=qsl,
+        max_query_len=1,
+        seq_lens=seq_lens,
+        max_seq_len=4,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_config,
+        for_cudagraph_capture=for_capture,
+        fast_prefill=None,
+    )
+    assert meta_diff_stride["l0"] is not meta_diff_stride["l1"]
+
+    # max_query_len > 1 must NOT share even when fast_prefill is None.
+    meta_prefill_fallback = attn_utils.build_attn_metadata(
+        attn_groups=[[g0, g1]],
+        num_reqs=1,
+        num_tokens=3,
+        query_start_loc_gpu=torch.tensor([0, 3], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 3], dtype=torch.int32),
+        max_query_len=3,
+        seq_lens=seq_lens,
+        max_seq_len=4,
+        block_tables=block_tables,
+        slot_mappings=torch.zeros((1, 3), dtype=torch.int64),
+        kv_cache_config=kv_config,
+        for_cudagraph_capture=for_capture,
+        fast_prefill=None,
+    )
+    assert meta_prefill_fallback["l0"] is not meta_prefill_fallback["l1"]
+
+    # Metadata with per-layer k_scale/v_scale (ROCm FP8 shuffle) must NOT share.
+    g0_fp8, _ = _make_group(_BaseBackend, ["l0"], build_extra={"k_scale": {"l0": 1.0}})
+    g1_fp8, _ = _make_group(fast_backend, ["l1"], build_extra={"k_scale": {"l1": 1.0}})
+    meta_fp8 = attn_utils.build_attn_metadata(
+        attn_groups=[[g0_fp8, g1_fp8]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=qsl,
+        query_start_loc_cpu=qsl,
+        max_query_len=1,
+        seq_lens=seq_lens,
+        max_seq_len=4,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_config,
+        for_cudagraph_capture=for_capture,
+        fast_prefill=None,
+    )
+    assert meta_fp8["l0"] is not meta_fp8["l1"]
+
+
 class _FakeSharedHostRegion:
     def __init__(self) -> None:
         self.cleanup_calls = 0

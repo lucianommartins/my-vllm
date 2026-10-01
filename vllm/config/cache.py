@@ -363,14 +363,18 @@ class CacheConfig:
     """Token granularity at which prefix-cache hits land: `hash_block_size`
     with partial hash hits, otherwise the scheduler block size."""
 
-    kv_sharing_fast_prefill: bool = False
+    kv_sharing_fast_prefill: bool = Field(default=None)  # type: ignore[assignment]
     """In some KV sharing setups, e.g. YOCO (https://arxiv.org/abs/2405.05254),
     some layers can skip tokens corresponding to prefill. This flag enables
     attention metadata for eligible layers to be overridden with metadata
-    necessary for implementing this optimization in some models (e.g. Gemma3n).
-    In Model Runner V2, batches containing LoRA requests use regular prefill;
-    batches without LoRA requests can still use fast prefill.
+    necessary for implementing this optimization in some models (e.g. Gemma3n,
+    Gemma4). In Model Runner V2, batches containing LoRA or prompt-logprobs
+    requests dynamically use regular prefill; other batches can still use
+    fast prefill.
     """
+    user_specified_kv_sharing_fast_prefill: bool = field(default=False, init=False)
+    """Whether kv_sharing_fast_prefill was explicitly provided.
+    Derived automatically."""
 
     swa_bounded_replay: bool = True
     """Keep the sliding-window KV of models that support it (DeepSeek-V4.1)
@@ -439,6 +443,7 @@ class CacheConfig:
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
+            "user_specified_kv_sharing_fast_prefill",
             "_block_size_resolved",
             "_extensible_kv_cache_resolved",
             # Post-init/derived counters
@@ -450,7 +455,6 @@ class CacheConfig:
             "hash_block_size",
             "cache_hit_alignment_tokens",
             # Feature toggles not impacting compiled graph shape
-            "kv_sharing_fast_prefill",
             "swa_bounded_replay",
             # Runtime memory allocation strategy, not graph structure.
             "enable_extensible_kv_cache",
@@ -469,7 +473,12 @@ class CacheConfig:
     _extensible_kv_cache_resolved: bool = field(default=False, init=False)
     """Set once `enable_extensible_kv_cache` has been settled for the model."""
 
-    @field_validator("block_size", "enable_extensible_kv_cache", mode="wrap")
+    @field_validator(
+        "block_size",
+        "enable_extensible_kv_cache",
+        "kv_sharing_fast_prefill",
+        mode="wrap",
+    )
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
         if value is None:
@@ -487,6 +496,10 @@ class CacheConfig:
             self.block_size = self.DEFAULT_BLOCK_SIZE
         else:
             self.user_specified_block_size = True
+        if self.kv_sharing_fast_prefill is None:
+            self.kv_sharing_fast_prefill = False
+        else:
+            self.user_specified_kv_sharing_fast_prefill = True
         return self
 
     @property

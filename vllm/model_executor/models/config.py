@@ -567,6 +567,134 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         )
 
 
+def _gemma4_supports_kv_sharing_fast_prefill_backend(backend: object) -> bool:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    return backend in {
+        AttentionBackendEnum.FLASH_ATTN,
+        AttentionBackendEnum.FLASHINFER,
+        AttentionBackendEnum.TRITON_ATTN,
+        AttentionBackendEnum.TRITON_FLASH_ATTN,
+        AttentionBackendEnum.TRITON_FLASHINFER,
+        AttentionBackendEnum.CPU_ATTN,
+        AttentionBackendEnum.ROCM_ATTN,
+        AttentionBackendEnum.ROCM_AITER_FA,
+        AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN,
+        AttentionBackendEnum.ROCM_RDNA_ATTN,
+    }
+
+
+def _get_gemma4_fast_prefill_disqualifier(
+    vllm_config: "VllmConfig",
+) -> str | None:
+    """Return a reason string if kv_sharing_fast_prefill is architecturally or
+    platform-unsupported for this Gemma4 config, else None."""
+    cache_config = getattr(vllm_config, "cache_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    if cache_config is None or model_config is None:
+        return "missing cache_config or model_config"
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    num_kv_shared_layers = getattr(hf_text_config, "num_kv_shared_layers", 0) or 0
+    if num_kv_shared_layers <= 0:
+        return (
+            "model has no KV-shared layers "
+            f"(num_kv_shared_layers={num_kv_shared_layers})"
+        )
+
+    arch = getattr(model_config, "architecture", None)
+    if (
+        not isinstance(arch, str)
+        or MODELS_CONFIG_MAP.get(arch) is not Gemma4Config
+        or arch
+        not in (
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        )
+        or getattr(model_config, "is_diffusion", False)
+    ):
+        return f"architecture {arch!r} is not an eligible Gemma4 generation model"
+
+    if (
+        getattr(model_config, "runner_type", "generate") != "generate"
+        or getattr(model_config, "convert_type", "none") != "none"
+        or getattr(model_config, "pooler_config", None) is not None
+    ):
+        return "non-generation runner/convert/pooler mode"
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if (
+        parallel_config is None
+        or parallel_config.pipeline_parallel_size != 1
+        or parallel_config.prefill_context_parallel_size != 1
+        or parallel_config.decode_context_parallel_size != 1
+        or getattr(parallel_config, "enable_expert_parallel", False)
+        or getattr(parallel_config, "use_sequence_parallel_moe", False)
+        or (
+            getattr(parallel_config, "data_parallel_size", 1) > 1
+            and getattr(model_config, "is_moe", False)
+        )
+    ):
+        return "incompatible parallel configuration"
+
+    if getattr(getattr(vllm_config, "aux_output_config", None), "enabled", False):
+        return "aux_output_config is enabled"
+
+    if not (current_platform.is_cuda_alike() or current_platform.is_cpu()):
+        return f"unsupported platform {current_platform.device_name}"
+
+    if str(getattr(cache_config, "cache_dtype", "")).startswith(
+        ("turboquant_", "ultraquant_")
+    ):
+        return "TurboQuant/UltraQuant KV cache is enabled"
+
+    attention_config = getattr(vllm_config, "attention_config", None)
+    backend = getattr(attention_config, "backend", None)
+    if backend is not None and not _gemma4_supports_kv_sharing_fast_prefill_backend(
+        backend
+    ):
+        return f"attention backend {backend} is unsupported"
+
+    return None
+
+
+def _maybe_enable_gemma4_kv_sharing_fast_prefill(
+    vllm_config: "VllmConfig",
+) -> None:
+    cache_config = getattr(vllm_config, "cache_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    if cache_config is None or model_config is None:
+        return
+
+    disqualifier = _get_gemma4_fast_prefill_disqualifier(vllm_config)
+    if disqualifier is not None:
+        if getattr(cache_config, "kv_sharing_fast_prefill", False):
+            logger.warning_once(
+                "Disabling kv_sharing_fast_prefill: %s.",
+                disqualifier,
+            )
+            cache_config.kv_sharing_fast_prefill = False
+        return
+
+    if getattr(cache_config, "user_specified_kv_sharing_fast_prefill", False):
+        return
+
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        return
+
+    if envs.VLLM_BATCH_INVARIANT:
+        return
+
+    if (
+        current_platform.uses_standalone_cpu_model_runner()
+        and getattr(vllm_config, "lora_config", None) is not None
+    ):
+        return
+
+    cache_config.kv_sharing_fast_prefill = True
+
+
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -592,61 +720,61 @@ class Gemma4Config(VerifyAndUpdateConfig):
             for i in range(min(arch_config.total_num_hidden_layers, len(layer_types)))
         }
 
-        if len(set(head_dims.values())) <= 1:
-            return
+        if len(set(head_dims.values())) > 1:
+            from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        from vllm.platforms import current_platform
-        from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+            max_head_dim = max(head_dims.values())
 
-        max_head_dim = max(head_dims.values())
-
-        if (
-            not envs.VLLM_BATCH_INVARIANT
-            and is_fa_version_supported(4)
-            and max_head_dim <= 512
-        ):
             if (
-                vllm_config.attention_config.flash_attn_version is None
-                and vllm_config.attention_config.backend
-                in (None, AttentionBackendEnum.FLASH_ATTN)
+                not envs.VLLM_BATCH_INVARIANT
+                and is_fa_version_supported(4)
+                and max_head_dim <= 512
             ):
-                use_per_layer_fa = current_platform.is_device_capability_family(
-                    90
-                ) and vllm_config.cache_config.cache_dtype.startswith("fp8")
-                if use_per_layer_fa:
-                    logger.info(
-                        "Gemma4 model has heterogeneous head dimensions %s. Using "
-                        "per-layer FA3/FA4 selection for FP8 KV cache on SM90.",
-                        head_dims,
-                    )
-                else:
-                    vllm_config.attention_config.flash_attn_version = 4
-                    logger.info(
-                        "Gemma4 model has heterogeneous head dimensions %s. Using FA4 "
-                        "for all layers to avoid mixed FA3/FA4 penalty.",
-                        head_dims,
-                    )
-        elif current_platform.is_xpu():
-            logger.info(
-                "Gemma4 model has heterogeneous head dimensions %s. Leaving the "
-                "attention backend choice to the XPU platform.",
-                head_dims,
-            )
-        elif vllm_config.attention_config.backend is None:
-            backend = AttentionBackendEnum.TRITON_ATTN
-            if (
-                vllm_config.cache_config.cache_dtype == "nvfp4"
-                and MODELS_CONFIG_MAP.get(model_config.architecture) is Gemma4Config
-            ):
-                backend = AttentionBackendEnum.FLASHINFER
-            vllm_config.attention_config.backend = backend
-            logger.info(
-                "Gemma4 model has heterogeneous head dimensions "
-                "%s. FA4 is unavailable for this configuration, forcing %s backend.",
-                head_dims,
-                backend.name,
-            )
+                if (
+                    vllm_config.attention_config.flash_attn_version is None
+                    and vllm_config.attention_config.backend
+                    in (None, AttentionBackendEnum.FLASH_ATTN)
+                ):
+                    use_per_layer_fa = current_platform.is_device_capability_family(
+                        90
+                    ) and vllm_config.cache_config.cache_dtype.startswith("fp8")
+                    if use_per_layer_fa:
+                        logger.info(
+                            "Gemma4 model has heterogeneous head dimensions %s. Using "
+                            "per-layer FA3/FA4 selection for FP8 KV cache on SM90.",
+                            head_dims,
+                        )
+                    else:
+                        vllm_config.attention_config.flash_attn_version = 4
+                        logger.info(
+                            "Gemma4 model has heterogeneous head dimensions %s. "
+                            "Using FA4 for all layers to avoid mixed FA3/FA4 penalty.",
+                            head_dims,
+                        )
+            elif current_platform.is_xpu():
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions %s. Leaving the "
+                    "attention backend choice to the XPU platform.",
+                    head_dims,
+                )
+            elif vllm_config.attention_config.backend is None:
+                backend = AttentionBackendEnum.TRITON_ATTN
+                if (
+                    vllm_config.cache_config.cache_dtype == "nvfp4"
+                    and MODELS_CONFIG_MAP.get(model_config.architecture) is Gemma4Config
+                ):
+                    backend = AttentionBackendEnum.FLASHINFER
+                vllm_config.attention_config.backend = backend
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions "
+                    "%s. FA4 is unavailable for this configuration, "
+                    "forcing %s backend.",
+                    head_dims,
+                    backend.name,
+                )
+
+        _maybe_enable_gemma4_kv_sharing_fast_prefill(vllm_config)
 
 
 class EmbeddingGemma2ModelConfig(Gemma4Config):

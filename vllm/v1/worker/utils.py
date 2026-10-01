@@ -271,6 +271,7 @@ class AttentionGroup:
     # otherwise it stays 0 and the kernel blocks per block are used.
     kernel_block_size: int | None = None
     kernel_block_stride: int = 0
+    num_heads_q: int = 0
     # Persistent per ubatch: CUDA graphs capture the mapped block table.
     kernel_block_table: torch.Tensor | None = None
     kernel_block_offsets: torch.Tensor | None = None

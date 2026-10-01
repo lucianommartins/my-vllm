@@ -28,14 +28,14 @@ from torch import nn
 
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.config.utils import getattr_iter
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import Attention
@@ -861,9 +861,16 @@ def _run_decoder_layers(
     return hidden_states
 
 
-@support_torch_compile(
-    enable_if=lambda vllm_config: vllm_config.cache_config.kv_sharing_fast_prefill
-)
+def _is_gemma4_fast_prefill_enabled(vllm_config: VllmConfig) -> bool:
+    hf_text_config = _get_text_config(vllm_config.model_config.hf_config)
+    return (
+        bool(vllm_config.cache_config.kv_sharing_fast_prefill)
+        and vllm_config.parallel_config.pipeline_parallel_size == 1
+        and (getattr(hf_text_config, "num_kv_shared_layers", 0) or 0) > 0
+    )
+
+
+@support_torch_compile(enable_if=_is_gemma4_fast_prefill_enabled)
 class Gemma4SelfDecoderLayers(nn.Module):
     """Compiled wrapper: embedding + non-KV-shared layers (YOCO first half).
 
@@ -1008,9 +1015,7 @@ class Gemma4SelfDecoderLayers(nn.Module):
         return hidden_states, per_layer_inputs
 
 
-@support_torch_compile(
-    enable_if=lambda vllm_config: vllm_config.cache_config.kv_sharing_fast_prefill
-)
+@support_torch_compile(enable_if=_is_gemma4_fast_prefill_enabled)
 class Gemma4CrossDecoderLayers(nn.Module):
     """Cross-decoder layers (YOCO second half, KV-shared)."""
 
@@ -1021,10 +1026,12 @@ class Gemma4CrossDecoderLayers(nn.Module):
         prefix: str = "",
         decoder_layers: list[Gemma4DecoderLayer],
         layer_idx_start: int,
+        norm: RMSNorm,
     ):
         super().__init__()
         self.decoder_layers = decoder_layers
         self.layer_idx_start = layer_idx_start
+        self.norm = norm
 
     def forward(
         self,
@@ -1033,7 +1040,7 @@ class Gemma4CrossDecoderLayers(nn.Module):
         per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        return _run_decoder_layers(
+        hidden_states = _run_decoder_layers(
             self.decoder_layers,
             self.layer_idx_start,
             positions,
@@ -1041,10 +1048,11 @@ class Gemma4CrossDecoderLayers(nn.Module):
             per_layer_inputs,
             **kwargs,
         )
+        return self.norm(hidden_states)
 
 
 @support_torch_compile(
-    enable_if=lambda vllm_config: not vllm_config.cache_config.kv_sharing_fast_prefill
+    enable_if=lambda vllm_config: not _is_gemma4_fast_prefill_enabled(vllm_config)
 )
 class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
     supports_aux_hidden_states_over_pp = True
@@ -1195,14 +1203,19 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                 prefix=f"{prefix}.cross_decoder",
                 decoder_layers=self.layers[first_kv_shared_layer_idx:],
                 layer_idx_start=first_kv_shared_layer_idx,
+                norm=self.norm,
             )
 
-        self.fast_prefill_enabled = cache_config.kv_sharing_fast_prefill
+        self.fast_prefill_enabled = _is_gemma4_fast_prefill_enabled(vllm_config)
 
         if self.fast_prefill_enabled:
-            # Allocate static buffers for CUDAGraph
+            # Allocate static buffers for CUDAGraph on the actual parameter device
+            # so meta-device initialization never materializes real device tensors.
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-            device = next(self.parameters()).device
+            first_param = next(self.parameters(), None)
+            device = (
+                first_param.device if first_param is not None else torch.device("cpu")
+            )
             self.positions = torch.zeros(
                 max_num_tokens, dtype=torch.int64, device=device
             )
@@ -1211,6 +1224,7 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                 dtype=vllm_config.model_config.dtype,
                 device=device,
             )
+            self.per_layer_inputs: torch.Tensor | None
             if (
                 self.hidden_size_per_layer_input
                 and self.hidden_size_per_layer_input > 0
@@ -1257,6 +1271,14 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
 
         self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if layers and self.fast_prefill_enabled:
+            raise ValueError(
+                "Gemma4 KV-sharing fast prefill is incompatible with "
+                "aux_hidden_state_layers; pass --no-kv-sharing-fast-prefill."
+            )
+        super()._set_aux_hidden_state_layers(layers)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.self_decoder.embed_input_ids(input_ids)
 
@@ -1297,7 +1319,9 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         **kwargs,
     ) -> torch.Tensor:
         logits_indices_padded, num_logits_indices = None, None
-        attn_metadata = get_forward_context().attn_metadata
+        logits_cg_mode = CUDAGraphMode.NONE
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is not None:
             assert isinstance(attn_metadata, dict)
@@ -1307,71 +1331,127 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             if isinstance(layer_attn_metadata, KVSharingFastPrefillMetadata):
                 logits_indices_padded = layer_attn_metadata.logits_indices_padded
                 num_logits_indices = layer_attn_metadata.num_logits_indices
+                if layer_attn_metadata.logits_cg_mode is not None:
+                    logits_cg_mode = layer_attn_metadata.logits_cg_mode
 
         batch_size = positions.size(0)
-        self.positions[:batch_size].copy_(positions)
         self_decoder_hidden_states, per_layer_inputs = self.self_decoder(
             input_ids=input_ids,
-            positions=self.positions[:batch_size],
+            positions=positions,
             inputs_embeds=inputs_embeds,
             per_layer_inputs=per_layer_inputs,
             **kwargs,
         )
 
         if logits_indices_padded is None:
-            logits_indices_padded = torch.arange(
-                batch_size,
-                dtype=positions.dtype,
-                device=positions.device,
-            )
+            if forward_context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE:
+                return self.cross_decoder(
+                    positions,
+                    self_decoder_hidden_states,
+                    per_layer_inputs,
+                    **kwargs,
+                )
 
-        # NOTE: Keep .clone() until fix in
-        # https://github.com/vllm-project/vllm/pull/22282
-        hidden_states = self_decoder_hidden_states.clone()
+            # Copy directly into static buffers during PIECEWISE decode or capture.
+            self.positions[:batch_size].copy_(positions)
+            self.hidden_states[:batch_size].copy_(self_decoder_hidden_states)
+            if self.per_layer_inputs is not None and per_layer_inputs is not None:
+                self.per_layer_inputs[:batch_size].copy_(per_layer_inputs)
+
+            orig_batch_desc = forward_context.batch_descriptor
+            if orig_batch_desc is not None:
+                forward_context.batch_descriptor = replace(
+                    orig_batch_desc, num_tokens=batch_size
+                )
+
+            cross_per_layer: torch.Tensor | None = (
+                self.per_layer_inputs[:batch_size]
+                if self.per_layer_inputs is not None
+                else None
+            )
+            try:
+                cross_hidden_states = self.cross_decoder(
+                    self.positions[:batch_size],
+                    self.hidden_states[:batch_size],
+                    cross_per_layer,
+                    **kwargs,
+                )
+            finally:
+                forward_context.batch_descriptor = orig_batch_desc
+            return cross_hidden_states
+
+        if num_logits_indices == 0:
+            return torch.empty_like(self_decoder_hidden_states)
+
+        # Prefill path with logits_indices_padded (max_query_len > 1).
+        # Clone PIECEWISE self_decoder output before cross_decoder replays to
+        # prevent global_graph_pool weak_ref_output aliasing; keep NONE zero-clone.
+        orig_batch_desc = forward_context.batch_descriptor
+        orig_runtime_mode = forward_context.cudagraph_runtime_mode
+        output_hidden_states = (
+            self_decoder_hidden_states.clone()
+            if orig_runtime_mode == CUDAGraphMode.PIECEWISE
+            else self_decoder_hidden_states
+        )
+
+        cross_runtime_mode = (
+            CUDAGraphMode.PIECEWISE
+            if (
+                logits_cg_mode == CUDAGraphMode.PIECEWISE
+                and not forward_context.skip_compiled
+            )
+            else CUDAGraphMode.NONE
+        )
 
         num_padded = logits_indices_padded.size(0)
-        self.positions[:num_padded].copy_(positions[logits_indices_padded])
-        self.hidden_states[:num_padded].copy_(
-            self_decoder_hidden_states[logits_indices_padded]
-        )
-        if self.per_layer_inputs is not None and per_layer_inputs is not None:
-            self.per_layer_inputs[:num_padded].copy_(
-                per_layer_inputs[logits_indices_padded]
+        if cross_runtime_mode == CUDAGraphMode.PIECEWISE:
+            self.positions[:num_padded].copy_(positions[logits_indices_padded])
+            self.hidden_states[:num_padded].copy_(
+                self_decoder_hidden_states[logits_indices_padded]
             )
-
-        # Update batch_descriptor so the cross-decoder's piecewise
-        # CUDAGraphWrapper dispatches to the correct (reduced) batch size.
-        forward_context = get_forward_context()
-        orig_batch_desc = forward_context.batch_descriptor
-        if orig_batch_desc is not None:
-            forward_context.batch_descriptor = replace(
-                orig_batch_desc, num_tokens=num_padded
-            )
-
-        cross_per_layer = (
-            self.per_layer_inputs[:num_padded]
-            if self.per_layer_inputs is not None
-            else None
-        )
-        cross_hidden_states = self.cross_decoder(
-            self.positions[:num_padded],
-            self.hidden_states[:num_padded],
-            cross_per_layer,
-            **kwargs,
-        )
-
-        # Restore the original batch_descriptor
-        forward_context.batch_descriptor = orig_batch_desc
-
-        if num_logits_indices is not None:
-            assert num_logits_indices > 0
-            hidden_states[logits_indices_padded[:num_logits_indices]] = (
-                cross_hidden_states[:num_logits_indices]
+            if self.per_layer_inputs is not None and per_layer_inputs is not None:
+                self.per_layer_inputs[:num_padded].copy_(
+                    per_layer_inputs[logits_indices_padded]
+                )
+            cross_positions = self.positions[:num_padded]
+            cross_hidden_in = self.hidden_states[:num_padded]
+            cross_per_layer = (
+                self.per_layer_inputs[:num_padded]
+                if self.per_layer_inputs is not None
+                else None
             )
         else:
-            hidden_states = cross_hidden_states
+            cross_positions = positions[logits_indices_padded]
+            cross_hidden_in = self_decoder_hidden_states[logits_indices_padded]
+            cross_per_layer = (
+                per_layer_inputs[logits_indices_padded]
+                if per_layer_inputs is not None
+                else None
+            )
 
-        return hidden_states
+        forward_context.cudagraph_runtime_mode = cross_runtime_mode
+        forward_context.batch_descriptor = BatchDescriptor(
+            num_tokens=num_padded,
+            num_active_loras=(
+                orig_batch_desc.num_active_loras if orig_batch_desc is not None else 0
+            ),
+        )
+        try:
+            cross_hidden_states = self.cross_decoder(
+                cross_positions,
+                cross_hidden_in,
+                cross_per_layer,
+                **kwargs,
+            )
+        finally:
+            forward_context.batch_descriptor = orig_batch_desc
+            forward_context.cudagraph_runtime_mode = orig_runtime_mode
+
+        if num_logits_indices is not None and num_logits_indices > 0:
+            output_hidden_states[logits_indices_padded[:num_logits_indices]] = (
+                cross_hidden_states[:num_logits_indices]
+            )
+        return output_hidden_states
 
     def forward(
         self,
@@ -1382,16 +1462,14 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if self.fast_prefill_enabled:
-            hidden_states = self.fast_prefill_forward(
+        if self.fast_prefill_enabled and not self.aux_hidden_state_layers:
+            return self.fast_prefill_forward(
                 input_ids,
                 positions,
                 inputs_embeds,
                 per_layer_inputs,
                 **kwargs,
             )
-            hidden_states = self.norm(hidden_states)
-            return hidden_states
 
         # Normal (non-fast-prefill) path with PP support
         if get_pp_group().is_first_rank:

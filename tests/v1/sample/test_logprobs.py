@@ -506,15 +506,15 @@ def test_prompt_logprob_token_ids_validation():
         verify(prompt_logprobs=1, prompt_logprob_start=-1)
 
 
-def test_prompt_logprob_token_ids_reject_fast_prefill():
-    """kv-sharing fast prefill would score rows the cross-decoder never ran."""
+def test_prompt_logprob_token_ids_accept_fast_prefill():
+    """kv-sharing fast prefill falls back per-step for prompt logprobs."""
     processor = SimpleNamespace(
         model_config=SimpleNamespace(
             return_sampling_mask=False, enable_trace_replay=False, is_diffusion=False
         ),
         vllm_config=SimpleNamespace(
             reasoning_config=None,
-            cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+            cache_config=SimpleNamespace(kv_sharing_fast_prefill=True),
         ),
         speculative_config=None,
         structured_outputs_config=None,
@@ -522,15 +522,10 @@ def test_prompt_logprob_token_ids_reject_fast_prefill():
         validate_logits_processors_params=lambda params: None,
         resolve_watermarking=lambda params: False,
     )
-    params = SamplingParams(prompt_logprob_token_ids=[[1, 2]])
     with patch.object(SamplingParams, "verify"):
+        params = SamplingParams(prompt_logprob_token_ids=[[1, 2]])
         InputProcessor._validate_params(processor, params, ("generate",))
-        processor.vllm_config.cache_config.kv_sharing_fast_prefill = True
-        with pytest.raises(VLLMValidationError, match="fast-prefill"):
-            InputProcessor._validate_params(processor, params, ("generate",))
 
-        # Top-K prompt logprobs with prompt_logprob_start are accepted.
-        processor.vllm_config.cache_config.kv_sharing_fast_prefill = False
         params = SamplingParams(prompt_logprobs=1, prompt_logprob_start=2)
         InputProcessor._validate_params(processor, params, ("generate",))
 
