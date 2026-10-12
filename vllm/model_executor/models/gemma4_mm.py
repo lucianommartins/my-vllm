@@ -34,6 +34,7 @@ from transformers.models.gemma4.configuration_gemma4 import (
     Gemma4TextConfig,
 )
 
+from vllm import ir
 from vllm.config import VllmConfig
 from vllm.config.model import get_served_model_name
 from vllm.config.multimodal import MultiModalDummyOptions, VideoDummyOptions
@@ -1012,36 +1013,6 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _vision_rmsnorm_kernel(
-    x_ptr,
-    w_ptr,
-    out_ptr,
-    stride_x_m,
-    stride_out_m,
-    H: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    eps: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int64)
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < H
-
-    x = tl.load(x_ptr + pid * stride_x_m + offs, mask=mask, other=0.0)
-    x_f32 = x.to(tl.float32)
-    var = tl.sum(x_f32 * x_f32, axis=0) / H
-    r = tl.rsqrt(var + eps)
-    out = x_f32 * r
-
-    if HAS_WEIGHT:
-        w = tl.load(w_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-        out = out * w
-
-    out_final = out.to(x_ptr.dtype.element_ty)
-    tl.store(out_ptr + pid * stride_out_m + offs, out_final, mask=mask)
-
-
-@triton.jit
 def _vision_2d_rope_kernel(
     x_ptr,
     cos_ptr,
@@ -1125,50 +1096,6 @@ def _vision_2d_rope_kernel(
         tl.store(out_base + (3 * D_Q + offs_q) * stride_od, y1_b, mask=mask_q)
 
 
-def fused_vision_rmsnorm(
-    x: torch.Tensor,
-    weight: torch.Tensor | None = None,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """Fused RMSNorm for Gemma4 multimodal vision/audio towers.
-
-    Supports arbitrary [..., H] shapes. If weight is None, performs unscaled RMSNorm.
-    Exact FP32 arithmetic matches HF Gemma4RMSNorm.
-    """
-    if not HAS_TRITON or not x.is_cuda:
-        mean_squared = x.float().pow(2).mean(-1, keepdim=True) + eps
-        out = x.float() * torch.pow(mean_squared, -0.5)
-        if weight is not None:
-            out = out * weight.float()
-        return out.type_as(x)
-
-    orig_shape = x.shape
-    H = orig_shape[-1]
-    if x.numel() == 0:
-        return x.clone()
-    x_2d = x.reshape(-1, H).contiguous()
-    M = x_2d.shape[0]
-
-    out = torch.empty_like(x_2d)
-    BLOCK_SIZE = triton.next_power_of_2(H)
-    has_weight = weight is not None
-    w_ptr = weight.contiguous() if weight is not None else x_2d
-
-    grid = (M,)
-    _vision_rmsnorm_kernel[grid](
-        x_2d,
-        w_ptr,
-        out,
-        x_2d.stride(0),
-        out.stride(0),
-        H=H,
-        BLOCK_SIZE=BLOCK_SIZE,
-        eps=eps,
-        HAS_WEIGHT=has_weight,
-    )
-    return out.view(orig_shape)
-
-
 def fused_vision_2d_rope(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -1228,26 +1155,37 @@ def fused_vision_2d_rope(
     return out
 
 
+class Gemma4VisionRMSNorm(RMSNorm):
+    """RMSNorm for the eager HF towers that prefers the vLLM C kernel."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight.data if self.has_weight else None
+        impl = ir.ops.rms_norm.impls["vllm_c"]
+        if impl.supported and impl.supports_args(x, weight, self.variance_epsilon):
+            return impl.impl_fn(x, weight, self.variance_epsilon)
+        return super().forward(x)
+
+
 def _optimize_hf_multimodal_tower(tower: nn.Module) -> None:
     """Optimize HF multimodal tower with fused Triton kernels (RMSNorm, 2D RoPE)."""
     for module in tower.modules():
+        for child_name, child in module.named_children():
+            if child.__class__.__name__ != "Gemma4RMSNorm":
+                continue
+            hidden_size = child.weight.shape[0] if child.with_scale else module.head_dim
+
+            setattr(
+                module,
+                child_name,
+                Gemma4VisionRMSNorm(
+                    hidden_size,
+                    eps=child.eps,
+                    has_weight=child.with_scale,
+                    dtype=child.weight.dtype if child.with_scale else None,
+                ),
+            )
         name = module.__class__.__name__
         if name == "Gemma4RMSNorm":
-            orig_rmsnorm_forward = module.forward
-
-            def _fused_rmsnorm_forward(
-                hidden_states: torch.Tensor,
-                _m=module,
-                _orig=orig_rmsnorm_forward,
-            ) -> torch.Tensor:
-                if hidden_states.is_cuda:
-                    weight = _m.weight if getattr(_m, "with_scale", True) else None
-                    return fused_vision_rmsnorm(hidden_states, weight, eps=_m.eps)
-                return _orig(hidden_states)
-
-            module.forward = _fused_rmsnorm_forward
-
-        elif name == "Gemma4VisionAttention":
             import sys
 
             mod: Any = sys.modules.get(module.__module__)
