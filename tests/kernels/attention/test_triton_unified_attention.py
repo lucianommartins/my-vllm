@@ -1513,3 +1513,533 @@ def test_triton_unified_attn_window_aware_segments(
             sliding_window=sliding_window,
         )
         torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "case_desc,seq_lens,num_heads,head_size,sliding_window",
+    [
+        # Gemma 4 Global (head_size=512):
+        # 1. Prefill (E2B / E4B geometry)
+        ("hd512_prefill_e2b", [(512, 512)], (8, 1), 512, None),
+        ("hd512_prefill_12b", [(1024, 1024)], (16, 1), 512, None),
+        # 2. Decode (31B geometry)
+        ("hd512_decode", [(1, 2048)] * 4, (32, 4), 512, None),
+        ("hd512_decode_short", [(1, 512)] * 4, (32, 4), 512, None),
+        ("hd512_mtp_q5", [(5, 4096)] * 4, (32, 4), 512, None),
+        # 3. Mixed batch: 1 prefill + 7 decode (26B-A4B geometry)
+        ("hd512_mixed_batch", [(2048, 2048)] + [(1, 4096)] * 7, (16, 2), 512, None),
+        # Gemma 4 SWA (head_size=256):
+        # 4. SWA prefill (E4B and 32Q/16KV geometry)
+        ("hd256_swa1024_prefill", [(512, 512)], (8, 2), 256, 1024),
+        ("hd256_swa512_prefill", [(512, 512)], (32, 16), 256, 512),
+        # 5. SWA decode with W=512, B=1 (3D active)
+        ("hd256_swa512_b1", [(1, 2048)], (8, 1), 256, 512),
+        # 6. SWA decode with W=1024, B=4 (3D active)
+        ("hd256_swa1024_b4", [(1, 2048)] * 4, (16, 8), 256, 1024),
+        # 7. SWA decode with W=1024, B=16 (2D threshold active: 16 * 8 = 128 >= 128)
+        ("hd256_swa1024_b16", [(1, 2048)] * 16, (16, 8), 256, 1024),
+        # 8. MTP short-query: 16 requests with q=4 tokens, ctx=2048, W=1024
+        ("hd256_mtp_q4", [(4, 2048)] * 16, (16, 8), 256, 1024),
+        # 9. Padded decode with seq_len=0 sequence: must not read uninitialized segment
+        ("hd256_swa512_padded_decode", [(0, 0), (1, 2048)], (8, 1), 256, 512),
+    ],
+)
+@torch.inference_mode()
+def test_gemma4_large_head_and_swa_attention(
+    case_desc: str,
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+) -> None:
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(42)
+    dtype = torch.bfloat16
+    block_size = 16
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens_list)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    num_blocks_per_req = [
+        (kv_len + block_size - 1) // block_size for kv_len in kv_lens_list
+    ]
+    num_blocks = sum(num_blocks_per_req)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+
+    block_tables = torch.zeros(
+        (num_seqs, max(max(num_blocks_per_req), 1)),
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    block_start = 0
+    for req_idx, nb in enumerate(num_blocks_per_req):
+        if nb > 0:
+            block_tables[req_idx, :nb] = torch.arange(
+                block_start, block_start + nb, dtype=torch.int32, device=DEVICE_TYPE
+            )
+            block_start += nb
+
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device=DEVICE_TYPE
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device=DEVICE_TYPE)
+
+    output = torch.empty_like(query)
+    seq_threshold_3D = 512
+    num_par_softmax_segments = 16
+    head_size_padded = next_power_of_2(head_size)
+    # Initialize segment buffers with NaN so any uninitialized segment
+    # read fails immediately
+    softmax_segm_output = torch.full(
+        (num_seqs, num_query_heads, num_par_softmax_segments, head_size_padded),
+        float("nan"),
+        dtype=torch.float32,
+    )
+    softmax_segm_max = torch.full(
+        (num_seqs, num_query_heads, num_par_softmax_segments),
+        float("nan"),
+        dtype=torch.float32,
+    )
+    softmax_segm_expsum = torch.full(
+        (num_seqs, num_query_heads, num_par_softmax_segments),
+        float("nan"),
+        dtype=torch.float32,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=seq_threshold_3D,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+    )
+
+    torch.testing.assert_close(output.float(), ref_output.float(), atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mock_smem", [65536, 101376])
+@pytest.mark.parametrize("head_size,sliding_window", [(512, None), (256, 1024)])
+def test_gemma4_smem_fallback_paths(
+    mock_smem: int,
+    head_size: int,
+    sliding_window: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(42)
+    dtype = torch.bfloat16
+    block_size = 16
+    seq_lens = [(128, 128)]
+    num_heads = (8, 2)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens_list)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    num_blocks = (max_kv_len + block_size - 1) // block_size
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_tables = torch.arange(
+        num_blocks, dtype=torch.int32, device=DEVICE_TYPE
+    ).unsqueeze(0)
+    cu_query_lens = torch.tensor([0, 128], dtype=torch.int32, device=DEVICE_TYPE)
+    kv_lens = torch.tensor([128], dtype=torch.int32, device=DEVICE_TYPE)
+    output = torch.empty_like(query)
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.ops.triton_unified_attention._get_device_max_smem",
+        lambda dev_idx: mock_smem,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+    )
+
+    torch.testing.assert_close(output.float(), ref_output.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "case_desc,head_size,num_heads,q_len,ctx_len,sliding_window,mock_smem,"
+    "batch_invariant,expected_k,expected_reduce_tile",
+    [
+        (
+            "hd512_prefill_160k",
+            512,
+            (32, 4),
+            512,
+            512,
+            None,
+            166912,
+            False,
+            {
+                "IS_3D": False,
+                "BLOCK_M": 32,
+                "TILE_SIZE": 32,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+            None,
+        ),
+        (
+            "hd256_swa1024_prefill_160k",
+            256,
+            (32, 16),
+            512,
+            512,
+            1024,
+            166912,
+            False,
+            {
+                "IS_3D": False,
+                "BLOCK_M": 64,
+                "TILE_SIZE": 64,
+                "num_warps": 8,
+                "num_stages": 2,
+            },
+            None,
+        ),
+        (
+            "hd256_swa512_prefill_160k",
+            256,
+            (32, 16),
+            512,
+            512,
+            512,
+            166912,
+            False,
+            {
+                "IS_3D": False,
+                "BLOCK_M": 64,
+                "TILE_SIZE": 64,
+                "num_warps": 8,
+                "num_stages": 2,
+            },
+            None,
+        ),
+        (
+            "hd512_3d_decode_long_160k",
+            512,
+            (32, 4),
+            1,
+            4096,
+            None,
+            166912,
+            False,
+            {
+                "IS_3D": True,
+                "BLOCK_M": 16,
+                "TILE_SIZE": 32,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+            32,
+        ),
+        (
+            "hd512_3d_mtp_q5_long_160k",
+            512,
+            (32, 4),
+            5,
+            4096,
+            None,
+            166912,
+            False,
+            {
+                "IS_3D": True,
+                "BLOCK_M": 16,
+                "TILE_SIZE": 32,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+            32,
+        ),
+        (
+            "hd512_3d_decode_short_160k",
+            512,
+            (32, 4),
+            1,
+            512,
+            None,
+            166912,
+            False,
+            {
+                "IS_3D": True,
+                "BLOCK_M": 16,
+                "TILE_SIZE": 16,
+                "num_warps": None,
+                "num_stages": None,
+            },
+            16,
+        ),
+        (
+            "hd512_3d_decode_long_100k_fallback",
+            512,
+            (32, 4),
+            1,
+            4096,
+            None,
+            101376,
+            False,
+            {
+                "IS_3D": True,
+                "BLOCK_M": 16,
+                "TILE_SIZE": 16,
+                "num_warps": None,
+                "num_stages": 1,
+            },
+            16,
+        ),
+        (
+            "hd512_3d_decode_long_64k_fallback",
+            512,
+            (32, 4),
+            1,
+            4096,
+            None,
+            65536,
+            False,
+            {
+                "IS_3D": True,
+                "BLOCK_M": 16,
+                "TILE_SIZE": 16,
+                "num_warps": None,
+                "num_stages": 1,
+            },
+            16,
+        ),
+        (
+            "hd512_decode_batch_invariant",
+            512,
+            (32, 4),
+            1,
+            4096,
+            None,
+            166912,
+            True,
+            {
+                "IS_3D": False,
+                "BLOCK_M": 16,
+                "TILE_SIZE": 32,
+                "num_warps": None,
+                "num_stages": None,
+            },
+            None,
+        ),
+    ],
+)
+def test_gemma4_launch_params_smem_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+    case_desc: str,
+    head_size: int,
+    num_heads: tuple[int, int],
+    q_len: int,
+    ctx_len: int,
+    sliding_window: int | None,
+    mock_smem: int,
+    batch_invariant: bool,
+    expected_k: dict[str, object],
+    expected_reduce_tile: int | None,
+) -> None:
+    num_seqs = 2
+    num_q_heads, num_kv_heads = num_heads
+    query = torch.empty(
+        (num_seqs * q_len, num_q_heads, head_size), dtype=torch.bfloat16, device="cpu"
+    )
+    cache = torch.empty(
+        (1, 16, num_kv_heads, head_size), dtype=torch.bfloat16, device="cpu"
+    )
+    kernel = MagicMock()
+    reduce = MagicMock()
+    monkeypatch.setattr(attention, "kernel_unified_attention", kernel)
+    monkeypatch.setattr(attention, "reduce_segments", reduce)
+    monkeypatch.setattr(attention, "_get_device_max_smem", lambda dev_idx: mock_smem)
+    monkeypatch.setattr(attention, "is_batch_invariant", batch_invariant)
+    monkeypatch.setattr(attention.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        attention.current_platform, "is_device_capability_family", lambda cap: False
+    )
+
+    scratch = _scratch(num_seqs * q_len)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    unified_attention(
+        query,
+        cache,
+        cache,
+        torch.empty_like(query),
+        torch.arange(num_seqs + 1, dtype=torch.int32, device="cpu") * q_len,
+        q_len,
+        torch.full((num_seqs,), ctx_len, dtype=torch.int32, device="cpu"),
+        ctx_len,
+        head_size**-0.5,
+        True,
+        window_size,
+        torch.zeros((num_seqs, 1), dtype=torch.int32, device="cpu"),
+        0.0,
+        None,
+        None,
+        None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=16,
+        softmax_segm_output=scratch[0],
+        softmax_segm_max=scratch[1],
+        softmax_segm_expsum=scratch[2],
+    )
+    k_kwargs = kernel.__getitem__.return_value.call_args.kwargs
+    for key, val in expected_k.items():
+        if val is None:
+            assert key not in k_kwargs, (
+                f"{case_desc}: unexpected {key}={k_kwargs.get(key)}"
+            )
+        else:
+            assert k_kwargs[key] == val, f"{case_desc}: {key}={k_kwargs[key]} != {val}"
+    reduce_call = reduce.__getitem__.return_value.call_args
+    if expected_reduce_tile is None:
+        assert reduce_call is None, f"{case_desc}: unexpected reduce_segments launch"
+    else:
+        assert reduce_call is not None
+        assert reduce_call.kwargs["TILE_SIZE"] == expected_reduce_tile
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mock_smem", [65536, 101376])
+def test_gemma4_3d_smem_fallback_paths(
+    mock_smem: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(42)
+    dtype = torch.bfloat16
+    block_size = 16
+    head_size = 512
+    num_seqs = 2
+    kv_len = 2048
+    num_query_heads, num_kv_heads = 32, 4
+    scale = head_size**-0.5
+
+    query = torch.randn(num_seqs, num_query_heads, head_size, dtype=dtype)
+    num_blocks = num_seqs * (kv_len // block_size)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=DEVICE_TYPE).view(
+        num_seqs, -1
+    )
+    cu_query_lens = torch.arange(num_seqs + 1, dtype=torch.int32, device=DEVICE_TYPE)
+    kv_lens = torch.full((num_seqs,), kv_len, dtype=torch.int32, device=DEVICE_TYPE)
+    output = torch.empty_like(query)
+    num_par_softmax_segments = 16
+    segm_shape = (num_seqs, num_query_heads, num_par_softmax_segments)
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.ops.triton_unified_attention._get_device_max_smem",
+        lambda dev_idx: mock_smem,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=1,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=32,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=torch.full(
+            (*segm_shape, head_size), float("nan"), dtype=torch.float32
+        ),
+        softmax_segm_max=torch.full(segm_shape, float("nan"), dtype=torch.float32),
+        softmax_segm_expsum=torch.full(segm_shape, float("nan"), dtype=torch.float32),
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[1] * num_seqs,
+        kv_lens=[kv_len] * num_seqs,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=None,
+    )
+
+    torch.testing.assert_close(output.float(), ref_output.float(), atol=2e-2, rtol=2e-2)

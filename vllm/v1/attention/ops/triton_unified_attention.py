@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import functools
 import math
 from typing import Any
 
@@ -904,6 +905,7 @@ def reduce_segments(
     valid_segment = segm_mask & (segm_expsum > 0) & (segm_max != float("-inf"))
     segm_max = tl.where(valid_segment, segm_max, float("-inf"))
     overall_max = tl.max(segm_max)
+    overall_max = tl.where(overall_max > float("-inf"), overall_max, 0.0)
 
     # load and rescale segment exp sums
     segment_scale = tl.where(valid_segment, tl.exp(segm_max - overall_max), 0.0)
@@ -959,6 +961,18 @@ def kv_tile_alignment(k: torch.Tensor, v: torch.Tensor) -> tuple[int, int, int]:
     return k_align, math.gcd(k_align, v_delta, *v.stride()[:3]), v_delta
 
 
+@functools.lru_cache(maxsize=8)
+def _get_device_max_smem(device_idx: int) -> int:
+    if not (current_platform.is_cuda() and torch.cuda.is_available()):
+        return 65536
+    props = torch.cuda.get_device_properties(device_idx)
+    return getattr(
+        props,
+        "shared_memory_per_block_optin",
+        getattr(props, "shared_memory_per_block", 65536),
+    )
+
+
 def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     """Detect Gemma3 models via unique (head_size, sliding_window) signature.
 
@@ -969,15 +983,22 @@ def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     return sliding_window == 1024 and head_size in (128, 256)
 
 
+def _is_gemma4_swa(head_size: int, sliding_window: int) -> bool:
+    """Detect Gemma 4 sliding-window attention (head_size=256, window=512 or 1024)."""
+    return head_size == 256 and sliding_window in (512, 1024)
+
+
 def _get_tile_size(
     head_size: int,
     sliding_window: int,
     element_size: int,
     is_prefill: bool,
 ) -> int:
-    """Select tile size with Gemma3-specific optimization."""
-    if _is_gemma3_attention(head_size, sliding_window):
-        # Gemma3: use 32 for decode (default is 16)
+    """Select tile size with Gemma3/4-specific optimization."""
+    if _is_gemma3_attention(head_size, sliding_window) or _is_gemma4_swa(
+        head_size, sliding_window
+    ):
+        # Gemma3 and Gemma4: use 32 for decode (default is 16)
         return 32
 
     # Default behavior
@@ -1132,13 +1153,92 @@ def unified_attention(
     launch_num_stages: int | None = None
     tuned_prefill_tile: int | None = None
 
-    # Prefill-shaped head_size 256 batches (diffusion-gemma canvas, gemma-4
-    # sliding layers) are under-tiled by the decode defaults. BLOCK_M=32 is
-    # ~2x faster on B200 (128 KV tile, 8 warps) and ~1.6x on B70 (4 warps:
-    # XPU warps are 16 lanes). XPU keeps short spec-decode verify batches on
-    # the 3D split-K path, which is faster for them.
+    sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
+    dev_idx = q.device.index if q.device.index is not None else 0
+    max_smem = _get_device_max_smem(dev_idx)
+
+    # Require max_seqlen_q >= max(16, 32 // num_queries_per_kv) so short-query
+    # batches (e.g. MTP speculative verify with q=4) do not pad BLOCK_M=16 -> 32
+    # with masked-out rows.
+    min_q_for_large_head = max(16, 32 // num_queries_per_kv)
+    has_decode_tail = num_seqs > 1 and (q.shape[0] - max_seqlen_q) < (num_seqs - 1) * 16
+    # In 2D mode, grid size along dim 0 and 1 is total_num_q_blocks * num_kv_heads.
+    # To maintain sufficient grid occupancy across SMs for head_size=512 tuning
+    # (BLOCK_M=32, TILE_SIZE=64), require q.shape[0] * num_kv_heads >= 2048 (or
+    # q.shape[0] * q.shape[1] >= 8192 when num_kv_heads == 1). Small shapes below
+    # this threshold fallback to default TILE_SIZE=32 to maximize CTA parallelism.
+    enough_hd512_ctas = q.shape[0] * num_kv_heads >= 2048 or (
+        num_kv_heads == 1 and q.shape[0] * q.shape[1] >= 8192
+    )
+
+    # Prefill-shaped head_size 256/512 batches (diffusion-gemma canvas, gemma-4
+    # global & sliding layers) are under-tiled by the decode defaults.
+    # Select prefill tile size and warp count for head_size 256 and 512 based on
+    # device shared memory on CUDA, and keep XPU's 4-warp config (16-lane warps).
     is_xpu = current_platform.is_xpu()
-    tuned_large_head = (
+    tuned_large_head = False
+    is_gemma4_large_head = head_size == 512 or _is_gemma4_swa(
+        head_size, sliding_window_val
+    )
+    if (
+        current_platform.is_cuda()
+        and is_gemma4_large_head
+        # Preserve batch invariance between single- and multi-query calls.
+        and not is_batch_invariant
+        and max_seqlen_q >= min_q_for_large_head
+        and num_queries_per_kv <= 16
+        and q.element_size() <= 2
+    ):
+        # Blackwell Datacenter (B100/B200/GB200/B300) with TMEM
+        if current_platform.is_device_capability_family(100):
+            if head_size == 256:
+                BLOCK_M = 32
+                launch_num_warps = 8
+                launch_num_stages = 2
+                tuned_prefill_tile = 128
+                tuned_large_head = True
+            elif head_size == 512 and enough_hd512_ctas:
+                BLOCK_M = 32
+                launch_num_warps = 8
+                launch_num_stages = 2
+                tuned_prefill_tile = 64
+                tuned_large_head = True
+        # Hopper SM90 H100/H200, Ampere SM80 A100/A30, Orin SM87
+        elif max_smem >= 160000:
+            if head_size == 256:
+                BLOCK_M = 64
+                launch_num_warps = 8
+                launch_num_stages = 2
+                tuned_prefill_tile = 64
+                tuned_large_head = True
+            elif head_size == 512 and enough_hd512_ctas:
+                BLOCK_M = 32
+                launch_num_warps = 4
+                launch_num_stages = 2
+                tuned_prefill_tile = 32
+                tuned_large_head = True
+        # Blackwell SM120/121 RTX 5090, Ada SM89 L4/4090, Ampere SM86 3090/A10
+        elif max_smem >= 100000:
+            if head_size == 256:
+                BLOCK_M = 32
+                launch_num_warps = 8
+                launch_num_stages = 1
+                tuned_prefill_tile = 64
+                tuned_large_head = True
+            elif head_size == 512 and enough_hd512_ctas and not has_decode_tail:
+                BLOCK_M = 32
+                launch_num_warps = 4
+                launch_num_stages = 1
+                tuned_prefill_tile = 32
+                tuned_large_head = True
+        # Volta SM70 V100 — 98,304 B SMEM
+        elif max_smem >= 96000 and head_size == 256:
+            BLOCK_M = 32
+            launch_num_warps = 8
+            launch_num_stages = 1
+            tuned_prefill_tile = 64
+            tuned_large_head = True
+    elif (
         head_size == 256
         # Preserve batch invariance between single- and multi-query calls.
         and not is_batch_invariant
@@ -1148,14 +1248,15 @@ def unified_attention(
             (is_xpu and max_seqlen_q > MAX_3D_QUERY_LEN)
             or current_platform.is_device_capability_family(100)
         )
-    )
-    if tuned_large_head:
+    ):
         BLOCK_M = 32
-        BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 4 if is_xpu else 8
         launch_num_stages = 2
         if not is_xpu:
             tuned_prefill_tile = 128
+        tuned_large_head = True
+
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     # gfx1201: prefill / chunked-prefill / mixed launch. It sets BLOCK_Q, so it comes
     # before the grid size and the 2D/3D choice. The default launch is kept for
@@ -1191,8 +1292,6 @@ def unified_attention(
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
-    sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
-
     # Compute chunked block size from sliding window if needed.
     chunk_size = -1
     if sliding_window_val > 0 and chunk_lookback > -1:
@@ -1213,7 +1312,15 @@ def unified_attention(
         TILE_SIZE_PREFILL = tuned_prefill_tile
     elif rdna_prefill_tile is not None:
         TILE_SIZE_PREFILL = rdna_prefill_tile
-
+    elif (
+        current_platform.is_cuda()
+        and not is_batch_invariant
+        and head_size == 512
+        and max_smem < 160000
+    ):
+        if max_smem < 96000:
+            TILE_SIZE_PREFILL = 16
+        launch_num_stages = 1
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
     # size (32) is larger than a common ``block_size=16``, so clamp it
@@ -1301,6 +1408,43 @@ def unified_attention(
     if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
         logger.debug_once("Split-K scratch rows < query tokens; using 2D.")
         use_3d = False
+
+    # For short sliding windows where the window is smaller than the sequence
+    # length, keep 3D segmented decode (which clamps segments to the active
+    # window via window_segments) for small batches, and switch to 2D once the
+    # active 2D decode CTAs (num_seqs * num_kv_heads) reach 128.
+    if (
+        use_3d
+        and _is_gemma4_swa(head_size, sliding_window_val)
+        and chunk_lookback < 0
+        and use_causal
+        and not use_per_seq_causal
+        and not use_mm_prefix
+        and not use_rswa
+        and sliding_window_val < max_seqlen_k
+        and num_seqs * num_kv_heads >= 128
+    ):
+        use_3d = False
+
+    # For head_size=512 3D split-K decode (standard and spec-decode verify) on
+    # >=160KB SMEM GPUs, TILE_SIZE=32 with num_warps=4, num_stages=2 (82,944 B
+    # SMEM -> preserves 2 CTAs/SM on A100) halves KV tile loop iterations for
+    # long contexts (max_seqlen_k >= 2048) with zero short-context regression.
+    if (
+        use_3d
+        and current_platform.is_cuda()
+        and not is_batch_invariant
+        and head_size == 512
+        and max_smem >= 160000
+        and num_queries_per_kv <= 16
+        and q.element_size() == 2
+        and kv_quant_mode == KVQuantMode.NONE
+        and not use_td
+        and max_seqlen_k >= 2048
+    ):
+        TILE_SIZE_DECODE = 32
+        launch_num_warps = 4
+        launch_num_stages = 2
 
     # RDNA launch tuning, after vLLM's 2D/3D choice (it keeps vLLM's split-KV
     # threshold). Only launch parameters change; sliding window, sinks, softcap and
@@ -1431,7 +1575,6 @@ def unified_attention(
         and not use_mm_prefix
         and not use_rswa
     )
-
     # The kernel signature is the same for 2D and 3D — only the launch
     # grid + a handful of constexpr toggles differ.  Per-token-head scale
     # caches and their strides are passed as ``None`` when the
