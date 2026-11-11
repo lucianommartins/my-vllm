@@ -57,6 +57,8 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# Gemma4 checkpoints get the sliding-window work split (see builder).
+_GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_text", "gemma4_unified")
 
 
 @dataclass
@@ -91,6 +93,9 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    # Gemma4 sliding-window groups: split the window, not the sequence,
+    # across the 3D segments (unified_attention segment_sliding_window).
+    segment_sliding_window: bool = False
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -116,6 +121,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         ) or model_config.get_num_attention_heads(vllm_config.parallel_config)
         self.num_heads_kv = kv_cache_spec.num_kv_heads
         self.headdim = kv_cache_spec.head_size
+        self.segment_sliding_window = (
+            current_platform.is_cuda()
+            and model_config.hf_config.model_type in _GEMMA4_MODEL_TYPES
+            and getattr(kv_cache_spec, "sliding_window", None) is not None
+        )
+        if self.segment_sliding_window:
+            logger.info_once("Triton attention: Gemma4 sliding-window split on.")
 
         # Check if CUDA Graphs are enabled for decode
         self.decode_cudagraph_enabled = (
@@ -260,6 +272,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            segment_sliding_window=self.segment_sliding_window,
         )
         if self.max_seqs_64_segments > 0 and (
             self.max_seqs_64_segments < seq_lens.shape[0]
@@ -732,6 +745,7 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
+            segment_sliding_window=attn_metadata.segment_sliding_window,
         )
 
         return output
