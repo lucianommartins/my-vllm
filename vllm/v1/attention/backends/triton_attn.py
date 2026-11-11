@@ -166,12 +166,26 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # requests (K=3/5, 8 q / 1 KV head, 2k-128k context) 64 segments were
         # faster or within 6% at 2k, and 1.1-3.6x faster from 8k up.
         self.max_seqs_64_segments = 0
-        if current_platform.is_cuda() and current_platform.is_device_capability(
-            (12, 0)
+        if current_platform.is_cuda() and (
+            current_platform.is_device_capability((12, 0))
+            # Gemma4 on A100: global layers (2 KV heads) launch only 32
+            # programs per sequence at 16 segments; 64 fills the SMs.
+            or (
+                current_platform.is_device_capability((8, 0))
+                and model_config.hf_config.model_type in _GEMMA4_MODEL_TYPES
+            )
         ):
             self.max_seqs_64_segments = (current_platform.num_compute_units() - 1) // (
                 NUM_PAR_SOFTMAX_SEGMENTS * self.num_heads_kv
             )
+            if (
+                current_platform.is_device_capability((8, 0))
+                and self.max_seqs_64_segments > 0
+            ):
+                logger.info_once(
+                    "Triton attention: Gemma4 64-segment decode on (max_seqs=%d).",
+                    self.max_seqs_64_segments,
+                )
         headdim_padded = next_power_of_2(self.headdim)
         max_query_len_3d = 1
         speculative_config = vllm_config.speculative_config

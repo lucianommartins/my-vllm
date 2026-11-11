@@ -1243,6 +1243,13 @@ def unified_attention(
     )
 
     if use_3d:
+        # 64 segments x head_size_padded >= 512 holds 32K fp32 values per
+        # program; 8 warps cuts per-thread registers and speeds up reduction.
+        reduce_launch_kwargs = (
+            {"num_warps": 8}
+            if num_par_softmax_segments >= 64 and head_size_padded >= 512
+            else {}
+        )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=softmax_segm_output,
@@ -1263,4 +1270,5 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
             SEGMENT_WINDOW=segment_window,
+            **reduce_launch_kwargs,
         )
