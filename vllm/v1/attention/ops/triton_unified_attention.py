@@ -295,6 +295,9 @@ def kernel_unified_attention(
     # sequence) across the segments, and run every segment program to the
     # epilogue. Default False keeps the original partition.
     SEGMENT_WINDOW: tl.constexpr = False,
+    # Defer non-TD V tile load until after Q@K^T and softmax_step so K and V
+    # do not co-reside in shared memory on SM80 2D prefill.
+    STAGE_V_AFTER_SOFTMAX: tl.constexpr = False,
 ):
     # True when the segments partition the whole sequence (original 3D split).
     SEQ_SPLIT: tl.constexpr = IS_3D and not SEGMENT_WINDOW
@@ -487,12 +490,6 @@ def kernel_unified_attention(
                 HEAD_SIZE_PADDED,
             )
         else:
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-            )
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
@@ -505,14 +502,22 @@ def kernel_unified_attention(
                 mask=dim_mask[:, None] & tile_mask[None, :],
                 other=0.0,
             )
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
+            if not STAGE_V_AFTER_SOFTMAX:
+                v_offset = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + offs_d[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
+                # V : (TILE_SIZE, HEAD_SIZE)
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=dim_mask[None, :] & tile_mask[:, None],
+                    other=0.0,
+                )
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        if USE_TD or not STAGE_V_AFTER_SOFTMAX:
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
@@ -582,6 +587,20 @@ def kernel_unified_attention(
 
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
+
+        if (not USE_TD) and STAGE_V_AFTER_SOFTMAX:
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
@@ -1004,6 +1023,44 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
 
+    # SM80 (A100) 2D prefill retiling for Gemma4-class large head dimensions
+    # (hd=512 global GQA=8 where default BM=16, warps=4 spills 14 regs/thread at
+    # BLOCK_Q=2, and hd=256 sliding GQA<=8). Strictly gated on max_seqlen_q >
+    # MAX_3D_QUERY_LEN so both 3D decode and 2D high-batch decode stay untouched.
+    is_sm80_prefill = (
+        current_platform.is_device_capability((8, 0))
+        and max_seqlen_q > MAX_3D_QUERY_LEN
+        and num_queries_per_kv <= 8
+        and q.element_size() == 2
+        and not use_td
+        and (head_size == 256 or (head_size == 512 and num_queries_per_kv == 8))
+        and kv_quant_mode == KVQuantMode.NONE
+        and not use_alibi_slopes
+        and not use_qq_bias
+        and not use_rswa
+        and sinks is None
+        and not use_per_seq_causal
+        and chunk_lookback < 0
+    )
+    plain_sm80_prefill = is_sm80_prefill and not use_mm_prefix and softcap <= 0
+    stage_v_after_softmax = False
+    if is_sm80_prefill:
+        launch_num_warps = 8
+        if head_size == 512 and num_queries_per_kv == 8:
+            BLOCK_M = 32
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+            launch_num_stages = 1 if plain_sm80_prefill else 2
+        elif head_size == 256:
+            BLOCK_M = 64 if plain_sm80_prefill else 32
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+            launch_num_stages = 1 if plain_sm80_prefill else 2
+            stage_v_after_softmax = True
+        logger.info_once(
+            "Enabled SM80 2D prefill retiling on head_size=%d (BLOCK_M=%d, warps=8)",
+            head_size,
+            BLOCK_M,
+        )
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -1036,6 +1093,11 @@ def unified_attention(
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
         TILE_SIZE_PREFILL = 128
+    elif is_sm80_prefill:
+        if head_size == 512 and num_queries_per_kv == 8:
+            TILE_SIZE_PREFILL = 64 if plain_sm80_prefill else 32
+        elif head_size == 256:
+            TILE_SIZE_PREFILL = 64
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -1239,6 +1301,7 @@ def unified_attention(
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
         SEGMENT_WINDOW=segment_window,
+        STAGE_V_AFTER_SOFTMAX=stage_v_after_softmax and not use_3d,
         **launch_kwargs,
     )
 
