@@ -4,7 +4,9 @@
 
 import functools
 import json
+import math
 import os
+import struct
 from typing import Any
 
 import torch
@@ -623,6 +625,229 @@ def fused_moe_kernel(
 
 # NOTE(zyongye): we can remove all the wna16 kernel
 # once we drop off sm75 support
+_GELU_TANH_BETA_F32 = struct.unpack(
+    "f",
+    struct.pack(
+        "f",
+        struct.unpack(
+            "f", struct.pack("f", math.sqrt(2.0) * (2.0 / math.sqrt(math.pi)))
+        )[0]
+        * 0.5,
+    ),
+)[0]
+_GELU_TANH_KAPPA_F32 = struct.unpack("f", struct.pack("f", 0.044715))[0]
+
+SM80_P2A_CONFIGS: dict[int, dict[str, int]] = {
+    1:    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 1,  "num_warps": 8, "num_stages": 4},
+    2:    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 1,  "num_warps": 4, "num_stages": 3},
+    4:    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 1,  "num_warps": 4, "num_stages": 4},
+    8:    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    16:   {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    32:   {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    64:   {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    128:  {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    256:  {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    512:  {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1,  "num_warps": 4, "num_stages": 4},
+    1024: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1,  "num_warps": 4, "num_stages": 4},
+}
+
+
+@triton.jit
+def fused_moe_gate_up_gelu_tanh_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N_HALF: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    naive_block_assignment: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BN_HALF: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    top_k: tl.constexpr,
+    BETA: tl.constexpr,
+    KAPPA: tl.constexpr,
+):
+    pid = tl.program_id(axis=0).to(tl.int64)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N_HALF, BN_HALF)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    if not naive_block_assignment:
+        offs_token = tl.load(sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M + offs).to(
+            tl.int64
+        )
+    else:
+        offs_token = tl.where(offs == 0, pid_m, num_valid_tokens).to(tl.int64)
+
+    token_mask = offs_token < num_valid_tokens
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        offs_cn = pid_n * BN_HALF + tl.arange(0, BN_HALF).to(tl.int64)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N_HALF)
+        tl.store(
+            c_ptrs,
+            tl.zeros((BLOCK_SIZE_M, BN_HALF), dtype=tl.bfloat16),
+            mask=c_mask,
+        )
+        return
+
+    offs_bn_gate = (pid_n * BN_HALF + tl.arange(0, BN_HALF).to(tl.int64)) % N_HALF
+    offs_bn_up = offs_bn_gate + N_HALF
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+    b_base = b_ptr + off_experts * stride_be
+    b_gate_ptrs = b_base + (
+        offs_k[:, None] * stride_bk + offs_bn_gate[None, :] * stride_bn
+    )
+    b_up_ptrs = b_base + (
+        offs_k[:, None] * stride_bk + offs_bn_up[None, :] * stride_bn
+    )
+
+    acc_gate = tl.zeros((BLOCK_SIZE_M, BN_HALF), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_SIZE_M, BN_HALF), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_rem = K - k * BLOCK_SIZE_K
+        k_mask = offs_k < k_rem
+        a = tl.load(a_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
+        bg = tl.load(b_gate_ptrs, mask=k_mask[:, None], other=0.0)
+        bu = tl.load(b_up_ptrs, mask=k_mask[:, None], other=0.0)
+        acc_gate += tl.dot(a, bg)
+        acc_up += tl.dot(a, bu)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_gate_ptrs += BLOCK_SIZE_K * stride_bk
+        b_up_ptrs += BLOCK_SIZE_K * stride_bk
+
+    g = acc_gate.to(tl.bfloat16).to(tl.float32)
+    u = acc_up.to(tl.bfloat16).to(tl.float32)
+    x_cube = g * g * g
+    inner = BETA * (g + KAPPA * x_cube)
+    e_neg = tl.exp(-2.0 * tl.abs(inner))
+    t_abs = (1.0 - e_neg) / (1.0 + e_neg)
+    tanh_v = tl.where(inner >= 0.0, t_abs, -t_abs)
+    act = (0.5 * g * (1.0 + tanh_v)).to(tl.bfloat16).to(tl.float32)
+    out = (act * u).to(tl.bfloat16)
+
+    offs_cn = pid_n * BN_HALF + tl.arange(0, BN_HALF).to(tl.int64)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N_HALF)
+    tl.store(c_ptrs, out, mask=c_mask)
+
+
+def resolve_sm80_p2a_config(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    activation: MoEActivation,
+    config: dict[str, Any],
+    *,
+    is_quantized: bool,
+    has_bias: bool,
+    apply_router_weight_on_input: bool,
+) -> dict[str, int] | None:
+    M = A.shape[0]
+    if (
+        M <= 0
+        or M > 1024
+        or activation != MoEActivation.GELU_TANH
+        or is_quantized
+        or has_bias
+        or apply_router_weight_on_input
+        or A.dtype != torch.bfloat16
+        or B.dtype != torch.bfloat16
+        or B.shape[1] != 1408
+        or B.shape[2] != 2816
+        or B.stride(2) != 1
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability((8, 0))
+    ):
+        return None
+    nearest_key = min(SM80_P2A_CONFIGS.keys(), key=lambda x: abs(x - M))
+    p2a_cfg = SM80_P2A_CONFIGS[nearest_key]
+    if config.get("BLOCK_SIZE_M") != p2a_cfg["BLOCK_SIZE_M"]:
+        return None
+    return p2a_cfg
+
+
+def invoke_sm80_fused_gate_up_gelu_tanh(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C_act: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    p2a_cfg: dict[str, int],
+) -> None:
+    logger.info_once("Enabled SM80 fused MoE GEMM1+gelu_tanh (M<=1024)")
+    M = A.shape[0]
+    num_valid_tokens = M * top_k
+    bm = p2a_cfg["BLOCK_SIZE_M"]
+    bn_half = 64
+    n_half = B.shape[1] // 2
+    naive = sorted_token_ids is None
+    if not naive:
+        EM = min(sorted_token_ids.size(0), num_valid_tokens * bm)
+    else:
+        EM = num_valid_tokens * bm
+    grid = (triton.cdiv(EM, bm) * triton.cdiv(n_half, bn_half),)
+    fused_moe_gate_up_gelu_tanh_kernel[grid](
+        A,
+        B,
+        C_act,
+        sorted_token_ids if not naive else expert_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N_HALF=n_half,
+        K=B.shape[2],
+        EM=EM,
+        num_valid_tokens=num_valid_tokens,
+        stride_am=A.stride(0),
+        stride_ak=A.stride(1),
+        stride_be=B.stride(0),
+        stride_bk=B.stride(2),
+        stride_bn=B.stride(1),
+        stride_cm=C_act.stride(0),
+        stride_cn=C_act.stride(1),
+        naive_block_assignment=naive,
+        BLOCK_SIZE_M=bm,
+        BN_HALF=bn_half,
+        BLOCK_SIZE_K=p2a_cfg["BLOCK_SIZE_K"],
+        GROUP_SIZE_M=p2a_cfg["GROUP_SIZE_M"],
+        top_k=top_k,
+        BETA=_GELU_TANH_BETA_F32,
+        KAPPA=_GELU_TANH_KAPPA_F32,
+        num_warps=p2a_cfg["num_warps"],
+        num_stages=p2a_cfg["num_stages"],
+    )
+
+
 def invoke_fused_moe_wna16_cuda_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1862,33 +2087,60 @@ def fused_experts_impl(
         weights_host_resident=_weights_host_resident(w1, w2),
     )
 
-    dispatch_fused_moe_kernel(
+    p2a_cfg = resolve_sm80_p2a_config(
         qhidden_states,
         w1,
-        intermediate_cache1,
-        a1q_scale,
-        w1_scale,
-        w1_zp,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        apply_router_weight_on_input,
-        top_k_num,
+        activation_enum,
         config,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        block_shape=block_shape,
-        B_bias=w1_bias,
+        is_quantized=(
+            quant_dtype is not None
+            or use_fp8_w8a8
+            or use_int8_w8a8
+            or use_int8_w8a16
+            or use_int4_w4a16
+        ),
+        has_bias=(w1_bias is not None),
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
+    if p2a_cfg is not None:
+        invoke_sm80_fused_gate_up_gelu_tanh(
+            qhidden_states,
+            w1,
+            intermediate_cache2,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k_num,
+            p2a_cfg,
+        )
+    else:
+        dispatch_fused_moe_kernel(
+            qhidden_states,
+            w1,
+            intermediate_cache1,
+            a1q_scale,
+            w1_scale,
+            w1_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input,
+            top_k_num,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            B_bias=w1_bias,
+        )
 
-    apply_moe_activation(
-        activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
-    )
+        apply_moe_activation(
+            activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+        )
 
     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
         A=intermediate_cache2,
