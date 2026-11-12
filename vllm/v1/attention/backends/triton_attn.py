@@ -186,6 +186,18 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                     "Triton attention: Gemma4 64-segment decode on (max_seqs=%d).",
                     self.max_seqs_64_segments,
                 )
+        self.is_sm80_gemma4_sliding = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and model_config.hf_config.model_type in _GEMMA4_MODEL_TYPES
+            and kv_cache_spec.sliding_window is not None
+            and self.num_heads_kv == 8
+            and self.headdim == 256
+        )
+        if self.is_sm80_gemma4_sliding:
+            logger.info_once(
+                "Triton attention: Gemma4 wave-aware sliding 3D decode on."
+            )
         headdim_padded = next_power_of_2(self.headdim)
         max_query_len_3d = 1
         speculative_config = vllm_config.speculative_config
@@ -305,6 +317,34 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
                 -1, self.num_heads_q, segments
             )
+        elif self.is_sm80_gemma4_sliding:
+            n_rows = max(seq_lens.shape[0], num_actual_tokens)
+            if 9 <= n_rows <= 16:
+                segments = 8
+                target_thresh = 16
+            elif 25 <= n_rows <= 36:
+                segments = 4
+                target_thresh = 36
+            else:
+                segments = 0
+                target_thresh = 16
+            if segments > 0:
+                seg_out = self.softmax_segm_output.view(
+                    -1,
+                    self.num_heads_q,
+                    segments,
+                    self.softmax_segm_output.shape[-1],
+                )
+                if seg_out.shape[0] >= n_rows:
+                    attn_metadata.seq_threshold_3D = target_thresh
+                    attn_metadata.num_par_softmax_segments = segments
+                    attn_metadata.softmax_segm_output = seg_out
+                    attn_metadata.softmax_segm_max = self.softmax_segm_max.view(
+                        -1, self.num_heads_q, segments
+                    )
+                    attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
+                        -1, self.num_heads_q, segments
+                    )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
         if mm_ranges is not None:
