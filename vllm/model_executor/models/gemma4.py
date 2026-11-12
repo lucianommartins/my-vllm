@@ -1840,7 +1840,129 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        _apply_gemma4_wsp_patches(self)
+        return loaded
+
+
+def _apply_gemma4_wsp_patches(model: nn.Module) -> int:
+    """Opt-in runtime loader for go/gemma-wsp .wsp.npz / SAFEx weight patches.
+
+    Controlled via VLLM_GEMMA4_WSP_PATCH_PATH (comma-separated .npz path(s)).
+    When unset (default), performs zero work and leaves checkpoints untouched.
+    """
+    import os
+    import re
+    import numpy as np
+
+    raw_paths = os.environ.get("VLLM_GEMMA4_WSP_PATCH_PATH", "").strip()
+    if not raw_paths:
+        return 0
+
+    param_map: dict[str, torch.Tensor] = {}
+    for k, p in model.named_parameters():
+        param_map[k] = p.data
+    for k, b in model.named_buffers():
+        param_map[k] = b
+
+    re_mlp = re.compile(r"^layers\.(\d+)\.mlp\.(gate_proj|up_proj)\.weight$")
+    re_exp = re.compile(
+        r"^layers\.(\d+)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+    )
+    re_exp_packed = re.compile(
+        r"^layers\.(\d+)\.experts\.(gate_up_proj|down_proj)(?:\.weight)?$"
+    )
+
+    total_applied = 0
+    for path in (p.strip() for p in raw_paths.split(",") if p.strip()):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"VLLM_GEMMA4_WSP_PATCH_PATH file not found: {path}"
+            )
+        with np.load(path, allow_pickle=False) as npz:
+            for raw_key in npz.files:
+                key = raw_key
+                for pfx in ("model.language_model.", "language_model.model.", "model."):
+                    if key.startswith(pfx):
+                        key = key[len(pfx) :]
+                        break
+                arr = torch.from_numpy(npz[raw_key])
+
+                if key in param_map:
+                    dst = param_map[key]
+                    if dst.shape != arr.shape:
+                        raise ValueError(
+                            f"WSP shape mismatch for {raw_key}: got {tuple(arr.shape)}, expected {tuple(dst.shape)}"
+                        )
+                    dst.copy_(arr.to(device=dst.device, dtype=dst.dtype))
+                    total_applied += 1
+                    continue
+
+                m_mlp = re_mlp.match(key)
+                if m_mlp:
+                    l_idx = int(m_mlp.group(1))
+                    which = m_mlp.group(2)
+                    gu = model.layers[l_idx].mlp.gate_up_proj.weight.data
+                    inter = gu.shape[0] // 2
+                    target = gu[:inter] if which == "gate_proj" else gu[inter:]
+                    if target.shape != arr.shape:
+                        raise ValueError(
+                            f"WSP MLP shape mismatch for {raw_key}: got {tuple(arr.shape)}, expected {tuple(target.shape)}"
+                        )
+                    target.copy_(arr.to(device=target.device, dtype=target.dtype))
+                    total_applied += 1
+                    continue
+
+                m_exp = re_exp.match(key)
+                if m_exp:
+                    l_idx = int(m_exp.group(1))
+                    e_idx = int(m_exp.group(2))
+                    which = m_exp.group(3)
+                    exps = model.layers[l_idx].experts
+                    if which in ("gate_proj", "up_proj"):
+                        w13 = exps.w13_weight.data
+                        inter = w13.shape[1] // 2
+                        target = (
+                            w13[e_idx, :inter]
+                            if which == "gate_proj"
+                            else w13[e_idx, inter:]
+                        )
+                    else:
+                        target = exps.w2_weight.data[e_idx]
+                    if target.shape != arr.shape:
+                        raise ValueError(
+                            f"WSP expert shape mismatch for {raw_key}: got {tuple(arr.shape)}, expected {tuple(target.shape)}"
+                        )
+                    target.copy_(arr.to(device=target.device, dtype=target.dtype))
+                    total_applied += 1
+                    continue
+
+                m_pk = re_exp_packed.match(key)
+                if m_pk:
+                    l_idx = int(m_pk.group(1))
+                    which = m_pk.group(2)
+                    exps = model.layers[l_idx].experts
+                    target = (
+                        exps.w13_weight.data
+                        if which == "gate_up_proj"
+                        else exps.w2_weight.data
+                    )
+                    if target.shape != arr.shape:
+                        raise ValueError(
+                            f"WSP packed expert shape mismatch for {raw_key}: got {tuple(arr.shape)}, expected {tuple(target.shape)}"
+                        )
+                    target.copy_(arr.to(device=target.device, dtype=target.dtype))
+                    total_applied += 1
+                    continue
+
+                raise ValueError(f"Unsupported WSP patch tensor key: {raw_key}")
+
+        logger.info(
+            "Applied Gemma4 WSP weight patch (%d tensors) from %s",
+            total_applied,
+            path,
+        )
+    return total_applied
 
 
 class Gemma4ForCausalLM(
