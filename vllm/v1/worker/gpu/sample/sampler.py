@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -83,6 +84,11 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        self.needs_pre_top_k_proc = np.zeros(max_num_reqs, dtype=bool)
+        self._is_sm80_cuda = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+        )
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -94,13 +100,14 @@ class Sampler:
         )
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
-        needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
+        needs_sampling = self.sampling_states.add_request(req_idx, sampling_params)
+        needs_pre_proc = self.thinking_budget_state.add_request(
             req_idx, sampling_params
         )
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing
+            needs_pre_proc |= processor.add_request(req_idx, sampling_params)
+        self.needs_pre_top_k_proc[req_idx] = needs_pre_proc
+        self.needs_logits_processing[req_idx] = needs_sampling or needs_pre_proc
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
@@ -281,6 +288,46 @@ class Sampler:
         seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._is_sm80_cuda
+            and logits.is_cuda
+            and logits.ndim == 2
+            and logits.shape[-1] <= 262144
+            and logits.dtype in (torch.bfloat16, torch.float32)
+            and not self.return_sampling_mask
+            and not self.use_fp64_gumbel
+            and not envs.VLLM_BATCH_INVARIANT
+            and not (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            and idx_mapping_np.size > 0
+            and not np.any(self.needs_pre_top_k_proc[idx_mapping_np])
+            and np.all(self.sampling_states.min_p.np[idx_mapping_np] == 0.0)
+        ):
+            temp_np = self.sampling_states.temperature.np[idx_mapping_np]
+            if np.all(temp_np == 0.0):
+                from vllm._gemma4_sm80_ops import fast_greedy_argmax
+
+                return fast_greedy_argmax(logits), logits
+            if not np.any(temp_np == 0.0):
+                top_k_np = self.sampling_states.top_k.np[idx_mapping_np]
+                max_k = int(np.max(top_k_np))
+                if 1 <= max_k <= 256:
+                    from vllm._gemma4_sm80_ops import fast_topk_topp_gumbel_sample
+
+                    do_top_p = bool(
+                        np.any(self.sampling_states.top_p.np[idx_mapping_np] < 1.0)
+                    )
+                    sampled = fast_topk_topp_gumbel_sample(
+                        logits,
+                        expanded_idx_mapping,
+                        self.sampling_states.temperature.gpu,
+                        self.sampling_states.top_k.gpu,
+                        self.sampling_states.top_p.gpu if do_top_p else None,
+                        self.sampling_states.seeds.gpu,
+                        pos,
+                        max_k,
+                    )
+                    return sampled, logits
+
         processed_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,

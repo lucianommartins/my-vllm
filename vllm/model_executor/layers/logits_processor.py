@@ -111,6 +111,18 @@ class LogitsProcessor(PluggableLayer):
             )
         if logits is not None:
             if self.soft_cap is not None:
+                if (
+                    current_platform.is_cuda()
+                    and current_platform.is_device_capability((8, 0))
+                    and logits.is_cuda
+                    and logits.is_contiguous()
+                    and logits.dtype in (torch.bfloat16, torch.float32)
+                    and not torch.is_grad_enabled()
+                ):
+                    from vllm._gemma4_sm80_ops import fused_softcap_inplace
+
+                    fused_softcap_inplace(logits, self.soft_cap, self.scale)
+                    return logits
                 logits = logits / self.soft_cap
                 logits = torch.tanh(logits)
                 logits = logits * self.soft_cap
