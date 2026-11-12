@@ -1043,6 +1043,70 @@ def unified_attention(
         and chunk_lookback < 0
     )
     plain_sm80_prefill = is_sm80_prefill and not use_mm_prefix and softcap <= 0
+    if (
+        plain_sm80_prefill
+        and use_causal
+        and not is_batch_invariant
+        and output_scale is None
+        and q_descale is None
+        and q.stride(-1) == 1
+        and out.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and q.dtype == k.dtype == v.dtype == out.dtype
+    ):
+        if (
+            head_size == 256
+            and block_size % 16 == 0
+            and q.dtype in (torch.bfloat16, torch.float16)
+        ):
+            from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+            logger.info_once(
+                "Enabled SM80 zero-copy C++ FA2 paged prefill on head_size=256"
+            )
+            flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_k=max_seqlen_k,
+                seqused_k=seqused_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=list(window_size),
+                softcap=0.0,
+                block_table=block_table,
+                fa_version=2,
+            )
+            return
+        if (
+            head_size == 512
+            and num_queries_per_kv == 8
+            and block_size % 32 == 0
+            and window_size[0] < 0
+            and q.dtype == torch.bfloat16
+            and q.stride(1) == 512
+            and out.stride(1) == 512
+        ):
+            from vllm._gemma4_sm80_ops import paged_fa2_hd512
+
+            logger.info_once(
+                "Enabled SM80 CUDA mma.sync pipelined Paged FA2 prefill on head_size=512"
+            )
+            paged_fa2_hd512(
+                out=out,
+                q=q,
+                k_cache=k,
+                v_cache=v,
+                block_table=block_table,
+                seqused_k=seqused_k,
+                cu_seqlens_q=cu_seqlens_q,
+                scale=softmax_scale,
+            )
+            return
     stage_v_after_softmax = False
     if is_sm80_prefill:
         launch_num_warps = 8
