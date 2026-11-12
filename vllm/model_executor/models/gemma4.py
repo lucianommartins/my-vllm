@@ -25,6 +25,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.utils import getattr_iter
@@ -37,6 +38,10 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import (
+    get_attention_context,
+    unified_attention_with_output,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
@@ -63,6 +68,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
 from .interfaces import (
@@ -128,6 +139,174 @@ def _gemma4_layer_weights_mapper(config) -> WeightsMapper:
         },
         orig_to_new_stacked=stacked,
     )
+
+
+@triton.jit
+def _gemma4_qkv_norm_rope_cache_kernel(
+    qkv_ptr,
+    positions_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_ptr,
+    slot_mapping_ptr,
+    q_out_ptr,
+    kv_cache_ptr,
+    qkv_stride_t: tl.int64,
+    pos_stride_t: tl.int64,
+    slot_stride_t: tl.int64,
+    q_out_stride_t: tl.int64,
+    kv_stride_blk: tl.int64,
+    kv_stride_h: tl.int64,
+    kv_stride_slot: tl.int64,
+    num_slots: tl.int32,
+    eps: tl.float32,
+    NUM_Q: tl.constexpr,
+    NUM_KV: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HALF_HD: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    tok_idx = tl.program_id(0).to(tl.int64)
+    head_id = tl.program_id(1)
+    offs = tl.arange(0, HALF_HD)
+    offs_full = tl.arange(0, HEAD_SIZE)
+
+    base_in = qkv_ptr + tok_idx * qkv_stride_t + head_id * HEAD_SIZE
+    xf = tl.load(base_in + offs_full).to(tl.float32)
+    var = tl.sum(xf * xf, axis=0) / HEAD_SIZE
+    inv_rms = tl.math.rsqrt(var + eps)
+
+    x1 = tl.load(base_in + offs).to(tl.float32)
+    x2 = tl.load(base_in + HALF_HD + offs).to(tl.float32)
+
+    if head_id < NUM_Q + NUM_KV:
+        w_ptr = q_weight_ptr if head_id < NUM_Q else k_weight_ptr
+        w1 = tl.load(w_ptr + offs).to(tl.float32)
+        w2 = tl.load(w_ptr + HALF_HD + offs).to(tl.float32)
+        n1 = x1 * inv_rms * w1
+        n2 = x2 * inv_rms * w2
+
+        pos = tl.load(positions_ptr + tok_idx * pos_stride_t).to(tl.int64)
+        cs_base = cos_sin_ptr + pos * HEAD_SIZE
+        cos = tl.load(cs_base + offs).to(tl.float32)
+        sin = tl.load(cs_base + HALF_HD + offs).to(tl.float32)
+
+        o1 = (n1 * cos - n2 * sin).to(tl.bfloat16)
+        o2 = (n2 * cos + n1 * sin).to(tl.bfloat16)
+
+        if head_id < NUM_Q:
+            q_base = q_out_ptr + tok_idx * q_out_stride_t + head_id * HEAD_SIZE
+            tl.store(q_base + offs, o1)
+            tl.store(q_base + HALF_HD + offs, o2)
+        elif tok_idx < num_slots:
+            slot = tl.load(slot_mapping_ptr + tok_idx * slot_stride_t).to(tl.int64)
+            if slot >= 0:
+                kh = head_id - NUM_Q
+                blk = slot // BLOCK_SIZE
+                boff = slot % BLOCK_SIZE
+                k_dst = (
+                    kv_cache_ptr
+                    + blk * kv_stride_blk
+                    + kh * kv_stride_h
+                    + boff * kv_stride_slot
+                )
+                tl.store(k_dst + offs, o1)
+                tl.store(k_dst + HALF_HD + offs, o2)
+    elif tok_idx < num_slots:
+        slot = tl.load(slot_mapping_ptr + tok_idx * slot_stride_t).to(tl.int64)
+        if slot >= 0:
+            vh = head_id - (NUM_Q + NUM_KV)
+            v1 = (x1 * inv_rms).to(tl.bfloat16)
+            v2 = (x2 * inv_rms).to(tl.bfloat16)
+            blk = slot // BLOCK_SIZE
+            boff = slot % BLOCK_SIZE
+            v_dst = (
+                kv_cache_ptr
+                + blk * kv_stride_blk
+                + vh * kv_stride_h
+                + boff * kv_stride_slot
+                + HEAD_SIZE
+            )
+            tl.store(v_dst + offs, v1)
+            tl.store(v_dst + HALF_HD + offs, v2)
+
+
+def gemma4_qkv_norm_rope_cache(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    layer_name: LayerNameType,
+    eps: float,
+) -> torch.Tensor:
+    resolved = _resolve_layer_name(layer_name)
+    _, _, kv_cache, layer_slot_mapping = get_attention_context(resolved)
+    if layer_slot_mapping is None or kv_cache is None or kv_cache.numel() == 0:
+        q_out.zero_()
+        return qkv.new_empty(0)
+    num_tokens = qkv.shape[0]
+    if num_tokens == 0:
+        return qkv.new_empty(0)
+    nq = q_out.shape[1]
+    hd = q_out.shape[2]
+    nkv = kv_cache.shape[1]
+    bs = kv_cache.shape[2]
+    assert (
+        kv_cache.ndim == 4
+        and kv_cache.shape[3] == 2 * hd
+        and kv_cache.stride(3) == 1
+        and q_out.is_contiguous()
+    )
+    nw = 2 if (hd == 512 and num_tokens >= 256) else 1
+    _gemma4_qkv_norm_rope_cache_kernel[(num_tokens, nq + 2 * nkv)](
+        qkv,
+        positions,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        layer_slot_mapping,
+        q_out,
+        kv_cache,
+        qkv.stride(0),
+        positions.stride(0),
+        layer_slot_mapping.stride(0),
+        q_out.stride(0),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        int(layer_slot_mapping.shape[0]),
+        eps,
+        NUM_Q=nq,
+        NUM_KV=nkv,
+        HEAD_SIZE=hd,
+        HALF_HD=hd // 2,
+        BLOCK_SIZE=bs,
+        num_warps=nw,
+    )
+    return qkv.new_empty(0)
+
+
+def gemma4_qkv_norm_rope_cache_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    layer_name: LayerNameType,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+
+
+direct_register_custom_op(
+    op_name="gemma4_qkv_norm_rope_cache",
+    op_func=gemma4_qkv_norm_rope_cache,
+    mutates_args=["q_out"],
+    fake_impl=gemma4_qkv_norm_rope_cache_fake,
+)
 
 
 @triton.jit
@@ -539,6 +718,31 @@ class Gemma4Attention(nn.Module):
             mm_prefix_clamp_sliding_window=self.is_sliding,
             prefix=f"{prefix}.attn",
         )
+        self._use_fused_qkv_norm_rope_cache = (
+            current_platform.is_cuda()
+            and not self.is_kv_shared_layer
+            and not self.attn.attn_backend.forward_includes_kv_cache_update
+            and self.attn.kv_sharing_target_layer_name is None
+            and self.attn.kv_cache_dtype in ("auto", "bfloat16")
+            and self.attn.query_quant is None
+            and not getattr(self.attn.impl, "_is_per_token_head_quant", False)
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and getattr(self.rotary_emb, "rotary_dim", -1) == self.head_dim
+            and self.head_dim in (256, 512)
+            and self.v_norm.variance_epsilon == self.q_norm.variance_epsilon
+            and self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
+            and self.attn.impl.__class__.__name__
+            in ("TritonAttentionImpl", "FlashAttentionImpl")
+        )
+        if self._use_fused_qkv_norm_rope_cache:
+            if self.rotary_emb.cos_sin_cache.dtype != torch.bfloat16:
+                self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(
+                    torch.bfloat16
+                )
+            logger.info_once(
+                "Enabled fused Gemma4 QKV-Norm+RoPE+Cache on head_dim=%d",
+                self.head_dim,
+            )
 
     def forward(
         self,
@@ -558,21 +762,82 @@ class Gemma4Attention(nn.Module):
             # For k_eq_v, K weights are loaded into both K and V slots of
             # qkv_proj, so V == K automatically.
             qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if (
+                self._use_fused_qkv_norm_rope_cache
+                and qkv.dtype == torch.bfloat16
+                and qkv.stride(-1) == 1
+                and self.rotary_emb.cos_sin_cache.dtype == torch.bfloat16
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                num_tokens = qkv.shape[0]
+                pos_flat = positions.reshape(-1)
+                cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+                q_out = torch.empty(
+                    (num_tokens, self.num_heads, self.head_dim),
+                    dtype=qkv.dtype,
+                    device=qkv.device,
+                )
+                attn_out = torch.empty(
+                    (num_tokens, self.num_heads, self.head_dim),
+                    dtype=qkv.dtype,
+                    device=qkv.device,
+                )
+                if self.attn.use_direct_call:
+                    kv_dep = gemma4_qkv_norm_rope_cache(
+                        qkv,
+                        pos_flat,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos_sin_cache,
+                        q_out,
+                        self.attn.layer_name,
+                        self.q_norm.variance_epsilon,
+                    )
+                    unified_attention_with_output(
+                        q_out,
+                        None,
+                        None,
+                        attn_out,
+                        self.attn.layer_name,
+                        kv_cache_dummy_dep=kv_dep,
+                    )
+                else:
+                    encoded = _encode_layer_name(self.attn.layer_name)
+                    kv_dep = torch.ops.vllm.gemma4_qkv_norm_rope_cache(
+                        qkv,
+                        pos_flat,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos_sin_cache,
+                        q_out,
+                        encoded,
+                        self.q_norm.variance_epsilon,
+                    )
+                    torch.ops.vllm.unified_attention_with_output(
+                        q_out,
+                        None,
+                        None,
+                        attn_out,
+                        encoded,
+                        kv_cache_dummy_dep=kv_dep,
+                    )
+                attn_output = attn_out.view(num_tokens, self.q_size)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            q = q.unflatten(-1, (self.num_heads, self.head_dim))
-            q = self.q_norm(q)
-            q = q.flatten(-2, -1)
+                q = q.unflatten(-1, (self.num_heads, self.head_dim))
+                q = self.q_norm(q)
+                q = q.flatten(-2, -1)
 
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k)
+                k = k.flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
 
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
-            attn_output = self.attn(q, k, v)
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
+                v = v.flatten(-2, -1)
+                attn_output = self.attn(q, k, v)
 
         output, _ = self.o_proj(attn_output)
 
