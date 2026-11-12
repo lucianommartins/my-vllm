@@ -57,6 +57,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -473,8 +474,33 @@ class Gemma4MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = get_act_and_mul_fn(hidden_activation)
+        self._use_sm80_skinny_mlp = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and get_tensor_model_parallel_world_size() == 1
+            and hidden_size == 2816
+            and intermediate_size == 2112
+            and hidden_activation == "gelu_pytorch_tanh"
+            and isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+        )
+        if self._use_sm80_skinny_mlp:
+            import vllm._gemma4_sm80_ops  # noqa: F401
+
+            logger.info_once("Enabled SM80 Gemma4 skinny M<=4 deterministic GEMVs")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self._use_sm80_skinny_mlp
+            and x.dtype == torch.bfloat16
+            and type(self.gate_up_proj) is MergedColumnParallelLinear
+            and type(self.down_proj) is RowParallelLinear
+            and self.gate_up_proj.weight.dtype == torch.bfloat16
+            and self.down_proj.weight.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            x = torch.ops.vllm.gemma4_mlp_gate_up_gelu(x, self.gate_up_proj.weight)
+            return torch.ops.vllm.gemma4_skinny_linear(x, self.down_proj.weight, 4)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -743,6 +769,19 @@ class Gemma4Attention(nn.Module):
                 "Enabled fused Gemma4 QKV-Norm+RoPE+Cache on head_dim=%d",
                 self.head_dim,
             )
+        self._use_sm80_skinny_attn_proj = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and tp_size == 1
+            and hidden_size == 2816
+            and not config.attention_bias
+            and not self.is_kv_shared_layer
+            and isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and self.q_size in (4096, 8192)
+        )
+        if self._use_sm80_skinny_attn_proj:
+            import vllm._gemma4_sm80_ops  # noqa: F401
 
     def forward(
         self,
@@ -761,7 +800,18 @@ class Gemma4Attention(nn.Module):
         else:
             # For k_eq_v, K weights are loaded into both K and V slots of
             # qkv_proj, so V == K automatically.
-            qkv, _ = self.qkv_proj(hidden_states)
+            if (
+                self._use_sm80_skinny_attn_proj
+                and hidden_states.dtype == torch.bfloat16
+                and type(self.qkv_proj) is QKVParallelLinear
+                and self.qkv_proj.weight.dtype == torch.bfloat16
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                qkv = torch.ops.vllm.gemma4_skinny_linear(
+                    hidden_states, self.qkv_proj.weight, 2
+                )
+            else:
+                qkv, _ = self.qkv_proj(hidden_states)
             if (
                 self._use_fused_qkv_norm_rope_cache
                 and qkv.dtype == torch.bfloat16
@@ -839,7 +889,18 @@ class Gemma4Attention(nn.Module):
                 v = v.flatten(-2, -1)
                 attn_output = self.attn(q, k, v)
 
-        output, _ = self.o_proj(attn_output)
+        if (
+            self._use_sm80_skinny_attn_proj
+            and attn_output.dtype == torch.bfloat16
+            and type(self.o_proj) is RowParallelLinear
+            and self.o_proj.weight.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            output = torch.ops.vllm.gemma4_skinny_linear(
+                attn_output, self.o_proj.weight, 2 if self.is_sliding else 1
+            )
+        else:
+            output, _ = self.o_proj(attn_output)
 
         return output
 
@@ -994,6 +1055,63 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Layer scalar (loaded from checkpoint) — applies to ALL text layers
         self.register_buffer("layer_scalar", torch.ones(1))
+        self._use_sm80_fused_moe_norms = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and self.hidden_size == 2816
+            and self.enable_moe_block
+            and self.per_layer_input_gate is None
+        )
+        self._root_size_bf16_f = (
+            float(self.router.root_size.to(torch.bfloat16).item())
+            if self.router is not None
+            else 0.0
+        )
+        if self._use_sm80_fused_moe_norms:
+            import vllm._gemma4_sm80_ops  # noqa: F401
+
+    def forward_sm80_cross_norm(
+        self,
+        positions: torch.Tensor,
+        normed_in: torch.Tensor,
+        residual: torch.Tensor,
+        next_norm_weight: torch.Tensor,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_out = self.self_attn(
+            positions=positions,
+            hidden_states=normed_in,
+            **kwargs,
+        )
+        assert self.router is not None
+        assert self.experts is not None
+        assert self.pre_feedforward_layernorm_2 is not None
+        assert self.post_feedforward_layernorm_1 is not None
+        assert self.post_feedforward_layernorm_2 is not None
+        h_res, h_ff1, h_ff2, h_router = torch.ops.vllm.gemma4_post_attn_pre_ffn_norms(
+            attn_out,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm_2.weight,
+            self.router.scale,
+            self._root_size_bf16_f,
+            self.post_attention_layernorm.variance_epsilon,
+        )
+        mlp_out = self.mlp(h_ff1)
+        router_logits, _ = self.router.proj(h_router)
+        moe_out = self.experts(h_ff2, router_logits)
+        return torch.ops.vllm.gemma4_post_ffn_cross_layer_norms(
+            mlp_out,
+            moe_out,
+            h_res,
+            self.post_feedforward_layernorm_1.weight,
+            self.post_feedforward_layernorm_2.weight,
+            self.post_feedforward_layernorm.weight,
+            self.layer_scalar,
+            next_norm_weight,
+            self.post_feedforward_layernorm.variance_epsilon,
+        )
 
     def forward(
         self,
@@ -1481,6 +1599,20 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             return IntermediateTensors(tensors)
 
         self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
+        self._use_sm80_cross_layer_norms = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and not self.fast_prefill_enabled
+            and get_pp_group().is_first_rank
+            and get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+            and all(
+                not isinstance(l, PPMissingLayer) and l._use_sm80_fused_moe_norms
+                for l in self.layers[self.start_layer : self.end_layer]
+            )
+        )
+        if self._use_sm80_cross_layer_norms:
+            logger.info_once("Enabled SM80 Gemma4 fused cross-layer Multi-RMSNorms")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.self_decoder.embed_input_ids(input_ids)
@@ -1640,6 +1772,31 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = intermediate_tensors["hidden_states"]
             if per_layer_inputs is not None:
                 per_layer_inputs = intermediate_tensors["per_layer_inputs"]
+        if (
+            self._use_sm80_cross_layer_norms
+            and per_layer_inputs is None
+            and len(self.aux_hidden_state_layers) == 0
+            and hidden_states.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            active_layers = self.layers[self.start_layer : self.end_layer]
+            num_active = len(active_layers)
+            residual_cur = hidden_states
+            normed_cur = active_layers[0].input_layernorm(residual_cur)
+            for idx, layer in enumerate(active_layers):
+                nxt_w = (
+                    active_layers[idx + 1].input_layernorm.weight
+                    if idx + 1 < num_active
+                    else self.norm.weight
+                )
+                residual_cur, normed_cur = layer.forward_sm80_cross_norm(
+                    positions,
+                    normed_cur,
+                    residual_cur,
+                    nxt_w,
+                    **kwargs,
+                )
+            return normed_cur
         residual = None
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
