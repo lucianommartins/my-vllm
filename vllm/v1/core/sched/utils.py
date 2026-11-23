@@ -3,8 +3,12 @@
 import contextlib
 from collections.abc import Sequence
 
-from vllm.sampling_params import RepetitionDetectionParams
+from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
 from vllm.v1.request import Request, RequestStatus
+
+_FINISHED_STOPPED = RequestStatus.FINISHED_STOPPED
+_FINISHED_LENGTH_CAPPED = RequestStatus.FINISHED_LENGTH_CAPPED
+_FINISHED_REPETITION = RequestStatus.FINISHED_REPETITION
 
 
 def _has_repeating_pattern(
@@ -101,21 +105,34 @@ def check_stop(request: Request, max_model_len: int) -> bool:
     sampling_params = request.sampling_params
     assert sampling_params is not None
 
-    last_token_id = request.output_token_ids[-1]
-    if last_token_id == sampling_params.eos_token_id:
-        request.status = RequestStatus.FINISHED_STOPPED
+    if type(request) is Request:
+        out_tokens = request._output_token_ids
+        last_token_id = out_tokens[-1]
+        num_tokens = len(request._all_token_ids)
+        num_output_tokens = len(out_tokens)
+    else:
+        out_tokens = request.output_token_ids
+        last_token_id = out_tokens[-1]
+        num_tokens = request.num_tokens
+        num_output_tokens = request.num_output_tokens
+
+    eos_token_id = (
+        sampling_params._eos_token_id
+        if type(sampling_params) is SamplingParams
+        else sampling_params.eos_token_id
+    )
+    if last_token_id == eos_token_id:
+        request.status = _FINISHED_STOPPED
         return True
 
-    if last_token_id in (sampling_params.stop_token_ids or ()):
-        request.status = RequestStatus.FINISHED_STOPPED
+    stop_token_ids = sampling_params.stop_token_ids
+    if stop_token_ids and last_token_id in stop_token_ids:
+        request.status = _FINISHED_STOPPED
         request.stop_reason = last_token_id
         return True
 
-    if (
-        request.num_tokens >= max_model_len
-        or request.num_output_tokens >= request.max_tokens
-    ):
-        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    if num_tokens >= max_model_len or num_output_tokens >= request.max_tokens:
+        request.status = _FINISHED_LENGTH_CAPPED
         return True
 
     # Note(arpera):
@@ -123,17 +140,17 @@ def check_stop(request: Request, max_model_len: int) -> bool:
     # If you decide to change the order, first look at these PRs please:
     # 47489, 49521, and 51299
     # These PRs show some reasoning about the order of checks
-    if request.num_output_tokens < sampling_params.min_tokens:
+    if num_output_tokens < sampling_params.min_tokens:
         return False
 
     repetition_detection = sampling_params.repetition_detection
     if repetition_detection is not None and (
         check_sequence_repetition(
-            request.output_token_ids,
+            out_tokens,
             repetition_detection,
         )
     ):
-        request.status = RequestStatus.FINISHED_REPETITION
+        request.status = _FINISHED_REPETITION
         request.stop_reason = "repetition_detected"
         return True
 

@@ -425,6 +425,8 @@ class CommonAttentionMetadata:
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
     max_logits_per_req: int | None = None
+    logits_query_start_loc: torch.Tensor | None = None
+    logits_query_start_loc_cpu: torch.Tensor | None = None
 
     # Needed by CrossAttentionBuilder
     encoder_seq_lens: torch.Tensor | None = None

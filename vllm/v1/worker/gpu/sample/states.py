@@ -37,31 +37,50 @@ class SamplingStates:
         self.num_logprobs = np.empty(self.max_num_reqs, dtype=np.int32)
         # -1 means no logprobs are requested.
         self.num_logprobs.fill(NO_LOGPROBS)
+        self._has_any_logprobs = False
+        self.epoch = 0
+        self._dirty_mask = 0
+        self._uva_buffers = (
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.min_p,
+            self.seeds,
+        )
+
+    def _set_uva(self, idx: int, req_idx: int, value: float | int) -> None:
+        buf = self._uva_buffers[idx]
+        if buf.np[req_idx] != value:
+            buf.np[req_idx] = value
+            self._dirty_mask |= 1 << idx
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
+        self.epoch += 1
         temperature = sampling_params.temperature
         top_k = sampling_params.top_k
         top_p = sampling_params.top_p
         min_p = sampling_params.min_p
 
-        self.temperature.np[req_idx] = temperature
-        self.top_p.np[req_idx] = top_p
+        self._set_uva(0, req_idx, temperature)
+        self._set_uva(1, req_idx, top_p)
         if top_k <= 0 or top_k > self.vocab_size:
             top_k = self.vocab_size
-        self.top_k.np[req_idx] = top_k
-        self.min_p.np[req_idx] = min_p
+        self._set_uva(2, req_idx, top_k)
+        self._set_uva(3, req_idx, min_p)
 
         seed = sampling_params.seed
         self.seeds_set[req_idx] = seed is not None
         if seed is None:
             seed = np.random.randint(_NP_INT64_MIN, _NP_INT64_MAX)
-        self.seeds.np[req_idx] = seed
+        self._set_uva(4, req_idx, seed)
 
         num_logprobs = sampling_params.logprobs
         if num_logprobs is None:
             num_logprobs = NO_LOGPROBS
-        elif num_logprobs == -1:
-            num_logprobs = self.vocab_size
+        else:
+            self._has_any_logprobs = True
+            if num_logprobs == -1:
+                num_logprobs = self.vocab_size
         self.num_logprobs[req_idx] = num_logprobs
 
         return temperature != 0.0 and (
@@ -72,11 +91,13 @@ class SamplingStates:
         )
 
     def apply_staged_writes(self) -> None:
-        self.temperature.copy_to_uva()
-        self.top_p.copy_to_uva()
-        self.top_k.copy_to_uva()
-        self.min_p.copy_to_uva()
-        self.seeds.copy_to_uva()
+        mask = self._dirty_mask
+        if not mask:
+            return
+        for idx, buf in enumerate(self._uva_buffers):
+            if mask & (1 << idx):
+                buf.copy_to_uva()
+        self._dirty_mask = 0
 
     def apply_temperature(
         self,
@@ -142,4 +163,6 @@ class SamplingStates:
         return bool(np.any(self.seeds_set[idx_mapping_np]))
 
     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
+        if not self._has_any_logprobs:
+            return NO_LOGPROBS
         return int(np.max(self.num_logprobs[idx_mapping_np]))

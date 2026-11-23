@@ -31,7 +31,10 @@ from vllm.tracing import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
-from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+from vllm.v1.engine.detokenizer import (
+    FastIncrementalDetokenizer,
+    IncrementalDetokenizer,
+)
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
@@ -50,6 +53,40 @@ if TYPE_CHECKING:
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
 
 
+class _CollectorReadyCompat:
+    """Lightweight compatibility view for ``collector.ready`` callers in tests."""
+
+    __slots__ = ("_collector",)
+
+    def __init__(self, collector: "RequestOutputCollector") -> None:
+        self._collector = collector
+
+    def is_set(self) -> bool:
+        return self._collector.output is not None
+
+    def set(self) -> None:
+        self._collector._wake_waiter()
+
+    def clear(self) -> None:
+        pass
+
+    async def wait(self) -> bool:
+        c = self._collector
+        if c.output is None:
+            loop = c._loop
+            if loop is None:
+                loop = c._loop = asyncio.get_running_loop()
+            while c.output is None:
+                waiter = loop.create_future()
+                c._waiter = waiter
+                try:
+                    await waiter
+                finally:
+                    if c._waiter is waiter:
+                        c._waiter = None
+        return True
+
+
 class RequestOutputCollector:
     """Collects streamed RequestOutputs per individual request,
     for hand-off to the consuming asyncio generate task.
@@ -62,32 +99,61 @@ class RequestOutputCollector:
         self.aggregate = output_kind == RequestOutputKind.DELTA
         self.request_id = request_id
         self.output: RequestOutput | PoolingRequestOutput | Exception | None = None
-        self.ready = asyncio.Event()
+        self._waiter: asyncio.Future[None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         self._input_stream_task: asyncio.Task | None = None
 
+    @property
+    def ready(self) -> _CollectorReadyCompat:
+        return _CollectorReadyCompat(self)
+
+    def _wake_waiter(self) -> None:
+        waiter = self._waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
     def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
         """Non-blocking put operation."""
-        if self.output is None or isinstance(output, Exception):
+        cur = self.output
+        if type(output) is RequestOutput:
+            if cur is None:
+                self.output = output
+                waiter = self._waiter
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(None)
+                return
+            if type(cur) is RequestOutput:
+                cur.add(output, aggregate=self.aggregate)
+                return
+        if cur is None or isinstance(output, Exception):
             self.output = output
-            self.ready.set()
-        elif isinstance(self.output, RequestOutput) and isinstance(
-            output, RequestOutput
-        ):
-            # This ensures that request outputs with different request indexes
-            # (if n > 1) do not override each other.
-            self.output.add(output, aggregate=self.aggregate)
-        elif isinstance(self.output, PoolingRequestOutput) and isinstance(
+            waiter = self._waiter
+            if waiter is not None and not waiter.done():
+                waiter.set_result(None)
+        elif isinstance(cur, RequestOutput) and isinstance(output, RequestOutput):
+            cur.add(output, aggregate=self.aggregate)
+        elif isinstance(cur, PoolingRequestOutput) and isinstance(
             output, PoolingRequestOutput
         ):
             self.output = output
 
     async def get(self) -> RequestOutput | PoolingRequestOutput:
         """Get operation blocks on put event."""
-        while (output := self.output) is None:
-            await self.ready.wait()
+        output = self.output
+        if output is None:
+            loop = self._loop
+            if loop is None:
+                loop = self._loop = asyncio.get_running_loop()
+            while (output := self.output) is None:
+                waiter = loop.create_future()
+                self._waiter = waiter
+                try:
+                    await waiter
+                finally:
+                    if self._waiter is waiter:
+                        self._waiter = None
         self.output = None
-        self.ready.clear()
         if isinstance(output, Exception):
             raise output
         return output
@@ -97,7 +163,6 @@ class RequestOutputCollector:
         output = self.output
         if output is not None:
             self.output = None
-            self.ready.clear()
         if isinstance(output, Exception):
             raise output
         return output
@@ -149,14 +214,14 @@ class StreamingInputOutputCollector(RequestOutputCollector):
         output = await super().get()
         if self._backlog:
             self.output = self._backlog.popleft()
-            self.ready.set()
+            self._wake_waiter()
         return output
 
     def get_nowait(self) -> RequestOutput | PoolingRequestOutput | None:
         output = super().get_nowait()
         if self._backlog:
             self.output = self._backlog.popleft()
-            self.ready.set()
+            self._wake_waiter()
         return output
 
 
@@ -251,9 +316,46 @@ class RequestState:
             deque() if stream_input else None
         )
 
+        # Precomputed fast-path eligibility flags for process_outputs.
+        self._fast_stream_eligible = (
+            type(self) is RequestState
+            and (
+                output_kind == RequestOutputKind.DELTA
+                or output_kind == RequestOutputKind.FINAL_ONLY
+            )
+            and stream_interval == 1
+            and parent_req is None
+            and not stream_input
+        )
+        self._plain_fast_detok = (
+            (
+                detokenizer,
+                detokenizer.tokenizer,
+                detokenizer.token_ids,
+            )
+            if (
+                type(detokenizer) is FastIncrementalDetokenizer
+                and not detokenizer.stop
+                and detokenizer.spaces_between_special_tokens
+            )
+            else None
+        )
+        self._fast_decode_ctx: tuple | None = None
+
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
+        self._fast_decode_ctx = None
         self.streaming_input = not update.final
+        self._fast_stream_eligible = (
+            type(self) is RequestState
+            and (
+                self.output_kind == RequestOutputKind.DELTA
+                or self.output_kind == RequestOutputKind.FINAL_ONLY
+            )
+            and self.stream_interval == 1
+            and self.parent_req is None
+            and not self.streaming_input
+        )
         # TODO also include relevant output tokens in new prompt here
         #     (match scheduler behavior).
         if update.prompt:
@@ -308,6 +410,14 @@ class RequestState:
                 tokenizer=tokenizer,
                 request=request,
             )
+            if (
+                output_kind == RequestOutputKind.DELTA
+                and parent_req is None
+                and not sampling_params.stop
+                and type(detokenizer) is FastIncrementalDetokenizer
+            ):
+                detokenizer._delta_only = True
+                detokenizer._pending_delta = ""
             max_tokens_param = sampling_params.max_tokens
             top_p = sampling_params.top_p
             n = sampling_params.n
@@ -445,16 +555,21 @@ class RequestState:
                 finished=finished,
                 error=error,
             )
-        assert self.logprobs_processor is not None
+        lp = self.logprobs_processor
+        assert lp is not None
         if self.output_kind == RequestOutputKind.DELTA:
             # Side effect: logprobs processor forgets prompt logprobs
-            prompt_logprobs = self.logprobs_processor.pop_prompt_logprobs()
+            prompt_logprobs = (
+                lp.pop_prompt_logprobs() if lp.prompt_logprobs is not None else None
+            )
             prompt_token_id_logprobs = (
-                self.logprobs_processor.pop_prompt_token_id_logprobs()
+                lp.pop_prompt_token_id_logprobs()
+                if lp.prompt_token_id_logprobs is not None
+                else None
             )
         else:
-            prompt_logprobs = self.logprobs_processor.prompt_logprobs
-            prompt_token_id_logprobs = self.logprobs_processor.prompt_token_id_logprobs
+            prompt_logprobs = lp.prompt_logprobs
+            prompt_token_id_logprobs = lp.prompt_token_id_logprobs
 
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
@@ -463,7 +578,7 @@ class RequestState:
             prompt_token_ids=prompt_token_ids,
             prompt_logprobs=prompt_logprobs,
             prompt_token_id_logprobs=prompt_token_id_logprobs,
-            outputs=cast(list[CompletionOutput], outputs),
+            outputs=outputs,  # type: ignore[arg-type]
             finished=finished,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
@@ -754,12 +869,173 @@ class OutputProcessor:
         """
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        req_states = self.request_states
+        delta_kind = RequestOutputKind.DELTA
+        final_only_kind = RequestOutputKind.FINAL_ONLY
+        has_iter_stats = iteration_stats is not None
+        iter_stats_fast = (
+            has_iter_stats and type(iteration_stats) is IterationStats
+        )
+        compute_nans = (
+            iter_stats_fast and iteration_stats.compute_nans_in_logits
+        )
+        itlat_append = (
+            iteration_stats.inter_token_latencies_iter.append
+            if iter_stats_fast
+            else None
+        )
+        ro_new = RequestOutput.__new__
+        co_new = CompletionOutput.__new__
+        ro_append = request_outputs.append
+        no_weight_ver = weight_version is None
+        ts = engine_core_timestamp
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
-            req_state = self.request_states.get(req_id)
+            req_state = req_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+
+            new_token_ids = engine_core_output.new_token_ids
+            finish_reason = engine_core_output.finish_reason
+            fast_ctx = req_state._fast_decode_ctx
+            if (
+                fast_ctx is not None
+                and no_weight_ver
+                and finish_reason is None
+                and len(new_token_ids) == 1
+                and not req_state.sampling_mask_chunks
+                and engine_core_output.error is None
+                and engine_core_output.pooling_output is None
+                and engine_core_output.routed_experts is None
+                and engine_core_output.spec_decode_metrics is None
+                and engine_core_output.watermarking is None
+                and engine_core_output.events is None
+                and engine_core_output.new_sampling_mask is None
+                and engine_core_output.new_logprobs is None
+                and engine_core_output.new_prompt_logprobs_tensors is None
+                and engine_core_output.prompt_token_id_logprobs is None
+                and engine_core_output.kv_transfer_params is None
+                and engine_core_output.ec_transfer_params is None
+            ):
+                (
+                    detok_ref,
+                    detok_step,
+                    detok_tok,
+                    detok_ids_append,
+                    lp,
+                    req_stats,
+                    ext_id,
+                    req_prompt,
+                    prompt_toks,
+                    req_idx,
+                    lora_req,
+                    n_cached,
+                    n_cache_create,
+                    is_final_only,
+                    queue,
+                    plain_detok,
+                    is_delta_only,
+                ) = fast_ctx
+                if (
+                    req_state.detokenizer is detok_ref
+                    and lp.logprobs is None
+                    and "update" not in detok_ref.__dict__
+                    and not detok_ref.stop
+                ):
+                    if has_iter_stats:
+                        if iter_stats_fast:
+                            assert ts is not None
+                            assert req_stats is not None
+                            iteration_stats.num_generation_tokens += 1
+                            req_stats.num_generation_tokens += 1
+                            if (
+                                compute_nans
+                                and not req_stats.is_corrupted
+                                and engine_core_output.num_nans_in_logits > 0
+                            ):
+                                req_stats.is_corrupted = True
+                            itlat_append(ts - req_stats.last_token_ts)
+                            req_stats.last_token_ts = ts
+                        else:
+                            self._update_stats_from_output(
+                                req_state,
+                                engine_core_output,
+                                ts,
+                                iteration_stats,
+                            )
+                    tid = new_token_ids[0]
+                    try:
+                        text = detok_step(detok_tok, tid) or ""
+                    except (OverflowError, TypeError, Exception) as e:
+                        text = detok_ref._handle_step_error(tid, e) or ""
+                    detok_ids_append(tid)
+                    if is_final_only:
+                        if text:
+                            detok_ref.output_text += text
+                        continue
+                    if text and (not is_delta_only or detok_ref.output_text):
+                        detok_ref.output_text += text
+                        detok_ref._last_output_text_offset += len(text)
+                    if (
+                        queue is not None
+                        and type(queue) is RequestOutputCollector
+                        and (cur := queue.output) is not None
+                        and type(cur) is RequestOutput
+                        and queue.aggregate
+                        and not cur.finished
+                        and len(cur.outputs) == 1
+                        and (co0 := cur.outputs[0]).index == req_idx
+                    ):
+                        # Coalesce directly into the queued RequestOutput instead
+                        # of allocating transient RequestOutput/CompletionOutput.
+                        cur.kv_transfer_params = None
+                        cur.ec_transfer_params = None
+                        co0.text += text
+                        toks = co0.token_ids
+                        if type(toks) is not list:
+                            toks = co0.token_ids = list(toks)
+                        toks.append(tid)
+                        co0.cumulative_logprob = lp.cumulative_logprob
+                        co0.weight_versions = None
+                        co0.finish_reason = None
+                        co0.stop_reason = None
+                        continue
+                    co = co_new(CompletionOutput)
+                    co.index = req_idx
+                    co.text = text
+                    co.token_ids = new_token_ids
+                    co.cumulative_logprob = lp.cumulative_logprob
+                    co.logprobs = None
+                    co.routed_experts = None
+                    co.finish_reason = None
+                    co.stop_reason = None
+                    co.lora_request = None
+                    co.sampling_mask = None
+                    co.spec_decode_metrics = None
+                    co.weight_versions = None
+                    ro = ro_new(RequestOutput)
+                    ro.request_id = ext_id
+                    ro.prompt = req_prompt
+                    ro.prompt_token_ids = prompt_toks
+                    ro.prompt_logprobs = None
+                    ro.prompt_token_id_logprobs = None
+                    ro.outputs = [co]
+                    ro.finished = False
+                    ro.metrics = req_stats
+                    ro.lora_request = lora_req
+                    ro.encoder_prompt = None
+                    ro.encoder_prompt_token_ids = None
+                    ro.num_cached_tokens = n_cached
+                    ro.num_cache_creation_tokens = n_cache_create
+                    ro.kv_transfer_params = None
+                    ro.ec_transfer_params = None
+                    if queue is not None:
+                        queue.put(ro)
+                    else:
+                        ro_append(ro)
+                    continue
+                req_state._fast_decode_ctx = None
 
             error = engine_core_output.error
             if error is not None and req_state.queue is not None:
@@ -771,17 +1047,244 @@ class OutputProcessor:
                     reqs_to_abort.append(req_id)
                 continue
 
-            # 1) Compute stats for this iteration.
-            self._update_stats_from_output(
-                req_state, engine_core_output, engine_core_timestamp, iteration_stats
-            )
-
-            new_token_ids = engine_core_output.new_token_ids
             pooling_output = engine_core_output.pooling_output
-            finish_reason = engine_core_output.finish_reason
+
+            if (
+                finish_reason is None
+                and not req_state.is_prefilling
+                and req_state._fast_stream_eligible
+                and pooling_output is None
+                and no_weight_ver
+                and error is None
+                and not req_state.sampling_mask_chunks
+                and engine_core_output.routed_experts is None
+                and engine_core_output.spec_decode_metrics is None
+                and engine_core_output.watermarking is None
+                and engine_core_output.events is None
+                and engine_core_output.new_sampling_mask is None
+                and engine_core_output.new_logprobs is None
+                and engine_core_output.new_prompt_logprobs_tensors is None
+                and engine_core_output.prompt_token_id_logprobs is None
+                and engine_core_output.kv_transfer_params is None
+                and engine_core_output.ec_transfer_params is None
+            ):
+                if has_iter_stats:
+                    if iter_stats_fast:
+                        assert ts is not None
+                        req_stats = req_state.stats
+                        assert req_stats is not None
+                        num_new_gen = len(new_token_ids)
+                        iteration_stats.num_generation_tokens += num_new_gen
+                        req_stats.num_generation_tokens += num_new_gen
+                        if (
+                            compute_nans
+                            and not req_stats.is_corrupted
+                            and engine_core_output.num_nans_in_logits > 0
+                        ):
+                            req_stats.is_corrupted = True
+                        itlat_append(ts - req_stats.last_token_ts)
+                        req_stats.last_token_ts = ts
+                    else:
+                        self._update_stats_from_output(
+                            req_state,
+                            engine_core_output,
+                            ts,
+                            iteration_stats,
+                        )
+
+                output_kind = req_state.output_kind
+                detokenizer = req_state.detokenizer
+                lp = req_state.logprobs_processor
+                assert detokenizer is not None
+                assert lp is not None
+
+                plain = req_state._plain_fast_detok
+                if (
+                    plain is not None
+                    and len(new_token_ids) == 1
+                    and plain[0] is detokenizer
+                    and not detokenizer.stop
+                    and "update" not in detokenizer.__dict__
+                ):
+                    detok_ref, detok_tok, detok_ids = plain
+                    is_delta_only = (
+                        output_kind == delta_kind
+                        and detok_ref._delta_only
+                        and not detok_ref.output_text
+                        and not detok_ref._pending_delta
+                    )
+                    if (
+                        lp.logprobs is None
+                        and lp.prompt_logprobs is None
+                        and lp.prompt_token_id_logprobs is None
+                        and req_state.prompt_token_ids is not None
+                    ):
+                        req_state._fast_decode_ctx = (
+                            detok_ref,
+                            detok_ref.stream.step,
+                            detok_tok,
+                            detok_ids.append,
+                            lp,
+                            req_state.stats,
+                            req_state.external_req_id,
+                            req_state.prompt,
+                            req_state.prompt_token_ids,
+                            req_state.request_index,
+                            req_state.lora_request,
+                            req_state.num_cached_tokens,
+                            req_state.num_cache_creation_tokens,
+                            output_kind == final_only_kind,
+                            req_state.queue,
+                            plain,
+                            is_delta_only,
+                        )
+                    tid = new_token_ids[0]
+                    try:
+                        text = detok_ref.stream.step(detok_tok, tid) or ""
+                    except (OverflowError, TypeError, Exception) as e:
+                        text = detok_ref._handle_step_error(tid, e) or ""
+                    detok_ids.append(tid)
+                    if output_kind == final_only_kind:
+                        if text:
+                            detok_ref.output_text += text
+                        continue
+                    if text and (not is_delta_only or detok_ref.output_text):
+                        detok_ref.output_text += text
+                        detok_ref._last_output_text_offset += len(text)
+                else:
+                    stop_cfg = getattr(detokenizer, "stop", None)
+                    if stop_cfg or (
+                        stop_cfg is None
+                        and type(detokenizer) is not IncrementalDetokenizer
+                    ):
+                        num_prev_tokens = detokenizer.num_output_tokens()
+                    else:
+                        num_prev_tokens = 0
+                    stop_string = detokenizer.update(new_token_ids, False)
+                    if stop_string:
+                        finish_reason = FinishReason.STOP
+                        stop_reason = stop_string
+                        self._trim_surplus_tokens(
+                            req_state, engine_core_output, num_prev_tokens
+                        )
+                        request_output = req_state.make_request_output(
+                            new_token_ids,
+                            pooling_output,
+                            finish_reason,
+                            stop_reason,
+                            None,
+                            None,
+                            error=None,
+                        )
+                        if request_output is not None:
+                            queue = req_state.queue
+                            if queue is not None:
+                                queue.put(request_output)
+                            else:
+                                ro_append(request_output)
+                        self._finish_request(req_state)
+                        reqs_to_abort.append(req_id)
+                        self._update_stats_from_finished(
+                            req_state, finish_reason, iteration_stats
+                        )
+                        if self.tracing_enabled:
+                            self.do_tracing(
+                                engine_core_output, req_state, iteration_stats
+                            )
+                        continue
+                    if output_kind == final_only_kind:
+                        continue
+                    text = detokenizer.get_next_output_text(False, True)
+
+                if (
+                    lp.logprobs is None
+                    and lp.prompt_logprobs is None
+                    and lp.prompt_token_id_logprobs is None
+                    and (prompt_token_ids := req_state.prompt_token_ids) is not None
+                ):
+                    request_output = RequestOutput._fast_delta(
+                        req_state.external_req_id,
+                        req_state.prompt,
+                        prompt_token_ids,
+                        None,
+                        None,
+                        [
+                            CompletionOutput(
+                                req_state.request_index,
+                                text,
+                                new_token_ids,
+                                lp.cumulative_logprob,
+                                None,
+                            )
+                        ],
+                        req_state.stats,
+                        req_state.lora_request,
+                        req_state.num_cached_tokens,
+                        req_state.num_cache_creation_tokens,
+                    )
+                else:
+                    logprobs = lp.logprobs
+                    if logprobs:
+                        logprobs = (
+                            logprobs[-len(new_token_ids) :]
+                            if new_token_ids
+                            else logprobs[:0]
+                        )
+                    comp_out = CompletionOutput(
+                        req_state.request_index,
+                        text,
+                        new_token_ids,
+                        lp.cumulative_logprob,
+                        logprobs,
+                    )
+                    prompt_token_ids = req_state.prompt_token_ids
+                    if (
+                        prompt_token_ids is None
+                        and req_state.prompt_embeds is not None
+                    ):
+                        prompt_token_ids = [0] * len(req_state.prompt_embeds)
+                    assert prompt_token_ids is not None
+                    prompt_logprobs = (
+                        lp.pop_prompt_logprobs()
+                        if lp.prompt_logprobs is not None
+                        else None
+                    )
+                    prompt_token_id_logprobs = (
+                        lp.pop_prompt_token_id_logprobs()
+                        if lp.prompt_token_id_logprobs is not None
+                        else None
+                    )
+                    request_output = RequestOutput._fast_delta(
+                        req_state.external_req_id,
+                        req_state.prompt,
+                        prompt_token_ids,
+                        prompt_logprobs,
+                        prompt_token_id_logprobs,
+                        [comp_out],
+                        req_state.stats,
+                        req_state.lora_request,
+                        req_state.num_cached_tokens,
+                        req_state.num_cache_creation_tokens,
+                    )
+                queue = req_state.queue
+                if queue is not None:
+                    queue.put(request_output)
+                else:
+                    ro_append(request_output)
+                continue
+
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
+
+            # 1) Compute stats for this iteration.
+            self._update_stats_from_output(
+                req_state,
+                engine_core_output,
+                engine_core_timestamp,
+                iteration_stats,
+            )
+
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
@@ -796,11 +1299,15 @@ class OutputProcessor:
                         engine_core_output.prefill_stats.num_cache_creation_tokens
                     )
                 if req_state.remote_prefill_cached_tokens is not None:
-                    req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
+                    req_state.num_cached_tokens = (
+                        req_state.remote_prefill_cached_tokens
+                    )
                 req_state.is_prefilling = False
 
             if engine_core_output.spec_decode_metrics is not None:
-                req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
+                req_state.spec_decode_metrics = (
+                    engine_core_output.spec_decode_metrics
+                )
 
             request_error = None
             if (
@@ -816,13 +1323,23 @@ class OutputProcessor:
                 pooling_output = EMPTY_CPU_TENSOR
 
             if pooling_output is None:
-                assert req_state.detokenizer is not None
+                detokenizer = req_state.detokenizer
+                assert detokenizer is not None
                 assert req_state.logprobs_processor is not None
                 if new_token_ids and weight_version is not None:
-                    req_state.track_weight_version(weight_version)
+                    starts = req_state.weight_version_starts
+                    if not starts or starts[-1][0] != weight_version:
+                        req_state.track_weight_version(weight_version)
                 # 2) Detokenize the token ids into text and perform stop checks.
-                num_prev_tokens = req_state.detokenizer.num_output_tokens()
-                stop_string = req_state.detokenizer.update(
+                stop_cfg = getattr(detokenizer, "stop", None)
+                if stop_cfg or (
+                    stop_cfg is None
+                    and type(detokenizer) is not IncrementalDetokenizer
+                ):
+                    num_prev_tokens = detokenizer.num_output_tokens()
+                else:
+                    num_prev_tokens = 0
+                stop_string = detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP
                 )
                 if stop_string:
@@ -839,7 +1356,14 @@ class OutputProcessor:
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
-                req_state.logprobs_processor.update_from_output(engine_core_output)
+                if (
+                    engine_core_output.new_logprobs is not None
+                    or engine_core_output.new_prompt_logprobs_tensors is not None
+                    or engine_core_output.prompt_token_id_logprobs is not None
+                ):
+                    req_state.logprobs_processor.update_from_output(
+                        engine_core_output
+                    )
 
             streaming_chunk_boundary = req_state.streaming_input and (
                 finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)

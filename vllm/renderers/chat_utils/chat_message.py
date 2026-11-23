@@ -628,20 +628,33 @@ def parse_chat_message_content(
             mm_processor_kwargs=mm_processor_kwargs,
         )[0]["content"]
 
-    if content is None:
-        content = []
-    elif isinstance(content, str):
-        content = [ChatCompletionContentPartTextParam(type="text", text=content)]
-    if role == "system":
-        content = _strip_claude_code_billing_header(content)  # type: ignore[arg-type]
-    result = parse_chat_message_content_parts(
-        role,
-        content,  # type: ignore
-        mm_tracker,
-        wrap_dicts=(content_format == "openai"),
-        interleave_strings=interleave_strings,
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
+    if (
+        isinstance(content, str)
+        and (mc := getattr(mm_tracker, "model_config", None)) is not None
+        and not (role == "system" and content.startswith(_CLAUDE_CODE_BILLING_HEADER))
+    ):
+        _reject_reserved_placeholder_in_text(content, mc)
+        msg_val: Any = (
+            [{"type": "text", "text": content}]
+            if content_format == "openai"
+            else content
+        )
+        result = [ConversationMessage(role=role, content=msg_val)]
+    else:
+        if content is None:
+            content = []
+        elif isinstance(content, str):
+            content = [ChatCompletionContentPartTextParam(type="text", text=content)]
+        if role == "system":
+            content = _strip_claude_code_billing_header(content)  # type: ignore[arg-type]
+        result = parse_chat_message_content_parts(
+            role,
+            content,  # type: ignore
+            mm_tracker,
+            wrap_dicts=(content_format == "openai"),
+            interleave_strings=interleave_strings,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
 
     for result_msg in result:
         if role == "assistant":
@@ -771,6 +784,55 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                     function["arguments"] = {}
 
 
+_FAST_PLAIN_MSG_KEYS = frozenset(("role", "content", "name", "task"))
+
+
+def _try_fast_parse_plain_text_messages(
+    messages: list[ChatCompletionMessageParam],
+    model_config: ModelConfig,
+    content_format: ChatTemplateContentFormat,
+) -> list[ConversationMessage] | None:
+    if (
+        content_format not in ("string", "openai")
+        or model_config.enable_prompt_embeds
+        or (
+            model_config.multimodal_config is not None
+            and model_config.multimodal_config.interleave_mm_strings
+        )
+    ):
+        return None
+    wrap_dicts = content_format == "openai"
+    conversation: list[ConversationMessage] = []
+    append = conversation.append
+    for msg in messages:
+        if not isinstance(msg, dict) or not _FAST_PLAIN_MSG_KEYS.issuperset(msg):
+            return None
+        role = msg.get("role")
+        if role not in ("user", "assistant", "system"):
+            return None
+        content = msg.get("content")
+        if content is None:
+            if wrap_dicts:
+                return None
+            parsed_content: str | list[dict[str, str]] = ""
+        elif isinstance(content, str):
+            if role == "system" and content.startswith(_CLAUDE_CODE_BILLING_HEADER):
+                return None
+            _reject_reserved_placeholder_in_text(content, model_config)
+            parsed_content = (
+                [{"type": "text", "text": content}] if wrap_dicts else content
+            )
+        else:
+            return None
+        item: dict[str, Any] = {"role": role, "content": parsed_content}
+        if "name" in msg and isinstance(msg["name"], str):
+            item["name"] = msg["name"]
+        if "task" in msg and isinstance(msg["task"], str):
+            item["task"] = msg["task"]
+        append(item)  # type: ignore[arg-type]
+    return conversation
+
+
 def parse_chat_messages(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
@@ -782,6 +844,12 @@ def parse_chat_messages(
     MultiModalDataDict | None,
     MultiModalUUIDDict | None,
 ]:
+    fast_conv = _try_fast_parse_plain_text_messages(
+        messages, model_config, content_format
+    )
+    if fast_conv is not None:
+        return fast_conv, None, None
+
     conversation: list[ConversationMessage] = []
     mm_tracker = MultiModalItemTracker(
         model_config,
@@ -821,6 +889,12 @@ async def parse_chat_messages_async(
     MultiModalDataDict | None,
     MultiModalUUIDDict | None,
 ]:
+    fast_conv = _try_fast_parse_plain_text_messages(
+        messages, model_config, content_format
+    )
+    if fast_conv is not None:
+        return fast_conv, None, None
+
     conversation: list[ConversationMessage] = []
     mm_tracker = AsyncMultiModalItemTracker(
         model_config,

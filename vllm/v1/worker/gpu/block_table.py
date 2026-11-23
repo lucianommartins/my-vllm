@@ -12,6 +12,20 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+from vllm.v1.worker.gpu.triton_fast_launch import FastTritonLauncher
+
+
+_V1_EXT_UNSET = object()
+_V1_EXT = _V1_EXT_UNSET
+
+
+def _get_v1_ext():
+    global _V1_EXT
+    if _V1_EXT is _V1_EXT_UNSET:
+        from vllm.v1.worker.gpu._v1_sm80_ops import get_ext
+
+        _V1_EXT = get_ext()
+    return _V1_EXT
 
 
 class BlockTables:
@@ -86,6 +100,12 @@ class BlockTables:
             torch.zeros_like(b.gpu) for b in self.block_tables
         ]
         self._num_dirty_rows = 0
+        self._dirty_slot_tokens = self.max_num_batched_tokens
+        self._writes_dirty = False
+        self._num_blocks_dirty = False
+        self._input_block_tables_tuple = tuple(self.input_block_tables)
+        self._bt_views_cache: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._slot_views_cache: dict[int, torch.Tensor] = {}
 
         self.slot_mappings = torch.zeros(
             self.num_kv_cache_groups,
@@ -121,6 +141,11 @@ class BlockTables:
             self._sliding_window_reach, dtype=torch.int32, device=self.device
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
+        self.input_block_table_strides = torch.tensor(
+            [t.stride(0) for t in self.input_block_tables],
+            dtype=torch.int64,
+            device=self.device,
+        )
 
     def append_block_ids(
         self,
@@ -140,22 +165,46 @@ class BlockTables:
                     f"Block table write for request {req_index}, group {i} exceeds "
                     f"row capacity ({end} > {row_capacity})"
                 )
-            self.block_tables[i].stage_write(req_index, start, block_ids)
-            self.num_blocks.np[i, req_index] = end
+            if len(block_ids) > 0:
+                self.block_tables[i].stage_write(req_index, start, block_ids)
+                self._writes_dirty = True
+            if self.num_blocks.np[i, req_index] != end:
+                self.num_blocks.np[i, req_index] = end
+                self._num_blocks_dirty = True
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
             return
-        if self.num_kv_cache_groups == 1:
-            # Single group: write directly, skipping the per-write group lookup.
-            self.block_tables[0].apply_write()
-        elif self.num_kv_cache_groups > 1:
-            # Multiple groups: apply all block tables with one fused kernel.
-            assert self.fused_writer is not None
-            self.fused_writer.apply(
-                self.block_tables, self.block_table_ptrs, self.block_table_strides
-            )
-        self.num_blocks.copy_to_uva()
+        if self._writes_dirty:
+            if self.num_kv_cache_groups == 1:
+                # Single group: write directly, skipping the per-write group lookup.
+                self.block_tables[0].apply_write()
+            elif self.num_kv_cache_groups > 1:
+                # Multiple groups: apply all block tables with one fused kernel.
+                assert self.fused_writer is not None
+                self.fused_writer.apply(
+                    self.block_tables, self.block_table_ptrs, self.block_table_strides
+                )
+            self._writes_dirty = False
+        if self._num_blocks_dirty:
+            self.num_blocks.copy_to_uva()
+            self._num_blocks_dirty = False
+
+    def _get_cached_bt_views(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
+        views = self._bt_views_cache.get(num_reqs)
+        if views is None:
+            views = tuple(bt[:num_reqs] for bt in self._input_block_tables_tuple)
+            if len(self._bt_views_cache) < 128:
+                self._bt_views_cache[num_reqs] = views
+        return views
+
+    def _get_cached_slot_view(self, num_tokens: int) -> torch.Tensor:
+        view = self._slot_views_cache.get(num_tokens)
+        if view is None:
+            view = self.slot_mappings[:, :num_tokens]
+            if len(self._slot_views_cache) < 128:
+                self._slot_views_cache[num_tokens] = view
+        return view
 
     def gather_block_tables(
         self,
@@ -185,16 +234,22 @@ class BlockTables:
             num_computed_tokens = self.sliding_window_reach
         num_reqs = idx_mapping.shape[0]
         num_rows = num_reqs_padded
-        if out is None:
-            out = tuple(self.input_block_tables)
+        use_cached_views = out is None
+        if use_cached_views:
+            out = self._input_block_tables_tuple
             out_ptrs = self.input_block_table_ptrs
             num_rows = max(num_rows, self._num_dirty_rows)
             self._num_dirty_rows = num_reqs
         else:
+            assert out is not None
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
         # Also clear rows left by a larger batch in the shared buffer.
-        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
+        _GATHER_BLOCK_TABLES_LAUNCHER.launch_on_device(
+            self.num_kv_cache_groups,
+            num_rows,
+            1,
+            idx_mapping.device,
             idx_mapping,
             self.block_table_ptrs,
             out_ptrs,
@@ -205,9 +260,11 @@ class BlockTables:
             num_computed_tokens,
             self.sliding_window_reach,
             self.block_sizes_tensor,
-            MASK_SLIDING_WINDOW=mask_sliding_window,
-            BLOCK_SIZE=1024,  # type: ignore
+            mask_sliding_window,
+            1024,
         )
+        if use_cached_views:
+            return self._get_cached_bt_views(num_reqs_padded)
         return tuple(bt[:num_reqs_padded] for bt in out)
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
@@ -224,7 +281,7 @@ class BlockTables:
             block_table[:num_rows].zero_()
         # Profiling may populate the returned rows with valid block IDs.
         self._num_dirty_rows = num_reqs
-        return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)
+        return self._get_cached_bt_views(num_reqs)
 
     def compute_slot_mappings(
         self,
@@ -234,12 +291,21 @@ class BlockTables:
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        use_cached_view = out is None
         if self.num_kv_cache_groups == 0:
-            return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
+            if use_cached_view:
+                return self._get_cached_slot_view(num_tokens_padded)
+            assert out is not None
+            return out[:, :num_tokens_padded]
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
-        slot_mappings = self.slot_mappings if out is None else out
-        _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
+        slot_mappings = self.slot_mappings if use_cached_view else out
+        assert slot_mappings is not None
+        _COMPUTE_SLOT_MAPPINGS_LAUNCHER.launch_on_device(
+            num_groups,
+            num_reqs + 1,
+            1,
+            idx_mapping.device,
             slot_mappings.shape[1],
             idx_mapping,
             query_start_loc,
@@ -252,11 +318,14 @@ class BlockTables:
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
-            CP_SIZE=self.cp_size,
-            CP_INTERLEAVE=self.cp_interleave,
-            PAD_ID=PAD_SLOT_ID,
-            TRITON_BLOCK_SIZE=1024,  # type: ignore
+            self.cp_size,
+            self.cp_interleave,
+            PAD_SLOT_ID,
+            1024,
         )
+        if use_cached_view:
+            self._dirty_slot_tokens = num_tokens_padded
+            return self._get_cached_slot_view(num_tokens_padded)
         return slot_mappings[:, :num_tokens_padded]
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
@@ -264,11 +333,64 @@ class BlockTables:
         # This is because the padding logic is complex and kernels may access beyond
         # the requested range.
         self.slot_mappings.fill_(PAD_SLOT_ID)
+        self._dirty_slot_tokens = 0
         # NOTE(woosuk): The output may be used for CUDA graph capture.
         # Therefore, this method must return the persistent tensor
         # with the same memory address as that used during the model's forward pass,
         # rather than allocating a new tensor.
-        return self.slot_mappings[:, :num_tokens]
+        return self._get_cached_slot_view(num_tokens)
+
+    def prepare_decode_fast(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        idx_mapping_i32: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_computed: torch.Tensor,
+        last_sampled: torch.Tensor,
+        prefill_len: torch.Tensor,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor] | None:
+        ext = _get_v1_ext()
+        if ext is None or self.num_kv_cache_groups == 0 or self.cp_size > 1:
+            return None
+        bt_rows = max(num_reqs_padded, self._num_dirty_rows)
+        clear_end = max(num_tokens_padded, num_reqs_padded, self._dirty_slot_tokens)
+        ext.prepare_decode_all(
+            input_ids,
+            positions,
+            seq_lens,
+            idx_mapping_i32,
+            idx_mapping,
+            num_computed,
+            last_sampled,
+            prefill_len,
+            self.block_table_ptrs,
+            self.input_block_table_ptrs,
+            self.block_table_strides,
+            self.input_block_table_strides,
+            self.num_blocks.gpu,
+            self.sliding_window_reach,
+            self.block_sizes_tensor,
+            self.slot_mapping_enabled,
+            self.slot_mappings,
+            num_reqs,
+            num_reqs_padded,
+            bt_rows,
+            clear_end,
+            self.cp_size,
+            self.cp_rank,
+            self.cp_interleave,
+        )
+        self._num_dirty_rows = num_reqs
+        self._dirty_slot_tokens = num_reqs
+        return (
+            self._get_cached_bt_views(num_reqs_padded),
+            self._get_cached_slot_view(num_tokens_padded),
+        )
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -412,3 +534,18 @@ def _compute_slot_mappings_kernel(
 
         slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+
+
+_GATHER_BLOCK_TABLES_LAUNCHER = FastTritonLauncher(
+    _gather_block_tables_kernel,
+    constexpr_names=("MASK_SLIDING_WINDOW", "BLOCK_SIZE"),
+)
+_COMPUTE_SLOT_MAPPINGS_LAUNCHER = FastTritonLauncher(
+    _compute_slot_mappings_kernel,
+    constexpr_names=(
+        "CP_SIZE",
+        "CP_INTERLEAVE",
+        "PAD_ID",
+        "TRITON_BLOCK_SIZE",
+    ),
+)

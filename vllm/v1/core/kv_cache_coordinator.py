@@ -182,6 +182,61 @@ class KVCacheCoordinator(ABC):
         self.group_block_sizes = tuple(
             manager.block_size for manager in self.single_type_managers
         )
+        self._alloc_plan = tuple(
+            (manager, isinstance(manager, CrossAttentionManager))
+            for manager in self.single_type_managers
+        )
+        self._non_cross_managers = (
+            tuple(self.single_type_managers)
+            if not any(is_cross for _, is_cross in self._alloc_plan)
+            else None
+        )
+        self._two_non_cross_managers = (
+            (self.single_type_managers[0], self.single_type_managers[1])
+            if (
+                len(self.single_type_managers) == 2
+                and not self._alloc_plan[0][1]
+                and not self._alloc_plan[1][1]
+            )
+            else None
+        )
+        self._five_non_cross_managers = (
+            (
+                self.single_type_managers[0],
+                self.single_type_managers[1],
+                self.single_type_managers[2],
+                self.single_type_managers[3],
+                self.single_type_managers[4],
+            )
+            if (
+                self._non_cross_managers is not None
+                and len(self.single_type_managers) == 5
+            )
+            else None
+        )
+        self._caching_group_ids_and_managers = tuple(
+            (i, manager)
+            for i, manager in enumerate(self.single_type_managers)
+            if manager.enable_caching
+        )
+        self._any_eagle_manager = any(
+            manager.use_eagle for manager in self.single_type_managers
+        )
+        self._skip_managers = tuple(
+            manager
+            for manager in self.single_type_managers
+            if (
+                type(manager).remove_skipped_blocks
+                is not SingleTypeKVCacheManager.remove_skipped_blocks
+                or type(manager).get_num_skipped_tokens
+                is not SingleTypeKVCacheManager.get_num_skipped_tokens
+            )
+        )
+        self._step_start_managers = tuple(
+            manager
+            for manager in self.single_type_managers
+            if type(manager).new_step_starts is not SingleTypeKVCacheManager.new_step_starts
+        )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -233,6 +288,81 @@ class KVCacheCoordinator(ABC):
             The number of blocks to allocate.
 
         """
+        if self._five_non_cross_managers is not None and self.retention_interval != 0:
+            m0, m1, m2, m3, m4 = self._five_non_cross_managers
+            c0, c1, c2, c3, c4 = new_computed_blocks
+            return (
+                m0.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    c0,
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=0,
+                )
+                + m1.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    c1,
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=0,
+                )
+                + m2.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    c2,
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=0,
+                )
+                + m3.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    c3,
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=0,
+                )
+                + m4.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    c4,
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=0,
+                )
+            )
+        if (
+            self._non_cross_managers is not None
+            and self.retention_interval != 0
+        ):
+            total = 0
+            for manager, computed in zip(
+                self._non_cross_managers, new_computed_blocks
+            ):
+                total += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    computed,
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=0,
+                )
+            return total
+
         num_blocks_to_allocate = 0
         if self.retention_interval != 0:
             prefill_end = 0
@@ -336,16 +466,41 @@ class KVCacheCoordinator(ABC):
             The new allocated blocks.
 
         """
-        return tuple(
-            manager.allocate_new_blocks(
-                request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
+        if self._five_non_cross_managers is not None:
+            m0, m1, m2, m3, m4 = self._five_non_cross_managers
+            return (
+                m0.allocate_new_blocks(request_id, num_tokens, num_tokens_main_model),
+                m1.allocate_new_blocks(request_id, num_tokens, num_tokens_main_model),
+                m2.allocate_new_blocks(request_id, num_tokens, num_tokens_main_model),
+                m3.allocate_new_blocks(request_id, num_tokens, num_tokens_main_model),
+                m4.allocate_new_blocks(request_id, num_tokens, num_tokens_main_model),
             )
-            for manager in self.single_type_managers
-        )
+        if self._two_non_cross_managers is not None:
+            m0, m1 = self._two_non_cross_managers
+            return (
+                m0.allocate_new_blocks(request_id, num_tokens, num_tokens_main_model),
+                m1.allocate_new_blocks(request_id, num_tokens, num_tokens_main_model),
+            )
+        if self._non_cross_managers is not None:
+            return tuple(
+                [
+                    manager.allocate_new_blocks(
+                        request_id, num_tokens, num_tokens_main_model
+                    )
+                    for manager in self._non_cross_managers
+                ]
+            )
+        out = []
+        append = out.append
+        for manager, is_cross in self._alloc_plan:
+            append(
+                manager.allocate_new_blocks(
+                    request_id,
+                    num_encoder_tokens if is_cross else num_tokens,
+                    num_tokens_main_model,
+                )
+            )
+        return tuple(out)
 
     def get_num_cacheable_tokens(
         self, num_computed_tokens: int, kv_cache_group_id: int
@@ -365,18 +520,58 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
-        boundaries = replay_boundaries(
-            request.num_prompt_tokens,
-            self.scheduler_block_size,
-            use_eagle=bool(self.drop_eagle_group_ids),
+        caching_managers = self._caching_group_ids_and_managers
+        if not caching_managers:
+            return
+        boundaries = (
+            replay_boundaries(
+                request.num_prompt_tokens,
+                self.scheduler_block_size,
+                use_eagle=True,
+            )
+            if self.drop_eagle_group_ids
+            else (request.num_prompt_tokens - 1,)
         )
-        for group_id, manager in enumerate(self.single_type_managers):
-            if not manager.enable_caching:
-                continue
+        retention_interval = self.retention_interval
+        coord_type = type(self)
+        if (
+            coord_type.get_num_cacheable_tokens
+            is KVCacheCoordinator.get_num_cacheable_tokens
+        ):
+            common_cacheable = max(
+                0, num_computed_tokens - self.num_reprefillable_tokens
+            )
+            for _, manager in caching_managers:
+                manager.cache_blocks(
+                    request,
+                    common_cacheable,
+                    retention_interval=retention_interval,
+                    replay_boundaries=boundaries,
+                )
+            return
+        if (
+            coord_type.get_num_cacheable_tokens
+            is HybridKVCacheCoordinator.get_num_cacheable_tokens
+            and not self._any_eagle_manager
+        ):
+            common_cacheable = (
+                num_computed_tokens
+                if self.enable_partial_hash_hits
+                else round_down(num_computed_tokens, self.scheduler_block_size)
+            )
+            for _, manager in caching_managers:
+                manager.cache_blocks(
+                    request,
+                    common_cacheable,
+                    retention_interval=retention_interval,
+                    replay_boundaries=boundaries,
+                )
+            return
+        for group_id, manager in caching_managers:
             manager.cache_blocks(
                 request,
                 self.get_num_cacheable_tokens(num_computed_tokens, group_id),
-                retention_interval=self.retention_interval,
+                retention_interval=retention_interval,
                 replay_boundaries=boundaries,
             )
 
@@ -448,7 +643,7 @@ class KVCacheCoordinator(ABC):
                 manager types ignore it.
 
         """
-        for manager in self.single_type_managers:
+        for manager in self._skip_managers:
             manager.remove_skipped_blocks(
                 request_id, processed_computed_tokens, num_prompt_tokens
             )
@@ -473,7 +668,7 @@ class KVCacheCoordinator(ABC):
 
     def new_step_starts(self) -> None:
         """Notify each manager that a new step is starting."""
-        for manager in self.single_type_managers:
+        for manager in self._step_start_managers:
             manager.new_step_starts()
 
 
@@ -773,6 +968,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
+        self._any_eagle_manager = any(
+            manager.use_eagle for manager in self.single_type_managers
+        )
 
     def _align_cacheable(self, num_tokens: int) -> int:
         """Largest prefix of ``num_tokens`` a future cache hit could match.

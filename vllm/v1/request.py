@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import sys
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -230,7 +231,25 @@ class Request:
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
         self._block_hasher: Callable[[Request], list[BlockHash]] | None = block_hasher
-        self.update_block_hashes()
+        self._hash_block_step: int = getattr(block_hasher, "_hash_block_size", 0)
+        self._hash_lookahead: int = getattr(block_hasher, "_num_lookahead", 0)
+        hasher = self._block_hasher
+        if hasher is not None:
+            step = self._hash_block_step
+            if (
+                not step
+                or (len(self.block_hashes) + 1) * step + self._hash_lookahead
+                <= len(self._all_token_ids)
+            ):
+                self.block_hashes.extend(hasher(self))
+            self._next_hash_len = (
+                (len(self.block_hashes) + 1) * step + self._hash_lookahead
+                if step
+                else 0
+            )
+        else:
+            self._next_hash_len = sys.maxsize
+        self._kv_decode_bounds: tuple[int, int, int, int] | None = None
 
         self.prefix_cache_hit_limit = self.get_prefix_cache_hit_limit()
 
@@ -242,6 +261,30 @@ class Request:
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
+        self._fast_dec_static: tuple[int | None, Any, int] | None = None
+        self._refresh_fast_dec_static()
+
+    def _refresh_fast_dec_static(self) -> None:
+        sp = self.sampling_params
+        if (
+            not self.mm_features
+            and self.structured_output_request is None
+            and self.trace_headers is None
+            and self.spec_decode_metrics is None
+            and self.kv_transfer_params is None
+            and self.ec_transfer_params is None
+            and not self.pooling_params
+            and self.client_index == 0
+            and type(sp) is SamplingParams
+            and sp.repetition_detection is None
+        ):
+            self._fast_dec_static = (
+                sp._eos_token_id,
+                sp.stop_token_ids,
+                self.max_tokens,
+            )
+        else:
+            self._fast_dec_static = None
 
     @classmethod
     def from_engine_core_request(
@@ -274,6 +317,17 @@ class Request:
             block_hashes=block_hashes,
         )
 
+    def _refresh_next_hash_len(self) -> None:
+        if self._block_hasher is None:
+            self._next_hash_len = sys.maxsize
+        else:
+            step = self._hash_block_step
+            self._next_hash_len = (
+                (len(self.block_hashes) + 1) * step + self._hash_lookahead
+                if step
+                else 0
+            )
+
     def append_output_token_ids(
         self,
         token_ids: int | list[int],
@@ -285,12 +339,37 @@ class Request:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
 
-        self.update_block_hashes()
+        if len(self._all_token_ids) >= self._next_hash_len:
+            hasher = self._block_hasher
+            if hasher is not None:
+                self.block_hashes.extend(hasher(self))
+                step = self._hash_block_step
+                self._next_hash_len = (
+                    (len(self.block_hashes) + 1) * step + self._hash_lookahead
+                    if step
+                    else 0
+                )
 
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
-        if self._block_hasher is not None:
-            self.block_hashes.extend(self._block_hasher(self))
+        hasher = self._block_hasher
+        if hasher is not None:
+            step = self._hash_block_step
+            if (
+                step
+                and (len(self.block_hashes) + 1) * step + self._hash_lookahead
+                > len(self._all_token_ids)
+            ):
+                self._next_hash_len = (
+                    (len(self.block_hashes) + 1) * step + self._hash_lookahead
+                )
+                return
+            self.block_hashes.extend(hasher(self))
+            self._next_hash_len = (
+                (len(self.block_hashes) + 1) * step + self._hash_lookahead
+                if step
+                else 0
+            )
 
     def truncate_block_hashes(
         self, hash_block_size: int, num_hash_lookahead_tokens: int = 0
@@ -301,6 +380,7 @@ class Request:
         )
         del self.block_hashes[num_valid_hashes:]
         self._prompt_embeds_per_block_hashes.clear()
+        self._refresh_next_hash_len()
 
     @property
     def use_structured_output(self) -> bool:
@@ -324,7 +404,7 @@ class Request:
 
     @property
     def has_encoder_inputs(self) -> bool:
-        return self.num_encoder_inputs > 0
+        return bool(self.mm_features)
 
     def get_max_cache_hit_length(self, bound: int | None = None) -> int:
         """Longest prefix cache hit allowed, optionally tightened by bound."""

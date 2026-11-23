@@ -368,6 +368,9 @@ class CacheConfig:
     In Model Runner V2, batches containing LoRA requests use regular prefill;
     batches without LoRA requests can still use fast prefill.
     """
+    kv_sharing_fast_prefill_auto: bool = field(default=False, init=False)
+    """Internal flag: True when VllmConfig auto-enabled kv_sharing_fast_prefill,
+    so prompt_logprobs falls back per-step rather than rejecting requests."""
 
     swa_bounded_replay: bool = True
     """Keep the sliding-window KV of models that support it (DeepSeek-V4.1)
@@ -444,6 +447,7 @@ class CacheConfig:
             "cache_hit_alignment_tokens",
             # Feature toggles not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            "kv_sharing_fast_prefill_auto",
             "swa_bounded_replay",
             # Runtime memory allocation strategy, not graph structure.
             "enable_extensible_kv_cache",

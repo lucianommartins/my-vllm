@@ -48,7 +48,10 @@ class OpenAIModelRegistry:
         return self.base_model_paths[0].name
 
     def is_base_model(self, model_name: str) -> bool:
-        return any(model.name == model_name for model in self.base_model_paths)
+        paths = self.base_model_paths
+        if len(paths) == 1:
+            return paths[0].name == model_name
+        return any(model.name == model_name for model in paths)
 
     async def check_model(self, model_name: str | None) -> ErrorResponse | None:
         """Return an ErrorResponse if model_name is not served, else None."""

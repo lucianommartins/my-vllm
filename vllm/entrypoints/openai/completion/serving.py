@@ -6,8 +6,9 @@ import itertools
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
-from typing import cast
+from typing import Any, cast
 
+import orjson
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -52,6 +53,58 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
 logger = init_logger(__name__)
+
+_COMPLETION_SSE_SUFFIX = (
+    ',"logprobs":null,"finish_reason":null,"stop_reason":null,'
+    '"prompt_token_ids":null,"token_ids":null,"weight_versions":null}],'
+    '"kv_transfer_params":null}\n\n'
+)
+_COMPLETION_SSE_SUFFIX_BYTES = _COMPLETION_SSE_SUFFIX.encode("ascii")
+_SSE_DONE_BYTES = b"data: [DONE]\n\n"
+
+
+def _build_completion_sse_prefix(
+    request_id: str,
+    created_time: int,
+    model_name: str,
+    choice_index: int,
+) -> str:
+    """Build static SSE JSON prefix ending right before the choice text value."""
+    head = (
+        orjson.dumps(
+            {
+                "id": request_id,
+                "object": "text_completion",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{"index": choice_index, "text": ""}],
+            },
+            option=orjson.OPT_SERIALIZE_NUMPY,
+        )
+        .decode("utf-8")
+        .removesuffix('""}]}')
+    )
+    return f"data: {head}"
+
+
+def _build_completion_sse_prefix_bytes(
+    request_id: str,
+    created_time: int,
+    model_name: str,
+    choice_index: int,
+) -> bytes:
+    """Build static SSE JSON UTF-8 prefix bytes ending before choice text."""
+    head = orjson.dumps(
+        {
+            "id": request_id,
+            "object": "text_completion",
+            "created": created_time,
+            "model": model_name,
+            "choices": [{"index": choice_index, "text": ""}],
+        },
+        option=orjson.OPT_SERIALIZE_NUMPY,
+    ).removesuffix(b'""}]}')
+    return b"data: " + head
 
 
 class OpenAIServingCompletion(GenerateBaseServing):
@@ -116,7 +169,15 @@ class OpenAIServingCompletion(GenerateBaseServing):
         self,
         request: CompletionRequest,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
+        *,
+        _yield_bytes: bool = False,
+        _raw_json: bool = False,
+    ) -> (
+        AsyncGenerator[str | bytes, None]
+        | CompletionResponse
+        | ErrorResponse
+        | bytes
+    ):
         """Completion API similar to OpenAI's API.
 
         See https://platform.openai.com/docs/api-reference/completions/create
@@ -125,14 +186,29 @@ class OpenAIServingCompletion(GenerateBaseServing):
         NOTE: suffix is only supported by models that implement FIM rendering.
         """
         return await self._with_kv_transfer_rejection_cleanup(
-            self._create_completion(request, raw_request), request, raw_request
+            self._create_completion(
+                request,
+                raw_request,
+                _yield_bytes=_yield_bytes,
+                _raw_json=_raw_json,
+            ),
+            request,
+            raw_request,
         )
 
     async def _create_completion(
         self,
         request: CompletionRequest,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
+        *,
+        _yield_bytes: bool = False,
+        _raw_json: bool = False,
+    ) -> (
+        AsyncGenerator[str | bytes, None]
+        | CompletionResponse
+        | ErrorResponse
+        | bytes
+    ):
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -147,7 +223,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())
 
-        request_metadata = RequestResponseMetadata(request_id=request_id)
+        request_metadata = RequestResponseMetadata.model_construct(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
@@ -220,7 +296,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             generators.append(generator)
 
-        result_generator = merge_async_iterators(*generators)
+        single_prompt = len(generators) == 1
+        result_generator = (
+            generators[0] if single_prompt else merge_async_iterators(*generators)
+        )
 
         model_name = self.models.model_name(lora_request)
         num_prompts = len(engine_inputs)
@@ -239,13 +318,28 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 num_prompts=num_prompts,
                 tokenizer=tokenizer,
                 request_metadata=request_metadata,
+                _yield_bytes=_yield_bytes,
+                _single_prompt_stream=single_prompt,
             )
 
         # Non-streaming response
         final_res_batch: list[RequestOutput | None] = [None] * num_prompts
         try:
-            async for i, res in result_generator:
-                final_res_batch[i] = res
+            if single_prompt:
+                gen0 = cast(AsyncIterator[RequestOutput], result_generator)
+                try:
+                    async for res in gen0:
+                        final_res_batch[0] = res
+                finally:
+                    aclose = getattr(gen0, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+            else:
+                multi_gen = cast(
+                    AsyncIterator[tuple[int, RequestOutput]], result_generator
+                )
+                async for i, res in multi_gen:
+                    final_res_batch[i] = res
 
             for i, final_res in enumerate(final_res_batch):
                 assert final_res is not None
@@ -266,6 +360,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 model_name,
                 tokenizer,
                 request_metadata,
+                _raw_json=(
+                    _raw_json
+                    and not request.stream
+                    and not (self.enable_log_outputs and self.request_logger)
+                ),
             )
 
             if self.enable_log_outputs and self.request_logger:
@@ -282,14 +381,21 @@ class OpenAIServingCompletion(GenerateBaseServing):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
 
+        if type(response) is bytes:
+            return response
+
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
         if request.stream:
             response_json = response.model_dump_json()
 
-            async def fake_stream_generator() -> AsyncGenerator[str, None]:
-                yield f"data: {response_json}\n\n"
-                yield "data: [DONE]\n\n"
+            async def fake_stream_generator() -> AsyncGenerator[str | bytes, None]:
+                if _yield_bytes:
+                    yield f"data: {response_json}\n\n".encode("utf-8")
+                    yield _SSE_DONE_BYTES
+                else:
+                    yield f"data: {response_json}\n\n"
+                    yield "data: [DONE]\n\n"
 
             return fake_stream_generator()
 
@@ -299,14 +405,19 @@ class OpenAIServingCompletion(GenerateBaseServing):
         self,
         request: CompletionRequest,
         engine_inputs: list[EngineInput],
-        result_generator: AsyncIterator[tuple[int, RequestOutput]],
+        result_generator: (
+            AsyncIterator[tuple[int, RequestOutput]] | AsyncIterator[RequestOutput]
+        ),
         request_id: str,
         created_time: int,
         model_name: str,
         num_prompts: int,
         tokenizer: TokenizerLike | None,
         request_metadata: RequestResponseMetadata,
-    ) -> AsyncGenerator[str, None]:
+        *,
+        _yield_bytes: bool = False,
+        _single_prompt_stream: bool = False,
+    ) -> AsyncGenerator[str | bytes, None]:
         num_choices = 1 if request.n is None else request.n
         next_text_offsets = [0] * num_choices * num_prompts
         previous_num_tokens = [0] * num_choices * num_prompts
@@ -320,10 +431,80 @@ class OpenAIServingCompletion(GenerateBaseServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        can_fast_sse = (
+            request.logprobs is None
+            and not request.return_weight_versions
+            and not include_continuous_usage
+            and not request.return_token_ids
+        )
+        sse_prefix_0: str | None = None
+        sse_prefixes: dict[int, str] | None = (
+            {} if (can_fast_sse and not _yield_bytes) else None
+        )
+        sse_prefix_0_bytes: bytes | None = None
+        sse_prefixes_bytes: dict[int, bytes] | None = (
+            {} if (can_fast_sse and _yield_bytes) else None
+        )
+        fast_single_sse = (
+            _single_prompt_stream
+            and can_fast_sse
+            and _yield_bytes
+            and num_prompts == 1
+            and num_choices == 1
+            and not request.echo
+            and not (self.enable_log_outputs and self.request_logger)
+        )
+        if fast_single_sse:
+            assert request.max_tokens is not None
+            sse_prefix_0_bytes = _build_completion_sse_prefix_bytes(
+                request_id, created_time, model_name, 0
+            )
+        orjson_dumps = orjson.dumps
+        sse_suffix_b = _COMPLETION_SSE_SUFFIX_BYTES
+        fast_prev_toks = 0
+        fast_prompt_len = 0
 
         last_res: RequestOutput | None = None
         try:
-            async for prompt_idx, res in result_generator:
+            async for item in result_generator:
+                if fast_single_sse:
+                    res = item  # type: ignore[assignment]
+                    last_res = res
+                    if first_iteration:
+                        num_cached_tokens = res.num_cached_tokens
+                        first_iteration = False
+                    if not fast_prompt_len:
+                        ptids = res.prompt_token_ids
+                        if ptids is not None:
+                            fast_prompt_len = len(ptids)
+                    res_outputs = res.outputs
+                    if len(res_outputs) == 1:
+                        out = res_outputs[0]
+                        if (
+                            out.finish_reason is None
+                            and out.stop_reason is None
+                            and out.index == 0
+                        ):
+                            d_text = out.text
+                            d_toks = out.token_ids
+                            if not d_text and not d_toks and not fast_prev_toks:
+                                continue
+                            fast_prev_toks += len(d_toks)
+                            yield (
+                                sse_prefix_0_bytes  # type: ignore[operator]
+                                + orjson_dumps(d_text)
+                                + sse_suffix_b
+                            )
+                            continue
+                    prompt_idx = 0
+                    num_prompt_tokens[0] = fast_prompt_len
+                    previous_num_tokens[0] = fast_prev_toks
+                elif _single_prompt_stream:
+                    prompt_idx = 0
+                    res = item  # type: ignore[assignment]
+                else:
+                    prompt_idx, res = item  # type: ignore[misc]
+
                 last_res = res
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
@@ -332,10 +513,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     num_cached_tokens = res.num_cached_tokens
                     first_iteration = False
 
-                prompt_text = res.prompt
-                if prompt_text is None:
-                    engine_input = engine_inputs[prompt_idx]
-                    prompt_text = self._extract_prompt_text(engine_input)
+                prompt_text: str | None = None
 
                 # Prompt details are excluded from later streamed outputs
                 if prompt_token_ids is not None:
@@ -359,6 +537,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         assert prompt_token_ids is not None
                         if request.return_token_ids:
                             prompt_text = ""
+                        else:
+                            if prompt_text is None:
+                                prompt_text = res.prompt
+                            if prompt_text is None:
+                                prompt_text = self._extract_prompt_text(
+                                    engine_inputs[prompt_idx]
+                                )
                         assert prompt_text is not None
                         if request.max_tokens == 0:
                             # only return the prompt
@@ -435,56 +620,158 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                 delta=True,
                             )
 
-                    chunk = CompletionStreamResponse(
-                        id=request_id,
-                        object="text_completion",
-                        created=created_time,
-                        model=model_name,
-                        choices=[
-                            CompletionResponseStreamChoice(
-                                index=i,
-                                text=delta_text,
-                                logprobs=logprobs,
-                                finish_reason=finish_reason,
-                                stop_reason=stop_reason,
-                                prompt_token_ids=prompt_token_ids_to_return,
-                                token_ids=(
-                                    as_list(output.token_ids)
-                                    if request.return_token_ids
-                                    else None
-                                ),
-                                weight_versions=(
-                                    output.weight_versions
-                                    if request.return_weight_versions
-                                    else None
-                                ),
-                            )
-                        ],
-                        kv_transfer_params=(
-                            res.kv_transfer_params
-                            if finish_reason is not None
-                            else None
-                        ),
+                    tok_ids = (
+                        as_list(output.token_ids) if request.return_token_ids else None
                     )
-                    # Stamp on terminal chunk only when no trailing usage chunk
-                    # will follow (that one is the true final message).
+                    kv_xfer = (
+                        res.kv_transfer_params if finish_reason is not None else None
+                    )
                     if (
-                        not include_usage
-                        and self.system_fingerprint is not None
-                        and finish_reason is not None
+                        can_fast_sse
+                        and prompt_token_ids_to_return is None
+                        and finish_reason is None
+                        and stop_reason is None
+                        and kv_xfer is None
                     ):
-                        chunk.system_fingerprint = self.system_fingerprint
-                    if include_continuous_usage:
-                        prompt_tokens = num_prompt_tokens[prompt_idx]
-                        completion_tokens = previous_num_tokens[i]
-                        chunk.usage = UsageInfo(
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=prompt_tokens + completion_tokens,
+                        delta_bytes = (
+                            orjson_dumps(delta_text)
+                            if type(delta_text) is str
+                            else orjson_dumps(
+                                delta_text, option=orjson.OPT_SERIALIZE_NUMPY
+                            )
                         )
+                        if _yield_bytes:
+                            if i == 0:
+                                if sse_prefix_0_bytes is None:
+                                    sse_prefix_0_bytes = (
+                                        _build_completion_sse_prefix_bytes(
+                                            request_id, created_time, model_name, 0
+                                        )
+                                    )
+                                prefix_b = sse_prefix_0_bytes
+                            else:
+                                assert sse_prefixes_bytes is not None
+                                prefix_b = sse_prefixes_bytes.get(i)
+                                if prefix_b is None:
+                                    prefix_b = _build_completion_sse_prefix_bytes(
+                                        request_id, created_time, model_name, i
+                                    )
+                                    sse_prefixes_bytes[i] = prefix_b
+                            yield prefix_b + delta_bytes + _COMPLETION_SSE_SUFFIX_BYTES
+                        else:
+                            if i == 0:
+                                if sse_prefix_0 is None:
+                                    sse_prefix_0 = _build_completion_sse_prefix(
+                                        request_id, created_time, model_name, 0
+                                    )
+                                sse_prefix = sse_prefix_0
+                            else:
+                                assert sse_prefixes is not None
+                                sse_prefix = sse_prefixes.get(i)
+                                if sse_prefix is None:
+                                    sse_prefix = _build_completion_sse_prefix(
+                                        request_id, created_time, model_name, i
+                                    )
+                                    sse_prefixes[i] = sse_prefix
+                            yield (
+                                f"{sse_prefix}{delta_bytes.decode('utf-8')}"
+                                f"{_COMPLETION_SSE_SUFFIX}"
+                            )
+                        continue
 
-                    response_json = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {response_json}\n\n"
+                    if request.logprobs is None and not request.return_weight_versions:
+                        choice_dict: dict[str, Any] = {
+                            "index": i,
+                            "text": delta_text,
+                            "logprobs": None,
+                            "finish_reason": finish_reason,
+                            "stop_reason": stop_reason,
+                            "prompt_token_ids": prompt_token_ids_to_return,
+                            "token_ids": tok_ids,
+                            "weight_versions": None,
+                        }
+                        payload: dict[str, Any] = {
+                            "id": request_id,
+                            "object": "text_completion",
+                            "created": created_time,
+                            "model": model_name,
+                            "choices": [choice_dict],
+                            "kv_transfer_params": kv_xfer,
+                        }
+                        if (
+                            not include_usage
+                            and self.system_fingerprint is not None
+                            and finish_reason is not None
+                        ):
+                            payload["system_fingerprint"] = self.system_fingerprint
+                        if include_continuous_usage:
+                            prompt_tokens = num_prompt_tokens[prompt_idx]
+                            completion_tokens = previous_num_tokens[i]
+                            payload["usage"] = {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens,
+                            }
+                        payload_bytes = orjson.dumps(
+                            payload, option=orjson.OPT_SERIALIZE_NUMPY
+                        )
+                        if _yield_bytes:
+                            yield b"".join((b"data: ", payload_bytes, b"\n\n"))
+                            continue
+                        response_json = payload_bytes.decode("utf-8")
+                    else:
+                        chunk = CompletionStreamResponse(
+                            id=request_id,
+                            object="text_completion",
+                            created=created_time,
+                            model=model_name,
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=i,
+                                    text=delta_text,
+                                    logprobs=logprobs,
+                                    finish_reason=finish_reason,
+                                    stop_reason=stop_reason,
+                                    prompt_token_ids=prompt_token_ids_to_return,
+                                    token_ids=tok_ids,
+                                    weight_versions=(
+                                        output.weight_versions
+                                        if request.return_weight_versions
+                                        else None
+                                    ),
+                                )
+                            ],
+                            kv_transfer_params=kv_xfer,
+                        )
+                        # Stamp on terminal chunk only when no trailing usage chunk
+                        # will follow (that one is the true final message).
+                        if (
+                            not include_usage
+                            and self.system_fingerprint is not None
+                            and finish_reason is not None
+                        ):
+                            chunk.system_fingerprint = self.system_fingerprint
+                        if include_continuous_usage:
+                            prompt_tokens = num_prompt_tokens[prompt_idx]
+                            completion_tokens = previous_num_tokens[i]
+                            chunk.usage = UsageInfo.model_construct(
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=prompt_tokens + completion_tokens,
+                            )
+
+                        response_json = chunk.model_dump_json(exclude_unset=True)
+                    if _yield_bytes:
+                        yield f"data: {response_json}\n\n".encode("utf-8")
+                    else:
+                        yield f"data: {response_json}\n\n"
+                if fast_single_sse:
+                    fast_prompt_len = num_prompt_tokens[0]
+                    fast_prev_toks = previous_num_tokens[0]
+
+            if fast_single_sse:
+                num_prompt_tokens[0] = fast_prompt_len
+                previous_num_tokens[0] = fast_prev_toks
 
             if self.enable_log_outputs and self.request_logger:
                 for full_text in previous_texts:
@@ -499,15 +786,17 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             total_prompt_tokens = sum(num_prompt_tokens)
             total_completion_tokens = sum(previous_num_tokens)
-            final_usage_info = UsageInfo(
+            final_usage_info = UsageInfo.model_construct(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
             )
 
             if self.enable_prompt_tokens_details and num_cached_tokens is not None:
-                final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
-                    cached_tokens=num_cached_tokens
+                final_usage_info.prompt_tokens_details = (
+                    PromptTokenUsageInfo.model_construct(
+                        cached_tokens=num_cached_tokens
+                    )
                 )
 
             if include_usage:
@@ -544,18 +833,26 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True
                 )
-                yield f"data: {final_usage_data}\n\n"
+                frame = f"data: {final_usage_data}\n\n"
+                yield frame.encode("utf-8") if _yield_bytes else frame
 
             # report to FastAPI middleware aggregate usage across all choices
             request_metadata.final_usage_info = final_usage_info
 
         except GenerationError as e:
-            yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+            frame = f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+            yield frame.encode("utf-8") if _yield_bytes else frame
         except Exception as e:
             logger.exception("Error in completion stream generator.")
             data = self.create_streaming_error_response(e)
-            yield f"data: {data}\n\n"
-        yield "data: [DONE]\n\n"
+            frame = f"data: {data}\n\n"
+            yield frame.encode("utf-8") if _yield_bytes else frame
+        finally:
+            if _single_prompt_stream:
+                aclose = getattr(result_generator, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+        yield _SSE_DONE_BYTES if _yield_bytes else "data: [DONE]\n\n"
 
     def request_output_to_completion_response(
         self,
@@ -566,7 +863,85 @@ class OpenAIServingCompletion(GenerateBaseServing):
         model_name: str,
         tokenizer: TokenizerLike | None,
         request_metadata: RequestResponseMetadata,
-    ) -> CompletionResponse:
+        *,
+        _raw_json: bool = False,
+    ) -> CompletionResponse | bytes:
+        can_raw = (
+            _raw_json
+            and len(final_res_batch) == 1
+            and len(final_res_batch[0].outputs) == 1
+            and request.logprobs is None
+            and not request.return_weight_versions
+            and not self.enable_prompt_tokens_details
+            and not self.enable_per_request_metrics
+            and final_res_batch[0].prompt_logprobs is None
+            and final_res_batch[0].outputs[0].spec_decode_metrics is None
+        )
+        if can_raw:
+            final_res = final_res_batch[0]
+            prompt_token_ids = final_res.prompt_token_ids
+            assert prompt_token_ids is not None
+            prompt_text = final_res.prompt
+            output = final_res.outputs[0]
+            self._raise_if_error(output.finish_reason, request_id)
+            assert request.max_tokens is not None
+            if request.echo:
+                if request.return_token_ids:
+                    prompt_text = ""
+                assert prompt_text is not None
+                output_text = (
+                    prompt_text if request.max_tokens == 0 else prompt_text + output.text
+                )
+            else:
+                output_text = output.text
+            routed_experts_b64 = (
+                numpy2base64(output.routed_experts)
+                if output.routed_experts is not None
+                else None
+            )
+            num_prompt_tokens = len(prompt_token_ids)
+            num_generated_tokens = len(output.token_ids)
+            return orjson.dumps(
+                {
+                    "id": request_id,
+                    "object": "text_completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": output_text,
+                            "logprobs": None,
+                            "finish_reason": output.finish_reason,
+                            "stop_reason": output.stop_reason,
+                            "token_ids": (
+                                as_list(output.token_ids)
+                                if request.return_token_ids
+                                else None
+                            ),
+                            "prompt_logprobs": None,
+                            "prompt_token_ids": (
+                                prompt_token_ids if request.return_token_ids else None
+                            ),
+                            "routed_experts": routed_experts_b64,
+                            "weight_versions": None,
+                        }
+                    ],
+                    "service_tier": None,
+                    "system_fingerprint": self.system_fingerprint,
+                    "usage": {
+                        "prompt_tokens": num_prompt_tokens,
+                        "total_tokens": num_prompt_tokens + num_generated_tokens,
+                        "completion_tokens": num_generated_tokens,
+                        "completion_tokens_details": None,
+                    },
+                    "kv_transfer_params": final_res.kv_transfer_params,
+                    "ec_transfer_params": final_res.ec_transfer_params,
+                    "metrics": None,
+                },
+                option=orjson.OPT_SERIALIZE_NUMPY,
+            )
+
         choices: list[CompletionResponseChoice] = []
         num_prompt_tokens = 0
         num_generated_tokens = 0
@@ -633,7 +1008,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     else None
                 )
 
-                choice_data = CompletionResponseChoice(
+                choice_data = CompletionResponseChoice.model_construct(
                     index=len(choices),
                     text=output_text,
                     logprobs=logprobs,
@@ -659,7 +1034,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             num_prompt_tokens += len(prompt_token_ids)
 
-        usage = UsageInfo(
+        usage = UsageInfo.model_construct(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
@@ -670,7 +1045,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
             and last_final_res
             and last_final_res.num_cached_tokens is not None
         ):
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
+            usage.prompt_tokens_details = PromptTokenUsageInfo.model_construct(
                 cached_tokens=last_final_res.num_cached_tokens
             )
 
@@ -699,7 +1074,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
             kv_transfer_params = final_res_batch[0].kv_transfer_params
             ec_transfer_params = final_res_batch[0].ec_transfer_params
 
-        return CompletionResponse(
+        return CompletionResponse.model_construct(
             id=request_id,
             created=created_time,
             model=model_name,

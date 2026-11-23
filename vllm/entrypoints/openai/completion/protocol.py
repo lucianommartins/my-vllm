@@ -4,7 +4,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, ClassVar, Final, Literal
 
 from pydantic import Field, model_validator
 
@@ -13,9 +13,12 @@ from vllm.config import ModelConfig
 from vllm.entrypoints.generate.base.protocol import (
     AnyResponseFormat,
     MMPayload,
+    OpenAIResponseModel,
     PerRequestMetrics,
     StopParam,
     StreamOptions,
+    build_fast_model_template,
+    fast_validate_scalar_fields,
     resolve_return_mm_kwargs_alias,
     structured_outputs_from_response_format,
     validate_cache_salt,
@@ -35,6 +38,7 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
     ThinkingTokenBudget,
+    build_request_sampling_params,
 )
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import is_list_of
@@ -44,6 +48,47 @@ logger = init_logger(__name__)
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+
+_FAST_CMPL_FIELD_KINDS: Final[dict[str, str]] = {
+    "model": "str_or_none",
+    "prompt": "skip",
+    "echo": "bool_or_none",
+    "frequency_penalty": "float_or_none",
+    "logprobs": "skip",
+    "max_tokens": "int_or_none",
+    "n": "int",
+    "presence_penalty": "float_or_none",
+    "seed": "int64_or_none",
+    "stop": "stop",
+    "stream": "bool_or_none",
+    "suffix": "str_or_none",
+    "temperature": "float_or_none",
+    "top_p": "float_or_none",
+    "user": "str_or_none",
+    "use_beam_search": "bool",
+    "top_k": "int_or_none",
+    "min_p": "float_or_none",
+    "repetition_penalty": "float_or_none",
+    "length_penalty": "float",
+    "include_stop_str_in_output": "bool",
+    "ignore_eos": "bool",
+    "min_tokens": "int",
+    "skip_special_tokens": "bool_or_none",
+    "spaces_between_special_tokens": "bool",
+    "truncate_prompt_tokens": "trunc_toks",
+    "truncation_side": "trunc_side",
+    "add_special_tokens": "bool",
+    "priority": "int64",
+    "request_id": "str",
+    "session_id": "str_or_none",
+    "return_token_ids": "bool_or_none",
+    "return_weight_versions": "bool",
+    "return_token_offsets": "bool_or_none",
+    "stream_interval": "ge1_int_or_none",
+    "cache_salt": "cache_salt",
+}
+_FAST_CMPL_TEMPLATE: tuple[dict[str, Any], tuple[tuple[str, Any], ...], dict[str, Any] | None] | None = None
 
 
 class CompletionRequest(OpenAIBaseModel):
@@ -65,7 +110,7 @@ class CompletionRequest(OpenAIBaseModel):
     n: int = 1
     presence_penalty: float | None = None
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
-    stop: StopParam = []
+    stop: StopParam = Field(default_factory=list)
     stream: bool | None = False
     stream_options: StreamOptions | None = None
     suffix: str | None = None
@@ -80,7 +125,7 @@ class CompletionRequest(OpenAIBaseModel):
     repetition_penalty: float | None = None
     watermarking: bool | None = None
     length_penalty: float = 1.0
-    stop_token_ids: list[int] | None = []
+    stop_token_ids: list[int] | None = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
@@ -310,7 +355,7 @@ class CompletionRequest(OpenAIBaseModel):
         )
 
     # Default sampling parameters for completion requests
-    _DEFAULT_SAMPLING_PARAMS: dict = {
+    _DEFAULT_SAMPLING_PARAMS: ClassVar[dict] = {
         "repetition_penalty": 1.0,
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
@@ -361,86 +406,108 @@ class CompletionRequest(OpenAIBaseModel):
         max_tokens: int,
         default_sampling_params: dict | None = None,
     ) -> SamplingParams:
-        if default_sampling_params is None:
-            default_sampling_params = {}
-
-        # Priority: user -> server default -> OpenAI default
-        sampling_params = {
-            name: (
-                value
-                if (value := getattr(self, name)) is not None
-                else default_sampling_params.get(name, default)
-            )
-            for name, default in self._DEFAULT_SAMPLING_PARAMS.items()
-        }
-
-        # Merge server-default stop_token_ids (e.g., model-specific tokens
-        # like </call> for gpt-oss) with any request-specified ones
-        stop_token_ids = self.stop_token_ids
-        default_stop_ids = default_sampling_params.get("stop_token_ids")
-        if default_stop_ids:
-            if not stop_token_ids:
-                stop_token_ids = list(default_stop_ids)
-            else:
-                stop_token_ids = list(
-                    dict.fromkeys([*stop_token_ids, *default_stop_ids])
-                )
-
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
             prompt_logprobs = self.logprobs
 
         echo_without_generation = self.echo and self.max_tokens == 0
 
-        if (skip_special_tokens := self.skip_special_tokens) is None:
-            skip_special_tokens = default_sampling_params.get(
-                "skip_special_tokens", True
-            )
-
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
-        if self.kv_transfer_params:
-            # Pass in kv_transfer_params via extra_args
-            extra_args["kv_transfer_params"] = self.kv_transfer_params
-        if self.ec_transfer_params:
-            # Pass in ec_transfer_params via extra_args
-            extra_args["ec_transfer_params"] = self.ec_transfer_params
-        return SamplingParams.from_optional(
-            n=self.n,
-            **sampling_params,
-            watermarking=self.watermarking,
-            seed=self.seed,
-            stop=self.stop,
-            stop_token_ids=stop_token_ids,
-            logprobs=None if self.logprob_token_ids else self.logprobs,
-            ignore_eos=self.ignore_eos,
+        return build_request_sampling_params(
+            self,
             max_tokens=max_tokens if not echo_without_generation else 1,
-            min_tokens=self.min_tokens,
+            default_sampling_params=default_sampling_params,
+            logprobs=None if self.logprob_token_ids else self.logprobs,
             prompt_logprobs=prompt_logprobs,
-            logprob_token_ids=self.logprob_token_ids or None,
-            skip_special_tokens=skip_special_tokens,
-            spaces_between_special_tokens=self.spaces_between_special_tokens,
-            include_stop_str_in_output=self.include_stop_str_in_output,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
-            stream_interval=self.stream_interval,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             structured_outputs=self.extract_structured_outputs(),
-            logit_bias=self.logit_bias,
-            allowed_token_ids=self.allowed_token_ids,
-            bad_words=self.bad_words,
-            extra_args=extra_args or None,
-            skip_clone=True,  # Created fresh per request, safe to skip clone
-            repetition_detection=self.repetition_detection,
-            thinking_token_budget=self.thinking_token_budget,
-            routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 
+    @classmethod
+    def _try_fast_validate(cls, data: dict[str, Any]) -> "CompletionRequest | None":
+        """Lossless fast constructor for plain scalar+text completion payloads."""
+        if cls is not CompletionRequest:
+            return None
+        prompt = data.get("prompt")
+        if type(prompt) is str:
+            if prompt == "":
+                return None
+        elif (
+            type(prompt) is list
+            and 0 < len(prompt) <= envs.VLLM_MAX_COMPLETION_PROMPTS
+            and all(type(s) is str for s in prompt)
+        ):
+            pass
+        else:
+            return None
+        if "logprobs" in data and data["logprobs"] is not None:
+            return None
+
+        global _FAST_CMPL_TEMPLATE
+        tmpl = _FAST_CMPL_TEMPLATE
+        if tmpl is None:
+            tmpl = _FAST_CMPL_TEMPLATE = build_fast_model_template(cls)
+        base_defaults, factories, priv_tmpl = tmpl
+        values = fast_validate_scalar_fields(
+            data, _FAST_CMPL_FIELD_KINDS, base_defaults, factories
+        )
+        if values is None:
+            return None
+        if "max_tokens" in data and data["max_tokens"] is None:
+            values["max_tokens"] = 16
+
+        obj = cls.__new__(cls)
+        object.__setattr__(obj, "__dict__", values)
+        object.__setattr__(obj, "__pydantic_fields_set__", set(data))
+        object.__setattr__(obj, "__pydantic_extra__", {})
+        object.__setattr__(
+            obj, "__pydantic_private__", priv_tmpl.copy() if priv_tmpl else None
+        )
+        return obj
+
     @model_validator(mode="before")
+    @classmethod
+    def _validate_before_fast(cls, data: Any) -> Any:
+        if type(data) is not dict and not isinstance(data, dict):
+            return data
+        if "return_mm_kwargs" in data:
+            data = resolve_return_mm_kwargs_alias(data)
+        if "cache_salt" in data:
+            validate_cache_salt(data["cache_salt"])
+        if "max_tokens" in data and data["max_tokens"] is None:
+            data = data.copy()
+            data["max_tokens"] = cls.model_fields["max_tokens"].default
+        if "response_format" in data and data["response_format"] is not None:
+            cls.validate_response_format(data)
+        if "structured_outputs" in data and data["structured_outputs"] is not None:
+            cls.check_structured_outputs_count(data)
+        if (
+            "logprob_token_ids" in data
+            or "prompt_logprobs" in data
+            or "logprobs" in data
+        ):
+            cls.check_logprobs(data)
+        if (
+            "stream_options" in data
+            and data["stream_options"]
+            and not data.get("stream")
+        ):
+            raise VLLMValidationError(
+                "Stream options can only be defined when `stream=True`.",
+                parameter="stream_options",
+            )
+        cls.validate_prompt_and_prompt_embeds(data)
+        prompt = data.get("prompt")
+        prompt_embeds = data.get("prompt_embeds")
+        if isinstance(prompt, list) or isinstance(prompt_embeds, list):
+            cls.validate_prompt_list_length(data)
+        return data
+
     @classmethod
     def apply_return_mm_kwargs_alias(cls, data: Any) -> Any:
         return resolve_return_mm_kwargs_alias(data)
 
-    @model_validator(mode="before")
     @classmethod
     def check_cache_salt_support(cls, data: Any) -> Any:
         if not isinstance(data, dict):
@@ -448,7 +515,6 @@ class CompletionRequest(OpenAIBaseModel):
         validate_cache_salt(data.get("cache_salt"))
         return data
 
-    @model_validator(mode="before")
     @classmethod
     def normalize_null_max_tokens(cls, data):
         if isinstance(data, dict) and data.get("max_tokens") is None:
@@ -456,7 +522,6 @@ class CompletionRequest(OpenAIBaseModel):
             data["max_tokens"] = cls.model_fields["max_tokens"].default
         return data
 
-    @model_validator(mode="before")
     @classmethod
     def validate_response_format(cls, data):
         if not isinstance(data, dict):
@@ -489,7 +554,6 @@ class CompletionRequest(OpenAIBaseModel):
 
         return data
 
-    @model_validator(mode="before")
     @classmethod
     def check_structured_outputs_count(cls, data):
         if not isinstance(data, dict):
@@ -519,7 +583,6 @@ class CompletionRequest(OpenAIBaseModel):
         validate_structured_outputs_structural_tag(structured_outputs_kwargs)
         return data
 
-    @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
         if not isinstance(data, dict):
@@ -596,7 +659,6 @@ class CompletionRequest(OpenAIBaseModel):
 
         return data
 
-    @model_validator(mode="before")
     @classmethod
     def validate_stream_options(cls, data):
         if not isinstance(data, dict):
@@ -609,7 +671,6 @@ class CompletionRequest(OpenAIBaseModel):
 
         return data
 
-    @model_validator(mode="before")
     @classmethod
     def validate_prompt_and_prompt_embeds(cls, data):
         if not isinstance(data, dict):
@@ -630,20 +691,23 @@ class CompletionRequest(OpenAIBaseModel):
 
         return data
 
-    @model_validator(mode="before")
     @classmethod
     def validate_prompt_list_length(cls, data):
         if not isinstance(data, dict):
             return data
-        max_prompts = envs.VLLM_MAX_COMPLETION_PROMPTS
-
         prompt = data.get("prompt")
-        if (
+        prompt_embeds = data.get("prompt_embeds")
+        is_prompt_list = (
             isinstance(prompt, list)
             and len(prompt) > 0
             and not is_list_of(prompt, int)
-            and len(prompt) > max_prompts
-        ):
+        )
+        is_embeds_list = isinstance(prompt_embeds, list)
+        if not is_prompt_list and not is_embeds_list:
+            return data
+
+        max_prompts = envs.VLLM_MAX_COMPLETION_PROMPTS
+        if is_prompt_list and len(prompt) > max_prompts:
             raise VLLMValidationError(
                 f"prompt list length {len(prompt)} exceeds the maximum "
                 f"allowed count of {max_prompts}. To increase this "
@@ -652,8 +716,7 @@ class CompletionRequest(OpenAIBaseModel):
                 parameter="prompt",
             )
 
-        prompt_embeds = data.get("prompt_embeds")
-        if isinstance(prompt_embeds, list) and len(prompt_embeds) > max_prompts:
+        if is_embeds_list and len(prompt_embeds) > max_prompts:
             raise VLLMValidationError(
                 f"prompt_embeds list length {len(prompt_embeds)} exceeds "
                 f"the maximum allowed count of {max_prompts}. To increase "
@@ -665,14 +728,14 @@ class CompletionRequest(OpenAIBaseModel):
         return data
 
 
-class CompletionLogProbs(OpenAIBaseModel):
+class CompletionLogProbs(OpenAIResponseModel):
     text_offset: list[int] = Field(default_factory=list)
     token_logprobs: list[float | None] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)
     top_logprobs: list[dict[str, float] | None] = Field(default_factory=list)
 
 
-class CompletionResponseChoice(OpenAIBaseModel):
+class CompletionResponseChoice(OpenAIResponseModel):
     index: int
     text: str
     logprobs: CompletionLogProbs | None = None
@@ -702,7 +765,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
     weight_versions: list[WeightVersionSpan] | None = None
 
 
-class CompletionResponse(OpenAIBaseModel):
+class CompletionResponse(OpenAIResponseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
     object: Literal["text_completion"] = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
@@ -722,7 +785,7 @@ class CompletionResponse(OpenAIBaseModel):
     metrics: PerRequestMetrics | None = None
 
 
-class CompletionResponseStreamChoice(OpenAIBaseModel):
+class CompletionResponseStreamChoice(OpenAIResponseModel):
     index: int
     text: str
     logprobs: CompletionLogProbs | None = None
@@ -743,7 +806,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     weight_versions: list[WeightVersionSpan] | None = None
 
 
-class CompletionStreamResponse(OpenAIBaseModel):
+class CompletionStreamResponse(OpenAIResponseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))

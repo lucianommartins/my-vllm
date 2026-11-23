@@ -2095,6 +2095,8 @@ class Gemma4ForConditionalGeneration(
 
         return torch.cat(embeddings, dim=0)
 
+    supports_text_only_input_ids: ClassVar[bool] = True
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -2167,16 +2169,45 @@ class Gemma4ForConditionalGeneration(
         # Must run here (outside @support_torch_compile boundary) because
         # _run_decoder_layers is inside a compiled graph where Python
         # side effects are eliminated.
-        self._clear_mm_prefix_for_full_attn_layers()
+        is_mm_prefix_lm = getattr(self, "_is_mm_prefix_lm", None)
+        if is_mm_prefix_lm is None:
+            from vllm.config import get_current_vllm_config
 
-        hidden_states = self.language_model.model(
-            input_ids,
-            positions,
-            per_layer_inputs=per_layer_inputs,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+            try:
+                vllm_cfg = get_current_vllm_config()
+                is_mm_prefix_lm = bool(
+                    vllm_cfg.model_config is not None
+                    and vllm_cfg.model_config.is_mm_prefix_lm
+                )
+            except AssertionError:
+                is_mm_prefix_lm = True
+            self._is_mm_prefix_lm = is_mm_prefix_lm
+        if is_mm_prefix_lm:
+            self._clear_mm_prefix_for_full_attn_layers()
+
+        # When inputs_embeds is None (text-only / decode), enter the
+        # @support_torch_compile wrapper (__call__) so embeddings + PLE run
+        # inside Inductor / FULL CUDA Graphs. When inputs_embeds is provided
+        # (MM prefill chunk), call .forward directly to stay eager and
+        # avoid Dynamo recompiling VllmBackend with non-None inputs_embeds.
+        if inputs_embeds is not None:
+            hidden_states = self.language_model.model.forward(
+                input_ids,
+                positions,
+                per_layer_inputs=per_layer_inputs,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+        else:
+            hidden_states = self.language_model.model(
+                input_ids,
+                positions,
+                per_layer_inputs=per_layer_inputs,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
 
         return hidden_states
 

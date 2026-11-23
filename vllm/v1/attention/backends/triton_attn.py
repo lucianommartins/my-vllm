@@ -42,6 +42,9 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 )
 from vllm.v1.attention.ops.triton_unified_attention import (
     MAX_3D_QUERY_LEN,
+    _get_fa2_varlen_fwd,
+    _get_sm80_ext_fast,
+    _run_sm80_fa2_tail,
     unified_attention,
 )
 from vllm.v1.kv_cache_interface import (
@@ -96,6 +99,9 @@ class TritonAttentionMetadata:
     # Gemma4 sliding-window groups: split the window, not the sequence,
     # across the 3D segments (unified_attention segment_sliding_window).
     segment_sliding_window: bool = False
+    # Leading pure-decode request prefix count in mixed prefill+decode batches.
+    num_decode_reqs: int = 0
+    cu_seqlens_q_prefill: torch.Tensor | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -246,6 +252,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             dtype=torch.float32,
             device=device,
         )
+        self._segm_max_rows = self.softmax_segm_max.shape[0]
+        self._segm_views: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = {}
+        if self.max_seqs_64_segments > 0 or self.is_sm80_gemma4_sliding:
+            segm_dim = self.softmax_segm_output.shape[-1]
+            for seg in (NUM_PAR_SOFTMAX_SEGMENTS, 8, 4):
+                seg_out = self.softmax_segm_output.view(
+                    -1, self.num_heads_q, seg, segm_dim
+                )
+                self._segm_views[seg] = (
+                    seg_out,
+                    self.softmax_segm_max.view(-1, self.num_heads_q, seg),
+                    self.softmax_segm_expsum.view(-1, self.num_heads_q, seg),
+                    seg_out.shape[0],
+                )
         self.rswa_window = model_config.rswa_window
         # R-SWA restages prefix lengths in build(), which the no-op
         # update_draft_decode_metadata() does not refresh.
@@ -302,21 +322,16 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         )
         if self.max_seqs_64_segments > 0 and (
             self.max_seqs_64_segments < seq_lens.shape[0]
-            or self.softmax_segm_max.shape[0] < num_actual_tokens
+            or self._segm_max_rows < num_actual_tokens
         ):
             # The 16-segment grid fills the SMs, or the 64-segment rows cannot
             # hold every query token: same scratch, 16-segment layout.
             segments = NUM_PAR_SOFTMAX_SEGMENTS
+            seg_out, seg_max, seg_expsum, _ = self._segm_views[segments]
             attn_metadata.num_par_softmax_segments = segments
-            attn_metadata.softmax_segm_output = self.softmax_segm_output.view(
-                -1, self.num_heads_q, segments, self.softmax_segm_output.shape[-1]
-            )
-            attn_metadata.softmax_segm_max = self.softmax_segm_max.view(
-                -1, self.num_heads_q, segments
-            )
-            attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
-                -1, self.num_heads_q, segments
-            )
+            attn_metadata.softmax_segm_output = seg_out
+            attn_metadata.softmax_segm_max = seg_max
+            attn_metadata.softmax_segm_expsum = seg_expsum
         elif self.is_sm80_gemma4_sliding:
             n_rows = max(seq_lens.shape[0], num_actual_tokens)
             if 9 <= n_rows <= 16:
@@ -329,22 +344,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 segments = 0
                 target_thresh = 16
             if segments > 0:
-                seg_out = self.softmax_segm_output.view(
-                    -1,
-                    self.num_heads_q,
-                    segments,
-                    self.softmax_segm_output.shape[-1],
-                )
-                if seg_out.shape[0] >= n_rows:
+                seg_out, seg_max, seg_expsum, seg_rows = self._segm_views[segments]
+                if seg_rows >= n_rows:
                     attn_metadata.seq_threshold_3D = target_thresh
                     attn_metadata.num_par_softmax_segments = segments
                     attn_metadata.softmax_segm_output = seg_out
-                    attn_metadata.softmax_segm_max = self.softmax_segm_max.view(
-                        -1, self.num_heads_q, segments
-                    )
-                    attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
-                        -1, self.num_heads_q, segments
-                    )
+                    attn_metadata.softmax_segm_max = seg_max
+                    attn_metadata.softmax_segm_expsum = seg_expsum
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
         if mm_ranges is not None:
@@ -363,6 +369,38 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             persistent_prefix_lens.copy_(rswa_prefix_lens[:num_reqs])
             attn_metadata.rswa_prefix_lens = persistent_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
+
+        if max_query_len > 1 and num_reqs > 1:
+            q_loc_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+            if (
+                q_loc_cpu is not None
+                and q_loc_cpu.numel() >= num_reqs + 1
+                and query_start_loc.shape[0] >= num_reqs + 1
+                and seq_lens.shape[0] == num_reqs
+            ):
+                q_loc_list = q_loc_cpu[: num_reqs + 1].tolist()
+                num_dec = 0
+                while (
+                    num_dec < num_reqs
+                    and (q_loc_list[num_dec + 1] - q_loc_list[num_dec]) == 1
+                ):
+                    num_dec += 1
+                if (
+                    0 < num_dec < num_reqs
+                    and q_loc_list[num_dec] == num_dec
+                    and attn_metadata.softmax_segm_max.shape[0] >= num_dec
+                    and all(
+                        (q_loc_list[i + 1] - q_loc_list[i]) >= 1
+                        for i in range(num_dec, num_reqs)
+                    )
+                ):
+                    attn_metadata.num_decode_reqs = num_dec
+                    cu_prefill = query_start_loc[num_dec : num_reqs + 1] - num_dec
+                    attn_metadata.cu_seqlens_q_prefill = (
+                        cu_prefill
+                        if cu_prefill.dtype == torch.int32
+                        else cu_prefill.to(torch.int32)
+                    )
 
         return attn_metadata
 
@@ -643,6 +681,149 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.use_td = td_override
         self._set_kv_ptr_range = current_platform.is_rocm()
+        self._is_kv_quant_none = self._kv_quant_mode == KVQuantMode.NONE
+        self._use_kv_views_cache = not self._set_kv_ptr_range and self._is_kv_quant_none
+        self._is_encoder = self.attn_type in (
+            AttentionType.ENCODER_ONLY,
+            AttentionType.ENCODER,
+        )
+        self._win_left, self._win_right = self.sliding_window
+        self._cached_kv_obj = None
+        self._cached_kv_ptr = 0
+        self._cached_kv_shape = None
+        self._cached_kv_key = None
+        self._cached_kv_views = None
+        self._cached_kv_k = None
+        self._cached_kv_v = None
+        is_sm80_cuda = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and not self._set_kv_ptr_range
+        )
+        self._sm80_use_kv_update = (
+            is_sm80_cuda
+            and self._is_kv_quant_none
+            and not self._is_encoder
+        )
+        self._sm80_fast_layer = (
+            is_sm80_cuda
+            and not envs.VLLM_BATCH_INVARIANT
+            and not self.use_td
+            and self._is_kv_quant_none
+            and not self._is_encoder
+            and self.head_size in (256, 512)
+            and self.num_queries_per_kv == 8
+            and self.logits_soft_cap <= 0
+            and self.alibi_slopes is None
+            and not self.use_alibi_sqrt
+            and self.sinks is None
+            and self.chunk_lookback < 0
+            and self._win_right in (-1, 0)
+        )
+        self._sm80_dispatch_fn = None
+        self._sm80_kv_update_fn = None
+        self._sm80_fa2_fwd = None
+
+    def _get_kv_views(self, kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        kv_ptr = kv_cache.data_ptr()
+        if (
+            kv_cache is self._cached_kv_obj
+            and kv_ptr == self._cached_kv_ptr
+            and kv_cache.shape == self._cached_kv_shape
+        ):
+            return self._cached_kv_k, self._cached_kv_v
+        kv_key = (
+            kv_ptr,
+            kv_cache.shape,
+            kv_cache.stride(),
+            kv_cache.dtype,
+        )
+        if self._cached_kv_key == kv_key:
+            self._cached_kv_obj = kv_cache
+            self._cached_kv_ptr = kv_ptr
+            self._cached_kv_shape = kv_key[1]
+            return self._cached_kv_k, self._cached_kv_v
+        kv_t = kv_cache.transpose(1, 2)
+        key_cache, value_cache = kv_t.split(self.head_size, dim=-1)
+        self._cached_kv_obj = kv_cache
+        self._cached_kv_ptr = kv_ptr
+        self._cached_kv_shape = kv_key[1]
+        self._cached_kv_key = kv_key
+        self._cached_kv_views = (kv_key, key_cache, value_cache)
+        self._cached_kv_k = key_cache
+        self._cached_kv_v = value_cache
+        return key_cache, value_cache
+
+    def _try_sm80_fa2_direct(
+        self,
+        q_in: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        out_in: torch.Tensor,
+        cu_q: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bt: torch.Tensor,
+        max_query_len: int,
+        max_seq_len: int,
+    ) -> bool:
+        """Invoke cached _vllm_fa2_C.varlen_fwd directly when standard preconditions hold."""
+        fa2_fwd = self._sm80_fa2_fwd
+        num_seqs = seq_lens.shape[0]
+        if (
+            fa2_fwd is None
+            or num_seqs <= 0
+            or q_in.shape[0] <= 0
+            or max_seq_len <= 0
+            or not q_in.is_cuda
+            or q_in.shape != out_in.shape
+            or q_in.dtype is not torch.bfloat16
+            or out_in.dtype is not torch.bfloat16
+            or key_cache.dtype is not torch.bfloat16
+            or value_cache.dtype is not torch.bfloat16
+            or q_in.dim() != 3
+            or q_in.stride(-1) != 1
+            or out_in.stride(-1) != 1
+            or key_cache.stride(-1) != 1
+            or value_cache.stride(-1) != 1
+            or (key_cache.shape[1] & 15) != 0
+            or cu_q.dim() != 1
+            or seq_lens.dim() != 1
+            or bt.dim() != 2
+            or cu_q.shape[0] != num_seqs + 1
+            or bt.shape[0] < num_seqs
+            or cu_q.dtype is not torch.int32
+            or seq_lens.dtype is not torch.int32
+            or bt.dtype is not torch.int32
+            or not cu_q.is_contiguous()
+            or not seq_lens.is_contiguous()
+            or not bt.is_contiguous()
+        ):
+            return False
+        fa2_fwd(
+            q_in,
+            key_cache,
+            value_cache,
+            out_in,
+            cu_q,
+            cu_q,
+            seq_lens,
+            None,
+            bt,
+            None,
+            max_query_len,
+            max_seq_len,
+            0.0,
+            self.scale,
+            False,
+            True,
+            self.sliding_window[0],
+            self.sliding_window[1],
+            0.0,
+            False,
+            0,
+            None,
+        )
+        return True
 
     def forward(
         self,
@@ -697,7 +878,7 @@ class TritonAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Handle encoder attention differently - no KV cache needed
-        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+        if self._is_encoder:
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return self._forward_encoder_attention(
@@ -709,6 +890,11 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        q_in = query if query.shape[0] == num_actual_tokens else query[:num_actual_tokens]
+        out_in = (
+            output if output.shape[0] == num_actual_tokens else output[:num_actual_tokens]
+        )
+
         # KV cache arrives in logical (B, H, N, 2*hs) order.
         # Per-token-head quantized KV cache: handled by the core unified
         # kernel, which dequantizes per-(token, head) inline via constexpr
@@ -718,19 +904,105 @@ class TritonAttentionImpl(AttentionImpl):
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
             q_descale = k_descale = v_descale = None
-        # FP8 per-tensor / auto path (original flow).
         else:
-            kv_cache = kv_cache.transpose(1, 2)
-            hs = self.head_size
-            key_cache, value_cache = kv_cache.split(hs, dim=-1)
+            if self._use_kv_views_cache:
+                key_cache, value_cache = self._get_kv_views(kv_cache)
+            else:
+                kv_t = kv_cache.transpose(1, 2)
+                key_cache, value_cache = kv_t.split(self.head_size, dim=-1)
+                if (
+                    is_quantized_kv_cache(self.kv_cache_dtype)
+                    and key_cache.dtype != self.fp8_dtype
+                ):
+                    key_cache = key_cache.view(self.fp8_dtype)
+                    value_cache = value_cache.view(self.fp8_dtype)
+                if self._set_kv_ptr_range:
+                    set_triton_ptr_range(kv_t, key_cache, value_cache)
+
             if (
-                is_quantized_kv_cache(self.kv_cache_dtype)
-                and key_cache.dtype != self.fp8_dtype
+                self._sm80_fast_layer
+                and output_scale is None
+                and attn_metadata.mm_prefix_range_tensor is None
+                and attn_metadata.rswa_prefix_lens is None
+                and attn_metadata.causal is True
             ):
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-            if self._set_kv_ptr_range:
-                set_triton_ptr_range(kv_cache, key_cache, value_cache)
+                dispatch_fn = self._sm80_dispatch_fn
+                if dispatch_fn is None:
+                    ext = _get_sm80_ext_fast()
+                    dispatch_fn = ext.dispatch_sm80_fast_attn
+                    self._sm80_dispatch_fn = dispatch_fn
+                    if self._sm80_kv_update_fn is None:
+                        self._sm80_kv_update_fn = ext.launch_reshape_and_cache_bf16
+                    self._sm80_fa2_fwd = _get_fa2_varlen_fwd()
+                num_decode_reqs = attn_metadata.num_decode_reqs
+                max_query_len = attn_metadata.max_query_len
+                rc = dispatch_fn(
+                    out_in,
+                    q_in,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.query_start_loc,
+                    max_query_len,
+                    attn_metadata.seq_lens,
+                    self.scale,
+                    self._win_left,
+                    self._win_right,
+                    attn_metadata.block_table,
+                    attn_metadata.softmax_segm_output,
+                    attn_metadata.softmax_segm_max,
+                    attn_metadata.softmax_segm_expsum,
+                    num_decode_reqs,
+                    attn_metadata.cu_seqlens_q_prefill,
+                )
+                if rc == 1:
+                    return output
+                if rc != 0:
+                    if rc == 2:
+                        num_seqs = attn_metadata.seq_lens.shape[0]
+                        cu_pref = attn_metadata.cu_seqlens_q_prefill
+                        if cu_pref is not None and self._try_sm80_fa2_direct(
+                            q_in[num_decode_reqs:],
+                            key_cache,
+                            value_cache,
+                            out_in[num_decode_reqs:],
+                            cu_pref,
+                            attn_metadata.seq_lens[num_decode_reqs:num_seqs],
+                            attn_metadata.block_table[num_decode_reqs:num_seqs],
+                            max_query_len,
+                            attn_metadata.max_seq_len,
+                        ):
+                            return output
+                    elif rc == 3 and self._try_sm80_fa2_direct(
+                        q_in,
+                        key_cache,
+                        value_cache,
+                        out_in,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_table,
+                        max_query_len,
+                        attn_metadata.max_seq_len,
+                    ):
+                        return output
+                    _run_sm80_fa2_tail(
+                        rc,
+                        q_in,
+                        key_cache,
+                        value_cache,
+                        out_in,
+                        attn_metadata.query_start_loc,
+                        max_query_len,
+                        attn_metadata.seq_lens,
+                        attn_metadata.max_seq_len,
+                        self.scale,
+                        self.sliding_window,
+                        attn_metadata.block_table,
+                        num_decode_reqs,
+                        attn_metadata.cu_seqlens_q_prefill,
+                        fa2_fwd=self._sm80_fa2_fwd,
+                    )
+                    return output
+
             descale_shape = (
                 attn_metadata.query_start_loc.shape[0] - 1,
                 key_cache.shape[2],
@@ -763,10 +1035,10 @@ class TritonAttentionImpl(AttentionImpl):
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
-            q=query[:num_actual_tokens],
+            q=q_in,
             k=key_cache,
             v=value_cache,
-            out=output[:num_actual_tokens],
+            out=out_in,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             seqused_k=seqused_k,
@@ -800,6 +1072,8 @@ class TritonAttentionImpl(AttentionImpl):
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
             segment_sliding_window=attn_metadata.segment_sliding_window,
+            num_decode_reqs=attn_metadata.num_decode_reqs,
+            cu_seqlens_q_prefill=attn_metadata.cu_seqlens_q_prefill,
         )
 
         return output
@@ -894,12 +1168,24 @@ class TritonAttentionImpl(AttentionImpl):
             return
         # For decoder and cross-attention, use KV cache as before.
         # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            key_cache = key_cache.view(self.fp8_dtype)
-            value_cache = value_cache.view(self.fp8_dtype)
-        if self._set_kv_ptr_range:
-            set_triton_ptr_range(kv_cache, key_cache, value_cache)
+        if not self._set_kv_ptr_range and self._is_kv_quant_none:
+            key_cache, value_cache = self._get_kv_views(kv_cache)
+            if self._sm80_use_kv_update:
+                kv_fn = self._sm80_kv_update_fn
+                if kv_fn is None:
+                    kv_fn = _get_sm80_ext_fast().launch_reshape_and_cache_bf16
+                    self._sm80_kv_update_fn = kv_fn
+                if kv_fn(key, value, key_cache, value_cache, slot_mapping):
+                    return
+        else:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                key_cache = key_cache.view(self.fp8_dtype)
+                value_cache = value_cache.view(self.fp8_dtype)
+            if self._set_kv_ptr_range:
+                set_triton_ptr_range(kv_cache, key_cache, value_cache)
         triton_reshape_and_cache_flash(
             key,
             value,

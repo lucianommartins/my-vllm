@@ -493,6 +493,7 @@ class ModelConfig:
             "enable_trace_replay",
             "disable_cascade_attn",
             "skip_tokenizer_init",
+            "renderer_num_workers",
             "served_model_name",
             "config_format",
             "hf_token",

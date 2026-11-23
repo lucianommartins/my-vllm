@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -14,6 +15,42 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 logger = init_logger(__name__)
+_envs_dict = envs.__dict__
+_INIT_ENVIRON = os.environ
+_INIT_ENV_DATA = _INIT_ENVIRON.__dict__.get("_data")
+if isinstance(_INIT_ENV_DATA, dict) and hasattr(_INIT_ENVIRON, "encodekey"):
+    _NANS_ENV_KEY: bytes | str = _INIT_ENVIRON.encodekey(
+        "VLLM_COMPUTE_NANS_IN_LOGITS"
+    )
+    _RAISE_NANS_ENV_KEY: bytes | str = _INIT_ENVIRON.encodekey(
+        "VLLM_RAISE_ON_LOGIT_NANS"
+    )
+else:
+    _INIT_ENV_DATA = None
+    _NANS_ENV_KEY = "VLLM_COMPUTE_NANS_IN_LOGITS"
+    _RAISE_NANS_ENV_KEY = "VLLM_RAISE_ON_LOGIT_NANS"
+
+
+def _get_compute_nans_in_logits() -> bool:
+    """Fast-path lookup of envs.VLLM_COMPUTE_NANS_IN_LOGITS for uncached processes.
+
+    Preserves monkeypatch updates to ``vllm.envs`` and ``os.environ`` mutations
+    while avoiding repeated ``envs.__getattr__`` calls when disabled.
+    """
+    cached = _envs_dict.get("VLLM_COMPUTE_NANS_IN_LOGITS")
+    if cached is not None:
+        return bool(cached)
+    environ = os.environ
+    if environ is _INIT_ENVIRON and _INIT_ENV_DATA is not None:
+        if _NANS_ENV_KEY in _INIT_ENV_DATA or _RAISE_NANS_ENV_KEY in _INIT_ENV_DATA:
+            return bool(envs.VLLM_COMPUTE_NANS_IN_LOGITS)
+        return False
+    if (
+        "VLLM_COMPUTE_NANS_IN_LOGITS" in environ
+        or "VLLM_RAISE_ON_LOGIT_NANS" in environ
+    ):
+        return bool(envs.VLLM_COMPUTE_NANS_IN_LOGITS)
+    return False
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreEvent, EngineCoreOutput, FinishReason
@@ -422,7 +459,7 @@ class RequestSpecDecodeMetrics:
         return result
 
 
-@dataclass
+@dataclass(slots=True)
 class PromptTokenStats:
     """Breakdown of prompt tokens by source.
 
@@ -438,7 +475,7 @@ class PromptTokenStats:
         local_cache_hit + external_kv_transfer = cached_tokens
     """
 
-    ALL_SOURCES: tuple[str, ...] = (
+    ALL_SOURCES: ClassVar[tuple[str, ...]] = (
         "local_compute",
         "local_cache_hit",
         "external_kv_transfer",
@@ -461,25 +498,41 @@ class PromptTokenStats:
 
     def get_by_source(self, source: str) -> int:
         """Get token count by source label."""
-        source_map = {
-            "local_compute": self.computed,
-            "local_cache_hit": self.local_cache_hit,
-            "external_kv_transfer": self.external_kv_transfer,
-        }
-        if source not in source_map:
-            raise ValueError(f"Unknown source: {source}")
-        return source_map[source]
+        if source == "local_compute":
+            return self.computed
+        if source == "local_cache_hit":
+            return self.local_cache_hit
+        if source == "external_kv_transfer":
+            return self.external_kv_transfer
+        raise ValueError(f"Unknown source: {source}")
 
 
 class IterationStats:
     """Stats associated with a single set of EngineCoreOutputs."""
+
+    __slots__ = (
+        "iteration_timestamp",
+        "compute_nans_in_logits",
+        "num_generation_tokens",
+        "prompt_token_stats",
+        "num_preempted_reqs",
+        "finished_requests",
+        "max_num_generation_tokens_iter",
+        "n_params_iter",
+        "time_to_first_tokens_iter",
+        "inter_token_latencies_iter",
+        "num_corrupted_reqs",
+        "num_watermarked_reqs",
+        "num_watermark_skipped_reqs",
+        "num_not_watermarked_reqs",
+    )
 
     def __init__(self):
         self.iteration_timestamp = time.time()
         # Read once per iteration: update_from_output runs per request per
         # step, and each envs attribute access re-reads the environment
         # in processes that never enable the envs cache (the API server).
-        self.compute_nans_in_logits = envs.VLLM_COMPUTE_NANS_IN_LOGITS
+        self.compute_nans_in_logits = _get_compute_nans_in_logits()
         self.num_generation_tokens = 0
         self.prompt_token_stats = PromptTokenStats()
         self.num_preempted_reqs = 0
@@ -494,7 +547,9 @@ class IterationStats:
         self.num_not_watermarked_reqs: int = 0
 
     def __repr__(self) -> str:
-        field_to_value_str = ", ".join(f"{k}={v}" for k, v in vars(self).items())
+        field_to_value_str = ", ".join(
+            f"{k}={getattr(self, k)}" for k in self.__slots__
+        )
         return f"{self.__class__.__name__}({field_to_value_str})"
 
     @property

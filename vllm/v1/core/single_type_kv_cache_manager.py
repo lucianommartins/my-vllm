@@ -109,6 +109,12 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size * self.dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
+        self._hash_block_size = block_pool.hash_block_size
+        self._prefix_cacheable = kv_cache_spec.prefix_cacheable
+        self._dense_block_mask = (
+            type(self).reachable_block_mask.__func__
+            is SingleTypeKVCacheManager.reachable_block_mask.__func__
+        )
         self.enable_caching = enable_caching
         self.max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
@@ -156,6 +162,10 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_boundary_state_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
+        self._no_skip = (
+            type(self).get_num_skipped_tokens
+            is SingleTypeKVCacheManager.get_num_skipped_tokens
+        )
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -234,6 +244,16 @@ class SingleTypeKVCacheManager(ABC):
             # for draft tokens which are later rejected. In this case,
             # num_required_blocks may be smaller than num_req_blocks.
             return max(num_required_blocks - num_req_blocks, 0)
+
+        if not new_computed_blocks:
+            if self._no_skip:
+                return max(num_required_blocks - num_req_blocks, 0)
+            num_skipped_blocks = (
+                self.get_num_skipped_tokens(total_computed_tokens) // self.block_size
+            )
+            return max(
+                num_required_blocks - max(num_skipped_blocks, num_req_blocks), 0
+            )
 
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
@@ -385,8 +405,8 @@ class SingleTypeKVCacheManager(ABC):
             The new allocated blocks.
 
         """
-        cow_blocks: list[KVCacheBlock] = []
-        if request_id in self._partial_hit_reqs:
+        cow_blocks: list[KVCacheBlock] | None = None
+        if self._partial_hit_reqs and request_id in self._partial_hit_reqs:
             # Partial hit: redirect the shared tail to a private CoW block.
             # Replacing in place keeps the length-based allocation below
             # correct; the extra block was reserved by
@@ -395,19 +415,22 @@ class SingleTypeKVCacheManager(ABC):
             cow_block = self.block_pool.get_new_blocks(1)[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
             self.new_block_ids.append(cow_block.block_id)
-            cow_blocks.append(cow_block)
+            cow_blocks = [cow_block]
 
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_new_blocks = num_required_blocks - len(req_blocks)
         if num_new_blocks <= 0:
-            return cow_blocks
+            return cow_blocks if cow_blocks is not None else []
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
-            return cow_blocks + new_blocks
+            if cow_blocks is not None:
+                cow_blocks.extend(new_blocks)
+                return cow_blocks
+            return new_blocks
 
     @property
     def records_new_block_ids(self) -> bool:
@@ -416,6 +439,8 @@ class SingleTypeKVCacheManager(ABC):
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""
+        if not self.new_block_ids:
+            return []
         ids = self.new_block_ids
         self.new_block_ids = []
         return ids
@@ -424,6 +449,8 @@ class SingleTypeKVCacheManager(ABC):
         self,
     ) -> list[tuple[KVCacheBlock, KVCacheBlock]]:
         """Drain pending CoW source and destination block pairs."""
+        if not self._pending_cow_copies:
+            return []
         pending_copies = self._pending_cow_copies
         self._pending_cow_copies = []
         return pending_copies
@@ -439,6 +466,8 @@ class SingleTypeKVCacheManager(ABC):
         the request block table for the whole request, so a caller that reads
         them asynchronously must pin them first.
         """
+        if not self._pending_boundary_state_offloads:
+            return []
         pending = self._pending_boundary_state_offloads
         self._pending_boundary_state_offloads = []
         return pending
@@ -496,42 +525,48 @@ class SingleTypeKVCacheManager(ABC):
                 can resume at, from ``replay_boundaries``.
 
         """
-        if not self.kv_cache_spec.prefix_cacheable:
+        if not getattr(self, "_prefix_cacheable", self.kv_cache_spec.prefix_cacheable):
             return
-        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
-        num_full_blocks = min(num_tokens, num_hashed_tokens) // self.block_size
+        req_id = request.request_id
+        num_cached_blocks = self.num_cached_block.get(req_id, 0)
+        hash_bs = getattr(self, "_hash_block_size", self.block_pool.hash_block_size)
+        num_hashed_tokens = len(request.block_hashes) * hash_bs
+        avail_tokens = num_tokens if num_tokens < num_hashed_tokens else num_hashed_tokens
+        num_full_blocks = avail_tokens // self.block_size
 
         if num_cached_blocks >= num_full_blocks:
             return
 
-        # Token boundaries whose reachable tail must be retained under sparse
-        # retention: every position a replaying sibling can resume at (see
-        # ``replay_boundaries``) and any detected shared-prefix junction.
-        reachable_boundaries = [*replay_boundaries]
-        if request.shared_prefix_boundary:
-            reachable_boundaries.append(request.shared_prefix_boundary)
-            if self.use_eagle:
-                # A sibling that diverges right after the junction cannot use
-                # the block past it as the EAGLE peek, so its hit lands one
-                # block lower.
-                reachable_boundaries.append(
-                    request.shared_prefix_boundary - self.block_size
-                )
+        if getattr(self, "_dense_block_mask", False):
+            block_mask = None
+        else:
+            # Token boundaries whose reachable tail must be retained under sparse
+            # retention: every position a replaying sibling can resume at (see
+            # ``replay_boundaries``) and any detected shared-prefix junction.
+            shared_b = request.shared_prefix_boundary
+            if shared_b:
+                reachable_boundaries: Sequence[int] = [*replay_boundaries, shared_b]
+                if self.use_eagle:
+                    # A sibling that diverges right after the junction cannot use
+                    # the block past it as the EAGLE peek, so its hit lands one
+                    # block lower.
+                    reachable_boundaries.append(shared_b - self.block_size)
+            else:
+                reachable_boundaries = replay_boundaries
 
-        block_mask = self.reachable_block_mask(
-            start_block=num_cached_blocks,
-            end_block=num_full_blocks,
-            alignment_tokens=self.cache_hit_alignment_tokens,
-            kv_cache_spec=self.kv_cache_spec,
-            use_eagle=self.use_eagle,
-            retention_interval=retention_interval,
-            reachable_boundaries=reachable_boundaries,
-            dcp_world_size=self.dcp_world_size,
-        )
+            block_mask = self.reachable_block_mask(
+                start_block=num_cached_blocks,
+                end_block=num_full_blocks,
+                alignment_tokens=self.cache_hit_alignment_tokens,
+                kv_cache_spec=self.kv_cache_spec,
+                use_eagle=self.use_eagle,
+                retention_interval=retention_interval,
+                reachable_boundaries=reachable_boundaries,
+                dcp_world_size=self.dcp_world_size,
+            )
         self.block_pool.cache_full_blocks(
             request=request,
-            blocks=self.req_to_blocks[request.request_id],
+            blocks=self.req_to_blocks[req_id],
             num_cached_blocks=num_cached_blocks,
             num_full_blocks=num_full_blocks,
             block_size=self.block_size,
@@ -539,7 +574,7 @@ class SingleTypeKVCacheManager(ABC):
             block_mask=block_mask,
         )
 
-        self.num_cached_block[request.request_id] = num_full_blocks
+        self.num_cached_block[req_id] = num_full_blocks
 
     @classmethod
     def reachable_block_mask(
@@ -596,7 +631,16 @@ class SingleTypeKVCacheManager(ABC):
 
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
-        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+        block_pool = self.block_pool
+        if (
+            getattr(block_pool, "_fast_lifo_free", False) is True
+            and "free_blocks" not in block_pool.__dict__
+        ):
+            blocks = self.pop_blocks_for_free(request_id)
+            if blocks:
+                block_pool.free_blocks_forward(blocks)
+            return
+        block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
 
     @classmethod
     @abstractmethod
@@ -663,20 +707,22 @@ class SingleTypeKVCacheManager(ABC):
         Iterates backward so newly-evictable tail blocks are reached even after
         earlier blocks in the range were nulled in a prior call.
         """
-        if request_id not in self.req_to_blocks:
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None or first_block >= last_block:
             return
-        if first_block >= last_block:
-            return
-        blocks = self.req_to_blocks[request_id]
         last_block = min(last_block, len(blocks))
+        if last_block <= 0 or blocks[last_block - 1].is_null:
+            return
 
-        freed: list[KVCacheBlock] = []
-        for i in range(last_block - 1, first_block - 1, -1):
-            if blocks[i] == self._null_block:
-                break
-            freed.append(blocks[i])
-            blocks[i] = self._null_block
-        if freed:
+        null_block = self._null_block
+        i = last_block - 1
+        while i >= first_block and not blocks[i].is_null:
+            i -= 1
+        start = i + 1
+        if start < last_block:
+            freed = blocks[start:last_block]
+            freed.reverse()
+            blocks[start:last_block] = [null_block] * (last_block - start)
             self.block_pool.free_blocks(freed)
 
     def remove_skipped_blocks(
@@ -1144,6 +1190,38 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     mask[j - start_block] = True
 
         return mask
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        num_skipped_tokens = (
+            processed_computed_tokens
+            - self.sliding_window
+            + 1
+            - self.extra_retained_tokens
+        )
+        if num_skipped_tokens < self.block_size:
+            return
+        blocks = self.req_to_blocks[request_id]
+        last_block = num_skipped_tokens // self.block_size
+        n_blocks = len(blocks)
+        if last_block > n_blocks:
+            last_block = n_blocks
+        if last_block <= 0 or blocks[last_block - 1].is_null:
+            return
+        null_block = self._null_block
+        i = last_block - 1
+        while i >= 0 and not blocks[i].is_null:
+            i -= 1
+        start = i + 1
+        if start < last_block:
+            freed = blocks[start:last_block]
+            freed.reverse()
+            blocks[start:last_block] = [null_block] * (last_block - start)
+            self.block_pool.free_blocks(freed)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """Get the number of tokens that will be skipped for attention computation.

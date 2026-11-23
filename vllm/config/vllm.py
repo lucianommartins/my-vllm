@@ -2066,6 +2066,8 @@ class VllmConfig:
         else:
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        self._maybe_enable_kv_sharing_fast_prefill()
+
         if self.cache_config.kv_sharing_fast_prefill:
             if (
                 self.speculative_config is not None
@@ -3518,6 +3520,39 @@ class VllmConfig:
         compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compilation_config.max_cudagraph_capture_size = 0
         compilation_config.cudagraph_capture_sizes = []
+
+    def _maybe_enable_kv_sharing_fast_prefill(self) -> None:
+        if (
+            self.cache_config.kv_sharing_fast_prefill
+            or os.environ.get("VLLM_GEMMA4_FAST_PREFILL", "1") == "0"
+            or self.model_config is None
+            or not self.use_v2_model_runner
+            or self.parallel_config.pipeline_parallel_size != 1
+            or self.model_config.pooler_config is not None
+            or (
+                self.speculative_config is not None
+                and self.speculative_config.uses_target_hidden_states
+            )
+        ):
+            return
+        hf_config = getattr(self.model_config, "hf_config", None)
+        archs = getattr(hf_config, "architectures", None) or []
+        if not any(
+            a in ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM")
+            for a in archs
+        ):
+            return
+        hf_text_config = getattr(self.model_config, "hf_text_config", None)
+        num_kv_shared_layers = getattr(hf_text_config, "num_kv_shared_layers", 0) or 0
+        if num_kv_shared_layers <= 0:
+            return
+        self.cache_config.kv_sharing_fast_prefill = True
+        self.cache_config.kv_sharing_fast_prefill_auto = True
+        logger.info_once(
+            "Auto-enabling kv_sharing_fast_prefill for %s (num_kv_shared_layers=%d).",
+            archs[0],
+            num_kv_shared_layers,
+        )
 
     def _validate_v2_model_runner(self) -> None:
         """Check for features not yet supported by the V2 model runner."""

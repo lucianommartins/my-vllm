@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import ClassVar, Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -15,7 +15,11 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -29,6 +33,7 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+_KV_BOUNDS_GEN_COUNTER = itertools.count(1)
 
 
 @dataclass
@@ -39,6 +44,7 @@ class KVCacheBlocks:
     """
 
     blocks: tuple[Sequence[KVCacheBlock], ...]
+    _is_empty: ClassVar[bool] = False
     """
     `blocks[i][j]` refers to the i-th kv_cache_group
     and the j-th block of tokens.We don't use block of
@@ -97,14 +103,16 @@ class KVCacheBlocks:
                   group
 
         """
+        if allow_none and self._is_empty:
+            return None
         groups = (
             self.blocks
             if group_ids is None
-            else tuple(self.blocks[group_id] for group_id in group_ids)
+            else [self.blocks[group_id] for group_id in group_ids]
         )
-        if allow_none and all(len(group) == 0 for group in groups):
+        if allow_none and not any(groups):
             return None
-        return tuple([blk.block_id for blk in group] for group in groups)
+        return tuple([[blk.block_id for blk in group] for group in groups])
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
@@ -203,6 +211,7 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self._has_step_start_managers = bool(self.coordinator._step_start_managers)
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -224,6 +233,41 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        self.empty_kv_cache_blocks._is_empty = True
+
+        managers = self.coordinator.single_type_managers
+        self._managers = tuple(managers)
+        self._has_mamba_managers = any(
+            isinstance(m, MambaManager) for m in managers
+        )
+        self._any_records_new_block_ids = any(
+            m.records_new_block_ids for m in managers
+        )
+        self._all_have_cow_attr = all(
+            hasattr(m, "_pending_cow_copies") for m in managers
+        )
+        self._can_use_decode_fast_path = (
+            bool(managers)
+            and not use_eagle
+            and self.coordinator.num_reprefillable_tokens == 0
+            and all(
+                type(m) in (FullAttentionManager, SlidingWindowManager)
+                and m.dcp_world_size == 1
+                and m.pcp_world_size == 1
+                and not m.records_new_block_ids
+                for m in managers
+            )
+        )
+        self._decode_fast_bounds: dict[str, tuple[int, int, int]] = {}
+        self._bounds_gen: int = next(_KV_BOUNDS_GEN_COUNTER)
+        self._free_block_queue = getattr(self.block_pool, "free_block_queue", None)
+        self._hash_block_size = self.block_pool.hash_block_size
+        self._decode_cache_step = (
+            1
+            if getattr(self.coordinator, "enable_partial_hash_hits", False)
+            else scheduler_block_size
+        )
+        self._fast_min_free_blocks = self.num_kv_cache_groups * 2
 
     @property
     def usage(self) -> float:
@@ -489,6 +533,52 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
+        if (
+            self._can_use_decode_fast_path
+            and new_computed_blocks is None
+            and num_new_computed_tokens == 0
+            and not full_sequence_must_fit
+            and not delay_cache_blocks
+            and num_external_computed_tokens == 0
+            and num_encoder_tokens == 0
+            and reserved_blocks == 0
+            and (
+                (
+                    kb := request._kv_decode_bounds
+                    if type(request) is Request
+                    else None
+                )
+                is not None
+                and kb[3] == self._bounds_gen
+                or (kb := self._decode_fast_bounds.get(request.request_id))
+                is not None
+            )
+            and self.block_pool.get_num_free_blocks() >= self._fast_min_free_blocks
+        ):
+            alloc_limit, skip_limit, cache_limit = kb[0], kb[1], kb[2]
+            total_computed = min(request.num_computed_tokens, self.max_model_len)
+            num_tokens_main = total_computed + num_new_tokens
+            num_tokens_need = min(
+                num_tokens_main + num_lookahead_tokens, self.max_model_len
+            )
+            processed = max(0, total_computed - request.num_in_flight_tokens)
+            if (
+                num_tokens_need <= alloc_limit
+                and processed < skip_limit
+                and (
+                    not self.enable_caching
+                    or cache_limit > min(num_tokens_main, request.num_tokens)
+                    or cache_limit
+                    > len(request.block_hashes) * self._hash_block_size
+                )
+            ):
+                return self.empty_kv_cache_blocks
+
+        if self._decode_fast_bounds:
+            self._decode_fast_bounds.pop(request.request_id, None)
+        if type(request) is Request:
+            request._kv_decode_bounds = None
+
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -621,7 +711,51 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if self.enable_caching:
+            self.coordinator.cache_blocks(request, num_tokens_to_cache)
+
+        if self._can_use_decode_fast_path:
+            req_id = request.request_id
+            managers = self.coordinator.single_type_managers
+            if not any(req_id in m._partial_hit_reqs for m in managers):
+                upper = self.max_model_len + 1
+                alloc_limit = upper
+                skip_limit = upper
+                processed = max(0, total_computed_tokens - request.num_in_flight_tokens)
+                for m in managers:
+                    bs = m.block_size
+                    m_alloc = len(m.req_to_blocks[req_id]) * bs
+                    if m_alloc < alloc_limit:
+                        alloc_limit = m_alloc
+                    if isinstance(m, SlidingWindowManager):
+                        cur_skipped_blocks = m.get_num_skipped_tokens(processed) // bs
+                        m_skip = (
+                            (cur_skipped_blocks + 1) * bs
+                            + m.sliding_window
+                            - 1
+                            + m.extra_retained_tokens
+                        )
+                        if m_skip < skip_limit:
+                            skip_limit = m_skip
+                cache_limit = (
+                    self._compute_decode_cache_limit(
+                        req_id, num_tokens_to_cache, request.num_prompt_tokens
+                    )
+                    if self.enable_caching
+                    else upper
+                )
+                self._decode_fast_bounds[req_id] = (
+                    alloc_limit,
+                    skip_limit,
+                    cache_limit,
+                )
+                if type(request) is Request:
+                    request._kv_decode_bounds = (
+                        alloc_limit,
+                        skip_limit,
+                        cache_limit,
+                        self._bounds_gen,
+                    )
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -634,6 +768,9 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        self._decode_fast_bounds.pop(request.request_id, None)
+        if type(request) is Request:
+            request._kv_decode_bounds = None
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -668,6 +805,9 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        self._decode_fast_bounds.pop(request.request_id, None)
+        if type(request) is Request:
+            request._kv_decode_bounds = None
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -689,6 +829,8 @@ class KVCacheManager:
             False otherwise.
 
         """
+        self._decode_fast_bounds.clear()
+        self._bounds_gen = next(_KV_BOUNDS_GEN_COUNTER)
         if not self.coordinator.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -753,6 +895,8 @@ class KVCacheManager:
 
     def estimate_cached_tokens(self, request: Request) -> int:
         """Estimate the number of tokens cached by the request."""
+        if not self.enable_caching:
+            return 0
         cached_tokens: int | None = None
         for group, blocks in zip(
             self.kv_cache_config.kv_cache_groups,
@@ -782,6 +926,31 @@ class KVCacheManager:
 
         return cached_tokens or 0
 
+    def _compute_decode_cache_limit(
+        self, req_id: str, num_tokens_cached: int, num_prompt_tokens: int
+    ) -> int:
+        cache_limit = self.max_model_len + 1
+        step = self._decode_cache_step
+        for m in self.coordinator.single_type_managers:
+            if not m.enable_caching:
+                continue
+            if (
+                type(m) is SlidingWindowManager
+                and m.block_size != self._hash_block_size
+                and num_tokens_cached < num_prompt_tokens
+            ):
+                # Partial prompt tail block is only registered once the prompt
+                # completes; keep running cache_blocks until then.
+                return 0
+            m_cache = (m.num_cached_block.get(req_id, 0) + 1) * m.block_size
+            if step > 1:
+                rem = m_cache % step
+                if rem:
+                    m_cache += step - rem
+            if m_cache < cache_limit:
+                cache_limit = m_cache
+        return cache_limit
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
 
@@ -791,8 +960,37 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
 
         """
-        if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+        if not self.enable_caching:
+            return
+        if self._can_use_decode_fast_path:
+            is_req = type(request) is Request
+            kb = request._kv_decode_bounds if is_req else None
+            if kb is not None and kb[3] == self._bounds_gen:
+                bounds: tuple[int, int, int] | None = (kb[0], kb[1], kb[2])
+            else:
+                bounds = self._decode_fast_bounds.get(request.request_id)
+            if bounds is not None:
+                cache_limit = bounds[2]
+                if (
+                    num_computed_tokens < cache_limit
+                    or len(request.block_hashes) * self._hash_block_size < cache_limit
+                ):
+                    return
+                self.coordinator.cache_blocks(request, num_computed_tokens)
+                req_id = request.request_id
+                new_cl = self._compute_decode_cache_limit(
+                    req_id, num_computed_tokens, request.num_prompt_tokens
+                )
+                self._decode_fast_bounds[req_id] = (bounds[0], bounds[1], new_cl)
+                if is_req:
+                    request._kv_decode_bounds = (
+                        bounds[0],
+                        bounds[1],
+                        new_cl,
+                        self._bounds_gen,
+                    )
+                return
+        self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
@@ -833,12 +1031,84 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
+    def try_allocate_1tok_decode(self, request: Request) -> KVCacheBlocks | None:
+        """Fast-path no-op check for steady 1-token running decode steps."""
+        is_req = type(request) is Request
+        bounds = request._kv_decode_bounds if is_req else None
+        if bounds is None or bounds[3] != self._bounds_gen:
+            raw_b = self._decode_fast_bounds.get(request.request_id)
+            if raw_b is None:
+                return None
+            alloc_limit, skip_limit, cache_limit = raw_b
+        else:
+            alloc_limit, skip_limit, cache_limit, _ = bounds
+        free_q = self._free_block_queue
+        num_free = (
+            free_q.num_free_blocks
+            if free_q is not None and "get_num_free_blocks" not in self.block_pool.__dict__
+            else self.block_pool.get_num_free_blocks()
+        )
+        if num_free >= self._fast_min_free_blocks:
+            raw_computed = request.num_computed_tokens
+            max_len = self.max_model_len
+            total_computed = raw_computed if raw_computed < max_len else max_len
+            num_tokens_main = total_computed + 1
+            num_tokens_need = (
+                num_tokens_main if num_tokens_main <= max_len else max_len
+            )
+            if num_tokens_need <= alloc_limit and (
+                total_computed < skip_limit
+                or total_computed - request.num_in_flight_tokens < skip_limit
+            ):
+                if self.enable_caching:
+                    req_tokens = (
+                        len(request._all_token_ids)
+                        if is_req
+                        else request.num_tokens
+                    )
+                    cache_req_tokens = (
+                        num_tokens_main if num_tokens_main < req_tokens else req_tokens
+                    )
+                    if (
+                        cache_limit > cache_req_tokens
+                        or cache_limit
+                        > len(request.block_hashes) * self._hash_block_size
+                    ):
+                        return self.empty_kv_cache_blocks
+                    self.coordinator.cache_blocks(request, cache_req_tokens)
+                    req_id = request.request_id
+                    new_cl = self._compute_decode_cache_limit(
+                        req_id, cache_req_tokens, request.num_prompt_tokens
+                    )
+                    self._decode_fast_bounds[req_id] = (
+                        alloc_limit,
+                        skip_limit,
+                        new_cl,
+                    )
+                    if is_req:
+                        request._kv_decode_bounds = (
+                            alloc_limit,
+                            skip_limit,
+                            new_cl,
+                            self._bounds_gen,
+                        )
+                    return self.empty_kv_cache_blocks
+                else:
+                    return self.empty_kv_cache_blocks
+        return None
+
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
+        if not self._any_records_new_block_ids:
+            return []
+        ids: list[int] | None = None
         for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+            if new_ids := mgr.take_new_block_ids():
+                if ids is None:
+                    ids = new_ids
+                else:
+                    ids.extend(new_ids)
+        return ids if ids is not None else []
 
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
         """Re-record the request's blocks from start_token onwards for
@@ -858,9 +1128,22 @@ class KVCacheManager:
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] | None = None
+        all_cow_attr = self._all_have_cow_attr
+        for mgr in self._managers:
+            if (
+                all_cow_attr
+                and not mgr._pending_cow_copies
+                and "take_pending_cow_copies" not in mgr.__dict__
+            ):
+                continue
+            if cow := mgr.take_pending_cow_copies():
+                if pending_copies is None:
+                    pending_copies = cow
+                else:
+                    pending_copies.extend(cow)
+        if not pending_copies:
+            return [], []
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
@@ -884,18 +1167,19 @@ class KVCacheManager:
         blocks — never resolving them positionally — and offloads them so a
         later request can hit that prefix.
         """
-        offloads: dict[str, list[tuple[int, int, int]]] = {}
+        if not self._has_mamba_managers:
+            return {}
+        offloads: dict[str, list[tuple[int, int, int]]] | None = None
         for mgr in self.coordinator.single_type_managers:
-            for (
-                req_id,
-                group_id,
-                block,
-                boundary_tokens,
-            ) in mgr.take_pending_boundary_state_offloads():
+            if not (pending := mgr.take_pending_boundary_state_offloads()):
+                continue
+            if offloads is None:
+                offloads = {}
+            for req_id, group_id, block, boundary_tokens in pending:
                 offloads.setdefault(req_id, []).append(
                     (group_id, block.block_id, boundary_tokens)
                 )
-        return offloads
+        return offloads if offloads is not None else {}
 
     def finalize_partial_tail_offloads(
         self, request: Request
@@ -922,4 +1206,5 @@ class KVCacheManager:
 
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
-        self.coordinator.new_step_starts()
+        if self._has_step_start_managers:
+            self.coordinator.new_step_starts()

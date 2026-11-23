@@ -2396,12 +2396,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
 # --8<-- [end:env-vars-definition]
 
 
+_OS_ENVIRON = os.environ
+_INIT_ENV_DATA = getattr(_OS_ENVIRON, "_data", None)
+_encode_env_key = getattr(_OS_ENVIRON, "encodekey", lambda k: k)
+_ENV_MISSING = object()
+# Hot pure single-key env vars read on per-request/per-step paths where
+# enable_envs_cache() may not be active (e.g. API server / tests).
+# Stores (encoded_os_environ_key) and caches (raw_bytes_or_missing, factory_ref, val).
+_PURE_FAST_ENV_KEYS: dict[str, Any] = {
+    k: _encode_env_key(k)
+    for k in (
+        "VLLM_COMPUTE_NANS_IN_LOGITS",
+        "VLLM_RAISE_ON_LOGIT_NANS",
+        "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "VLLM_BATCH_INVARIANT",
+        "VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT",
+        "VLLM_MEDIA_CONNECTOR",
+        "VLLM_MAX_N_SEQUENCES",
+        "VLLM_MAX_COMPLETION_PROMPTS",
+        "VLLM_MAX_NUM_BAD_WORDS",
+        "VLLM_ALLOW_RUNTIME_LORA_UPDATING",
+        "VLLM_ALLOW_INSECURE_SERIALIZATION",
+        "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION",
+        "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_ELASTIC_EP_DRAIN_REQUESTS",
+        "VLLM_USE_V2_MODEL_RUNNER",
+    )
+}
+_FAST_ENV_CACHE: dict[str, tuple[Any, Any, Any]] = {}
+
+
 def __getattr__(name: str):
     """Gets environment variables lazily.
 
     NOTE: After enable_envs_cache() invocation (which triggered after service
     initialization), all environment variables will be cached.
     """
+    bkey = _PURE_FAST_ENV_KEYS.get(name)
+    if (
+        bkey is not None
+        and os.environ is _OS_ENVIRON
+        and _INIT_ENV_DATA is not None
+    ):
+        raw = _INIT_ENV_DATA.get(bkey, _ENV_MISSING)
+        factory = environment_variables[name]
+        entry = _FAST_ENV_CACHE.get(name)
+        if entry is not None and entry[0] == raw and entry[1] is factory:
+            return entry[2]
+        val = factory()
+        _FAST_ENV_CACHE[name] = (raw, factory, val)
+        return val
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

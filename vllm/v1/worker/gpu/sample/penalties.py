@@ -50,11 +50,23 @@ class PenaltiesState(LogitsProcessor):
         )
 
         self._new_penalties_reqs: list[int] = []
+        self._dirty_mask = 0
+        self._uva_buffers = (
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )
+
+    def _set_uva(self, idx: int, req_idx: int, value: float) -> None:
+        buf = self._uva_buffers[idx]
+        if buf.np[req_idx] != value:
+            buf.np[req_idx] = value
+            self._dirty_mask |= 1 << idx
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
-        self.repetition_penalty.np[req_idx] = sampling_params.repetition_penalty
-        self.frequency_penalty.np[req_idx] = sampling_params.frequency_penalty
-        self.presence_penalty.np[req_idx] = sampling_params.presence_penalty
+        self._set_uva(0, req_idx, sampling_params.repetition_penalty)
+        self._set_uva(1, req_idx, sampling_params.frequency_penalty)
+        self._set_uva(2, req_idx, sampling_params.presence_penalty)
 
         do_penalty = use_penalty(sampling_params)
         self.use_penalty[req_idx] = do_penalty
@@ -81,9 +93,13 @@ class PenaltiesState(LogitsProcessor):
             )
             self._new_penalties_reqs.clear()
 
-        self.repetition_penalty.copy_to_uva()
-        self.frequency_penalty.copy_to_uva()
-        self.presence_penalty.copy_to_uva()
+        mask = self._dirty_mask
+        if not mask:
+            return
+        for idx, buf in enumerate(self._uva_buffers):
+            if mask & (1 << idx):
+                buf.copy_to_uva()
+        self._dirty_mask = 0
 
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
         if not np.any(self.use_penalty[ctx.idx_mapping_np]):

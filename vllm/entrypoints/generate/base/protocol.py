@@ -4,14 +4,16 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import json
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, ClassVar, Literal, TypeAlias
 
 from pydantic import (
     BaseModel,
     BeforeValidator,
+    ConfigDict,
     Field,
     model_serializer,
 )
+from pydantic_core import PydanticUndefined
 
 import vllm.envs as envs
 from vllm.config.utils import replace
@@ -97,7 +99,14 @@ def validate_request_mm_kwargs(
         )
 
 
-class SpeculativeDecodingMetrics(OpenAIBaseModel):
+class OpenAIResponseModel(BaseModel):
+    """Lightweight BaseModel for internal/outbound response models (no extra-field logging)."""
+
+    model_config = ConfigDict(extra="allow")
+    field_names: ClassVar[set[str] | None] = None
+
+
+class SpeculativeDecodingMetrics(OpenAIResponseModel):
     """Per-request speculative-decoding acceptance metrics.
 
     Experimental, subject to change. Only populated for single-sequence requests
@@ -119,7 +128,7 @@ class SpeculativeDecodingMetrics(OpenAIBaseModel):
     per_step_drafted: list[int] | None = None
 
 
-class PerRequestMetrics(OpenAIBaseModel):
+class PerRequestMetrics(OpenAIResponseModel):
     time_to_first_token_ms: float | None = None
     generation_time_ms: float | None = None
     queue_time_ms: float | None = None
@@ -353,7 +362,7 @@ class ExtractedToolCallInformation(BaseModel):
     content: str | None = None
 
 
-class DeltaMessage(OpenAIBaseModel):
+class DeltaMessage(OpenAIResponseModel):
     role: str | None = None
     content: str | None = None
     reasoning: str | None = None
@@ -365,3 +374,168 @@ class DeltaMessage(OpenAIBaseModel):
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
         return data
+
+
+_FAST_INT64_MIN = -(2**63)
+_FAST_INT64_MAX = 2**63 - 1
+
+
+def build_fast_model_template(
+    model_cls: type[BaseModel],
+) -> tuple[dict[str, Any], tuple[tuple[str, Any], ...], dict[str, Any] | None]:
+    """Snapshot static field defaults, default factories, and private attrs once."""
+    base_defaults: dict[str, Any] = {}
+    factories: list[tuple[str, Any]] = []
+    for name, finfo in model_cls.model_fields.items():
+        if finfo.default_factory is not None:
+            factories.append((name, finfo.default_factory))
+        elif finfo.default is not PydanticUndefined:
+            base_defaults[name] = finfo.default
+    priv_attrs = getattr(model_cls, "__private_attributes__", None)
+    priv_template = (
+        {k: attr.default for k, attr in priv_attrs.items()}
+        if priv_attrs
+        else None
+    )
+    return base_defaults, tuple(factories), priv_template
+
+
+def fast_validate_scalar_fields(
+    data: dict[str, Any],
+    field_kinds: dict[str, str],
+    base_defaults: dict[str, Any],
+    factories: tuple[tuple[str, Any], ...],
+) -> dict[str, Any] | None:
+    """Validate scalar fields in ``data`` against ``field_kinds``.
+
+    Returns populated field dict ready for ``model_construct`` or ``None`` if any
+    key or value requires full Pydantic validation.
+    """
+    values = base_defaults.copy()
+    for name, fn in factories:
+        if name not in data:
+            values[name] = fn()
+    for key, val in data.items():
+        kind = field_kinds.get(key)
+        if kind is None:
+            return None
+        if kind == "skip":
+            values[key] = val
+        elif kind == "str_or_none":
+            if val is not None and type(val) is not str:
+                return None
+            values[key] = val
+        elif kind == "str":
+            if type(val) is not str:
+                return None
+            values[key] = val
+        elif kind == "bool":
+            if type(val) is not bool:
+                return None
+            values[key] = val
+        elif kind == "bool_or_none":
+            if val is not None and type(val) is not bool:
+                return None
+            values[key] = val
+        elif kind == "int":
+            if type(val) is not int:
+                return None
+            values[key] = val
+        elif kind == "int_or_none":
+            if val is not None and type(val) is not int:
+                return None
+            values[key] = val
+        elif kind == "ge1_int_or_none":
+            if val is not None and (type(val) is not int or val < 1):
+                return None
+            values[key] = val
+        elif kind == "int64_or_none":
+            if val is not None and (
+                type(val) is not int
+                or not (_FAST_INT64_MIN <= val <= _FAST_INT64_MAX)
+            ):
+                return None
+            values[key] = val
+        elif kind == "int64":
+            if type(val) is not int or not (
+                _FAST_INT64_MIN <= val <= _FAST_INT64_MAX
+            ):
+                return None
+            values[key] = val
+        elif kind == "float":
+            if type(val) is float:
+                values[key] = val
+            elif type(val) is int:
+                values[key] = float(val)
+            else:
+                return None
+        elif kind == "float_or_none":
+            if val is None or type(val) is float:
+                values[key] = val
+            elif type(val) is int:
+                values[key] = float(val)
+            else:
+                return None
+        elif kind == "stop":
+            if val is None or type(val) is str:
+                values[key] = val
+            elif (
+                type(val) is list
+                and len(val) <= envs.VLLM_MAX_STOP_STRINGS
+                and all(type(s) is str for s in val)
+            ):
+                values[key] = val
+            else:
+                return None
+        elif kind == "false_or_none":
+            if val is not None and val is not False:
+                return None
+            values[key] = val
+        elif kind == "zero_or_none":
+            if val is not None and (type(val) is not int or val != 0):
+                return None
+            values[key] = 0
+        elif kind == "tool_choice_none":
+            if val is not None and val != "none":
+                return None
+            values[key] = val
+        elif kind == "ct_kwargs":
+            if val is None:
+                values[key] = None
+            elif (
+                type(val) is dict
+                and "chat_template" not in val
+                and all(
+                    type(ck) is str
+                    and (cv is None or type(cv) in (bool, int, float, str))
+                    for ck, cv in val.items()
+                )
+            ):
+                values[key] = val
+            else:
+                return None
+        elif kind == "trunc_side":
+            if val is not None and val != "left" and val != "right":
+                return None
+            values[key] = val
+        elif kind == "trunc_toks":
+            if val is not None and (
+                type(val) is not int or val < -1 or val > _FAST_INT64_MAX
+            ):
+                return None
+            values[key] = val
+        elif kind == "cache_salt":
+            if val is not None and (
+                type(val) is not str
+                or not val
+                or len(val) > _MAX_CACHE_SALT_LENGTH
+                or "@" in val
+                or "/" in val
+                or "\\" in val
+                or "\x00" in val
+            ):
+                return None
+            values[key] = val
+        else:
+            return None
+    return values

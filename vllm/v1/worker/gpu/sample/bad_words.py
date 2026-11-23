@@ -36,11 +36,15 @@ class BadWordsState(LogitsProcessor):
         )
         # number of bad words per request
         self.num_bad_words = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+        self._num_dirty = False
+        self._writes_dirty = False
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
         bad_words_token_ids = sampling_params.bad_words_token_ids
         if not bad_words_token_ids:
-            self.num_bad_words.np[req_idx] = 0
+            if self.num_bad_words.np[req_idx] != 0:
+                self.num_bad_words.np[req_idx] = 0
+                self._num_dirty = True
             return False
 
         num_bad_words = len(bad_words_token_ids)
@@ -68,13 +72,20 @@ class BadWordsState(LogitsProcessor):
         # Stage writes
         self.bad_word_token_ids.stage_write(req_idx, 0, flattened_tokens)
         self.bad_word_offsets.stage_write(req_idx, 0, offsets)
-        self.num_bad_words.np[req_idx] = num_bad_words
+        self._writes_dirty = True
+        if self.num_bad_words.np[req_idx] != num_bad_words:
+            self.num_bad_words.np[req_idx] = num_bad_words
+            self._num_dirty = True
         return True
 
     def apply_staged_writes(self) -> None:
-        self.num_bad_words.copy_to_uva()
-        self.bad_word_token_ids.apply_write()
-        self.bad_word_offsets.apply_write()
+        if self._num_dirty:
+            self.num_bad_words.copy_to_uva()
+            self._num_dirty = False
+        if self._writes_dirty:
+            self.bad_word_token_ids.apply_write()
+            self.bad_word_offsets.apply_write()
+            self._writes_dirty = False
 
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
         max_num_bad_words = int(self.num_bad_words.np[ctx.idx_mapping_np].max())

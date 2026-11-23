@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    _LifoFreeBlockStack,
     generate_block_hash_extra_keys,
     generate_lookahead_block_hash_extra_keys,
     get_block_hash,
@@ -177,9 +178,16 @@ class BlockPool:
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # list of free blocks when caching is enabled, or a fast LIFO stack
+        # when prefix caching is disabled.
+        self.free_block_queue: FreeKVCacheBlockQueue | _LifoFreeBlockStack = (
+            FreeKVCacheBlockQueue(self.blocks)
+            if enable_caching
+            else _LifoFreeBlockStack(self.blocks)
+        )
+        self._fast_lifo_free: bool = (
+            not enable_caching and type(self.free_block_queue) is _LifoFreeBlockStack
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -264,13 +272,52 @@ class BlockPool:
         """
         if num_cached_blocks >= num_full_blocks:
             return
+        raw_hashes = request.block_hashes
+        hash_bs = self.hash_block_size
+        scale = 1 if block_size == hash_bs else block_size // hash_bs
+        if not self.enable_kv_cache_events and block_mask is None:
+            cache_map = self.cached_block_hash_to_block._cache
+            by_block = self.cached_block_hashes_by_block
+            for pos in range(num_cached_blocks, num_full_blocks):
+                blk = blocks[pos]
+                if blk.is_null:
+                    continue
+                hash_idx = pos if scale == 1 else (pos + 1) * scale - 1
+                block_hash = raw_hashes[hash_idx]
+                num_hash_tokens = (pos + 1) * block_size
+                key = make_block_hash_with_group_id(block_hash, kv_cache_group_id)
+                primary = blk._block_hash
+                if primary is not None:
+                    assert (
+                        blk._block_hash_num_tokens is not None
+                        and blk._block_hash_num_tokens < num_hash_tokens
+                    )
+                    self._remove_cached_block_hashes(blk)
+                    primary = blk._block_hash
+                if primary == key:
+                    continue
+                cur = cache_map.get(key)
+                if cur is not None:
+                    if isinstance(cur, KVCacheBlock):
+                        if cur.block_id == blk.block_id:
+                            continue
+                        cache_map[key] = {cur.block_id: cur, blk.block_id: blk}
+                    elif isinstance(cur, dict):
+                        if blk.block_id in cur:
+                            continue
+                        cur[blk.block_id] = blk
+                    else:
+                        self.cached_block_hash_to_block._unexpected_blocks_type(cur)
+                else:
+                    cache_map[key] = blk
+                if primary is None:
+                    blk.set_block_hash(key, num_tokens=num_hash_tokens)
+                else:
+                    by_block.setdefault(blk.block_id, set()).add(key)
+            return
+
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
-        block_hashes = resolve_block_hashes(
-            request.block_hashes, self.hash_block_size, block_size
-        )
-
-        new_block_hashes = block_hashes[num_cached_blocks:]
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
@@ -280,19 +327,20 @@ class BlockPool:
             # in align mode. We skip null blocks here.
             if blk.is_null or (block_mask is not None and not block_mask[i]):
                 continue
-            block_hash = new_block_hashes[i]
-            num_hash_tokens = (num_cached_blocks + i + 1) * block_size
+            pos = num_cached_blocks + i
+            block_hash = raw_hashes[pos if scale == 1 else (pos + 1) * scale - 1]
+            num_hash_tokens = (pos + 1) * block_size
 
             # Update and added the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id
             )
-            if blk.block_hash is not None:
+            if blk._block_hash is not None:
                 # The only valid case where a "new full block" already has a
                 # hash is partial->full promotion of the same cache block.
                 assert (
-                    blk.block_hash_num_tokens is not None
-                    and blk.block_hash_num_tokens < num_hash_tokens
+                    blk._block_hash_num_tokens is not None
+                    and blk._block_hash_num_tokens < num_hash_tokens
                 )
                 removed_hashes = self._remove_cached_block_hashes(blk)
                 self._emit_block_removed_events(removed_hashes)
@@ -309,7 +357,11 @@ class BlockPool:
                 parent_block_hash: ExternalBlockHash | None = None
             else:
                 parent_block_hash = maybe_convert_block_hash(
-                    block_hashes[num_cached_blocks - 1]
+                    raw_hashes[
+                        num_cached_blocks - 1
+                        if scale == 1
+                        else num_cached_blocks * scale - 1
+                    ]
                 )
 
             # Calculate token range for the blocks being cached
@@ -633,12 +685,21 @@ class BlockPool:
         self,
         block: KVCacheBlock,
     ) -> list[BlockHashWithGroupId]:
-        block_hashes: list[BlockHashWithGroupId] = []
-        if block.block_hash is not None:
-            block_hashes.append(block.block_hash)
-        block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))
-        if not block_hashes:
+        by_block = self.cached_block_hashes_by_block
+        primary = block._block_hash
+        extra = by_block.pop(block.block_id, None) if by_block else None
+        if primary is None and not extra:
             return []
+        if not extra:
+            assert primary is not None
+            popped = self.cached_block_hash_to_block.pop(primary, block.block_id)
+            block.reset_hash()
+            return [primary] if popped is not None else []
+
+        block_hashes: list[BlockHashWithGroupId] = []
+        if primary is not None:
+            block_hashes.append(primary)
+        block_hashes.extend(extra)
 
         removed_hashes: list[BlockHashWithGroupId] = []
         for block_hash in block_hashes:
@@ -734,11 +795,16 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
-            for block in ret:
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+            metrics_collector = self.metrics_collector
+            if metrics_collector is None:
+                for block in ret:
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+            else:
+                for block in ret:
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    metrics_collector.on_block_allocated(block)
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
@@ -815,6 +881,53 @@ class BlockPool:
         """Return whether a block can be mutated by its sole owner."""
         return not block.is_null and block.ref_cnt == 1 and block.block_hash is None
 
+    def free_blocks_forward(self, alloc_blocks: Sequence[KVCacheBlock]) -> None:
+        """Free blocks given in forward allocation order (reverse of eviction order)."""
+        free_q = self.free_block_queue
+        if (
+            not self._fast_lifo_free
+            or type(free_q) is not _LifoFreeBlockStack
+            or "prepend_n" in free_q.__dict__
+            or type(alloc_blocks) is not list
+        ):
+            self.free_blocks(reversed(alloc_blocks))
+            return
+        if not alloc_blocks:
+            return
+        freed: list[KVCacheBlock] | None = None
+        other_pools: dict[BlockPool, list[KVCacheBlock]] | None = None
+        for i, block in enumerate(alloc_blocks):
+            if (
+                block.is_null
+                or (block.pool is not self and block.pool is not None)
+                or block.ref_cnt != 1
+            ):
+                if freed is None:
+                    freed = alloc_blocks[:i]
+                if block.is_null:
+                    continue
+                pool = block.pool
+                if pool is not None and pool is not self:
+                    if other_pools is None:
+                        other_pools = {}
+                    other_pools.setdefault(pool, []).append(block)
+                    continue
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0:
+                    freed.append(block)
+                continue
+            block.ref_cnt = 0
+            if freed is not None:
+                freed.append(block)
+        out = freed if freed is not None else alloc_blocks
+        if out:
+            free_q._buf.extend(out)
+            free_q.num_free_blocks += len(out)
+        if other_pools is not None:
+            for pool, blocks in other_pools.items():
+                blocks.reverse()
+                pool.free_blocks(blocks)
+
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
@@ -824,19 +937,46 @@ class BlockPool:
                 priority.
 
         """
+        if not self.enable_caching:
+            blocks_to_evict_first: list[KVCacheBlock] = []
+            append_first = blocks_to_evict_first.append
+            other_pools: dict[BlockPool, list[KVCacheBlock]] | None = None
+            for block in ordered_blocks:
+                if block.is_null:  # never pooled; its ref_cnt is not maintained
+                    continue
+                pool = block.pool
+                if pool is not None and pool is not self:
+                    if other_pools is None:
+                        other_pools = {}
+                    other_pools.setdefault(pool, []).append(block)
+                    continue
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0:
+                    append_first(block)
+            if blocks_to_evict_first:
+                self.free_block_queue.prepend_n(blocks_to_evict_first)
+            if other_pools is not None:
+                for pool, blocks in other_pools.items():
+                    pool.free_blocks(blocks)
+            return
+
         # Identify blocks with hash (LRU cache) and without it (never match APC)
-        blocks_to_evict_last = []
-        blocks_to_evict_first = []
-        other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
+        blocks_to_evict_last: list[KVCacheBlock] = []
+        blocks_to_evict_first: list[KVCacheBlock] = []
+        other_pools: dict[BlockPool, list[KVCacheBlock]] | None = None
+        enable_caching = self.enable_caching
         for block in ordered_blocks:
             if block.is_null:  # never pooled; its ref_cnt is not maintained
                 continue
-            if block.pool is not None and block.pool is not self:
-                other_pools.setdefault(block.pool, []).append(block)
+            pool = block.pool
+            if pool is not None and pool is not self:
+                if other_pools is None:
+                    other_pools = {}
+                other_pools.setdefault(pool, []).append(block)
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                if block.block_hash is None or not self.enable_caching:
+                if not enable_caching or block.block_hash is None:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
                 else:
@@ -844,11 +984,14 @@ class BlockPool:
                     blocks_to_evict_last.append(block)
 
         # Blocks to reuse first are prepended to the front of the free queue.
-        self.free_block_queue.prepend_n(blocks_to_evict_first)
+        if blocks_to_evict_first:
+            self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
-        self.free_block_queue.append_n(blocks_to_evict_last)
-        for pool, blocks in other_pools.items():
-            pool.free_blocks(blocks)
+        if blocks_to_evict_last:
+            self.free_block_queue.append_n(blocks_to_evict_last)
+        if other_pools is not None:
+            for pool, blocks in other_pools.items():
+                pool.free_blocks(blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.

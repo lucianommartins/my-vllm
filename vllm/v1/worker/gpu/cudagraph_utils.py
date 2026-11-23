@@ -34,7 +34,8 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
-from vllm.model_executor.offloader.base import get_offloader
+import vllm.model_executor.offloader.base as _offloader_base
+from vllm.model_executor.offloader.base import NoopOffloader, get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
@@ -193,6 +194,10 @@ class CudaGraphManager:
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+        self._dispatch_cache: dict[
+            tuple[int, int, int | None, int, int | None, int],
+            BatchExecutionDescriptor,
+        ] = {}
 
         # Breakable CUDA graph (PW CUDA graph without torch.compile)
         self.use_breakable_cg = (
@@ -410,6 +415,7 @@ class CudaGraphManager:
         """
         self.graphs.clear()
         self._graphs_captured = False
+        self._dispatch_cache.clear()
         if self.breakable_cg_runner is not None:
             BreakableCUDAGraphWrapper.clear_all_graphs()
 
@@ -518,6 +524,7 @@ class CudaGraphManager:
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
 
+        self._dispatch_cache.clear()
         self._graphs_captured = True
 
     def captured_token_counts(self) -> list[int]:
@@ -536,8 +543,24 @@ class CudaGraphManager:
         num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
+        if self._graphs_captured:
+            cache_key = (
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                num_active_loras,
+                max_query_len,
+                num_ubatches,
+            )
+            cached = self._dispatch_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        else:
+            cache_key = None
+
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
+        result: BatchExecutionDescriptor | None = None
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:
                 if _is_compatible(
@@ -549,29 +572,41 @@ class CudaGraphManager:
                     max_query_len,
                     num_ubatches,
                 ):
-                    return desc
-        return BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode.NONE,
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            num_active_loras=effective_loras,
-            num_ubatches=num_ubatches,
-        )
+                    result = desc
+                    break
+        if result is None:
+            result = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=effective_loras,
+                num_ubatches=num_ubatches,
+            )
+        if cache_key is not None and len(self._dispatch_cache) < 2048:
+            self._dispatch_cache[cache_key] = result
+        return result
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""
-        assert desc.cg_mode == CUDAGraphMode.FULL, (
-            f"Expected FULL mode, got {desc.cg_mode}"
-        )
-        assert desc in self.graphs, f"No cudagraph for {desc}"
+        graph = getattr(self, "_last_fg_graph", None)
+        if desc is not getattr(self, "_last_fg_desc", None) or graph is None:
+            assert desc.cg_mode == CUDAGraphMode.FULL, (
+                f"Expected FULL mode, got {desc.cg_mode}"
+            )
+            graph = self.graphs.get(desc)
+            assert graph is not None, f"No cudagraph for {desc}"
+            self._last_fg_desc = desc
+            self._last_fg_graph = graph
         # Sync offloader before replay - needed when transitioning from
         # eager/piecewise to full cudagraph (e.g., prefill → decode).
         # The previous eager iteration's start_prefetch may have queued
         # H2D copies on copy_stream that the graph's captured events
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
-        get_offloader().sync_prev_onload()
-        self.graphs[desc].replay()
+        offloader = _offloader_base._instance
+        if type(offloader) is not NoopOffloader:
+            offloader.sync_prev_onload()
+        graph.replay()
 
     def init_breakable_cg_runner(
         self, model: nn.Module, key_fn: Callable[..., Hashable] | None = None
@@ -615,6 +650,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        self._hidden_states_views: dict[int, torch.Tensor] = {}
+        self._last_fg_desc: BatchExecutionDescriptor | None = None
+        self._last_fg_graph: torch.cuda.CUDAGraph | None = None
 
     def capture(
         self,
@@ -726,6 +764,8 @@ class ModelCudaGraphManager(CudaGraphManager):
                 )
                 # Capture with dummy rows marked as padding.
                 input_buffers.is_padding.fill_(True)
+                if hasattr(input_buffers, "_last_is_padding_state"):
+                    input_buffers._last_is_padding_state = None
                 finish = self.ubatch_runner.begin_capturable_run(
                     model, model_inputs, ubatch_state, for_capture=True
                 )
@@ -753,6 +793,8 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
+            if hasattr(input_buffers, "_last_is_padding_state"):
+                input_buffers._last_is_padding_state = None
             is_padding = input_buffers.is_padding[:num_tokens]
             if pcp_manager is not None:
                 is_padding = pcp_manager.moe_is_padding(is_padding)
@@ -798,15 +840,21 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
         super().run_fullgraph(desc)
+        n = desc.num_tokens
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
-            return self.intermediate_tensors[: desc.num_tokens]
+            return self.intermediate_tensors[:n]
 
-        assert self.hidden_states is not None
-        hidden_states = self.hidden_states[: desc.num_tokens]
+        hidden_states = self.hidden_states
+        assert hidden_states is not None
+        view = self._hidden_states_views.get(n)
+        if view is None:
+            view = hidden_states[:n]
+            if len(self._hidden_states_views) < 128:
+                self._hidden_states_views[n] = view
         if not self.use_aux_hidden_state_outputs:
-            return hidden_states
-        return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
+            return view
+        return view, [x[:n] for x in self.aux_hidden_states]
 
 
 def set_dcp_capture_context(

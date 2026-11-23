@@ -4,8 +4,14 @@
 
 from http import HTTPStatus
 
-from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, FastAPI, Request, Response
+
+from vllm.entrypoints.serve.instrumentator._fast_middleware import (
+    FastStreamingResponse,
+)
+from vllm.entrypoints.serve.utils.orjson_route import FastOrjsonAPIRoute
+from fastapi.responses import JSONResponse
+from vllm.entrypoints.serve.utils.api_utils import create_model_json_response
 
 from vllm.entrypoints.openai.chat_completion.batch_serving import OpenAIServingChatBatch
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -28,7 +34,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-router = APIRouter()
+router = APIRouter(route_class=FastOrjsonAPIRoute)
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 
@@ -64,23 +70,52 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if handler is None:
         raise NotImplementedError("The model does not support Chat Completions API")
 
-    generator = await handler.create_chat_completion(request, raw_request)
+    handler_cls = type(handler)
+    if (
+        getattr(handler_cls, "create_chat_completion", None)
+        is OpenAIServingChat.create_chat_completion
+    ):
+        use_raw_json = (
+            not request.stream
+            and getattr(handler_cls, "chat_completion_full_generator", None)
+            is OpenAIServingChat.chat_completion_full_generator
+            and getattr(handler_cls, "_create_chat_message", None)
+            is OpenAIServingChat._create_chat_message
+            and getattr(handler_cls, "_finalize_response_message", None)
+            is OpenAIServingChat._finalize_response_message
+        )
+        generator = await handler.create_chat_completion(
+            request, raw_request, _yield_bytes=True, _raw_json=use_raw_json
+        )
+    else:
+        generator = await handler.create_chat_completion(request, raw_request)
+
+    if type(generator) is bytes:
+        return Response(
+            content=generator,
+            status_code=HTTPStatus.OK,
+            headers=metrics_header(metrics_header_format),
+            media_type="application/json",
+        )
 
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
+        return create_model_json_response(
+            generator, status_code=generator.error.code
         )
 
     elif isinstance(generator, ChatCompletionResponse):
-        return JSONResponse(
-            content=generator.model_dump(),
-            headers=metrics_header(metrics_header_format),
+        return create_model_json_response(
+            generator, headers=metrics_header(metrics_header_format)
         )
 
     args = getattr(raw_request.app.state, "args", None)
     keep_alive_interval = getattr(args, "sse_keep_alive_interval", 0)
-    return StreamingResponse(
-        content=with_sse_keep_alive(generator, float(keep_alive_interval)),
+    return FastStreamingResponse(
+        content=(
+            with_sse_keep_alive(generator, float(keep_alive_interval))
+            if keep_alive_interval
+            else generator
+        ),
         media_type="text/event-stream",
     )
 
@@ -108,9 +143,9 @@ async def create_batch_chat_completion(
     result = await handler.create_batch_chat_completion(request, raw_request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return create_model_json_response(result, status_code=result.error.code)
 
-    return JSONResponse(content=result.model_dump())
+    return create_model_json_response(result)
 
 
 def attach_router(app: FastAPI):

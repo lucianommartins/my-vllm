@@ -55,7 +55,7 @@ class WeightVersionSpan:
     end: int
 
 
-@dataclass
+@dataclass(slots=True)
 class CompletionOutput:
     """The output data of one completion output of a request.
 
@@ -166,6 +166,24 @@ class RequestOutput:
 
     """
 
+    __slots__ = (
+        "request_id",
+        "prompt",
+        "prompt_token_ids",
+        "prompt_logprobs",
+        "prompt_token_id_logprobs",
+        "outputs",
+        "finished",
+        "metrics",
+        "lora_request",
+        "encoder_prompt",
+        "encoder_prompt_token_ids",
+        "num_cached_tokens",
+        "num_cache_creation_tokens",
+        "kv_transfer_params",
+        "ec_transfer_params",
+    )
+
     def __init__(
         self,
         request_id: str,
@@ -208,6 +226,39 @@ class RequestOutput:
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
 
+    @classmethod
+    def _fast_delta(
+        cls,
+        request_id: str,
+        prompt: str | None,
+        prompt_token_ids: list[int] | None,
+        prompt_logprobs: PromptLogprobs | None,
+        prompt_token_id_logprobs: np.ndarray | None,
+        outputs: list[CompletionOutput],
+        metrics: RequestStateStats | None,
+        lora_request: LoRARequest | None,
+        num_cached_tokens: int,
+        num_cache_creation_tokens: int,
+    ) -> "RequestOutput":
+        """Construct a non-terminal streaming RequestOutput without kwargs parsing."""
+        obj = cls.__new__(cls)
+        obj.request_id = request_id
+        obj.prompt = prompt
+        obj.prompt_token_ids = prompt_token_ids
+        obj.prompt_logprobs = prompt_logprobs
+        obj.prompt_token_id_logprobs = prompt_token_id_logprobs
+        obj.outputs = outputs
+        obj.finished = False
+        obj.metrics = metrics
+        obj.lora_request = lora_request
+        obj.encoder_prompt = None
+        obj.encoder_prompt_token_ids = None
+        obj.num_cached_tokens = num_cached_tokens
+        obj.num_cache_creation_tokens = num_cache_creation_tokens
+        obj.kv_transfer_params = None
+        obj.ec_transfer_params = None
+        return obj
+
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
         self.finished |= next_output.finished
@@ -220,9 +271,12 @@ class RequestOutput:
                     if aggregate:
                         # Merge outputs with same index
                         completion.text += next_completion.text
-                        if not isinstance(completion.token_ids, MutableSequence):
-                            completion.token_ids = list(completion.token_ids)
-                        completion.token_ids.extend(next_completion.token_ids)
+                        toks = completion.token_ids
+                        if type(toks) is not list and not isinstance(
+                            toks, MutableSequence
+                        ):
+                            toks = completion.token_ids = list(toks)
+                        toks.extend(next_completion.token_ids)
                         if next_completion.logprobs:
                             assert completion.logprobs is not None
                             completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]

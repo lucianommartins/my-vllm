@@ -4,7 +4,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import (
     BaseModel,
@@ -34,6 +34,23 @@ _REMOVED_GUIDED_FIELDS = frozenset(
 )
 
 
+def _log_ignored_extra_fields(extra_keys: Any) -> None:
+    """Log removed guided-decoding or ignored extra fields once/debug."""
+    removed = extra_keys & _REMOVED_GUIDED_FIELDS
+    if removed:
+        logger.warning_once(
+            "Request contains the removed guided-decoding field(s) "
+            "%s, which are ignored; output will NOT be constrained. "
+            "Use `structured_outputs` (or `response_format`) "
+            "instead; see docs/features/structured_outputs.md.",
+            str(sorted(removed)),
+        )
+    logger.debug(
+        "The following fields were present in the request but ignored: %s",
+        extra_keys,
+    )
+
+
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does allow extra fields
     model_config = ConfigDict(extra="allow")
@@ -41,39 +58,12 @@ class OpenAIBaseModel(BaseModel):
     # Cache class field names
     field_names: ClassVar[set[str] | None] = None
 
-    @model_validator(mode="wrap")
-    @classmethod
-    def __log_extra_fields__(cls, data, handler):
-        result = handler(data)
-        if not isinstance(data, dict):
-            return result
-        field_names = cls.field_names
-        if field_names is None:
-            # Get all class field names and their potential aliases
-            field_names = set()
-            for field_name, field in cls.model_fields.items():
-                field_names.add(field_name)
-                if alias := getattr(field, "alias", None):
-                    field_names.add(alias)
-            cls.field_names = field_names
-
-        # Compare against both field names and aliases
-        extra_keys = data.keys() - field_names
-        if extra_keys:
-            removed = extra_keys & _REMOVED_GUIDED_FIELDS
-            if removed:
-                logger.warning_once(
-                    "Request contains the removed guided-decoding field(s) "
-                    "%s, which are ignored; output will NOT be constrained. "
-                    "Use `structured_outputs` (or `response_format`) "
-                    "instead; see docs/features/structured_outputs.md.",
-                    str(sorted(removed)),
-                )
-            logger.debug(
-                "The following fields were present in the request but ignored: %s",
-                extra_keys,
-            )
-        return result
+    @model_validator(mode="after")
+    def __log_extra_fields__(self):
+        extra = self.__pydantic_extra__
+        if extra:
+            _log_ignored_extra_fields(extra.keys())
+        return self
 
 
 class ErrorInfo(OpenAIBaseModel):

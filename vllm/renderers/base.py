@@ -103,6 +103,19 @@ class _SwappableExecutor(Executor):
         self._inner = ThreadPoolExecutor(max_workers=self._max_workers)
 
 
+class _ValidatedTokenIds(list[int]):
+    """Token ID list already produced within a tokenizer's valid range."""
+
+    __slots__ = ("max_token_id", "tokenizer")
+
+    def __init__(
+        self, token_ids: Sequence[int], max_token_id: int, tokenizer: Any
+    ) -> None:
+        super().__init__(token_ids)
+        self.max_token_id = max_token_id
+        self.tokenizer = tokenizer
+
+
 class BaseRenderer(ABC, Generic[_T]):
     def __init__(self, config: "VllmConfig", tokenizer: _T | None) -> None:
         super().__init__()
@@ -156,6 +169,7 @@ class BaseRenderer(ABC, Generic[_T]):
         self._tokenize_prompt_async = make_async(
             self._tokenize_prompt, executor=self._executor
         )
+        self._default_tokenize_prompt_async = self._tokenize_prompt_async
         self._async_tokenizer_decode = make_async(self._decode, executor=self._executor)
 
         self.mm_processor: BaseMultiModalProcessor | None = None
@@ -240,7 +254,12 @@ class BaseRenderer(ABC, Generic[_T]):
 
     def stat_mm_cache(self) -> MultiModalCacheStats | None:
         mm_cache_stats = self._mm_cache_stats
-        if mm_cache_stats is None:
+        if mm_cache_stats is None or not (
+            mm_cache_stats.requests
+            or mm_cache_stats.reset
+            or mm_cache_stats.queries
+            or mm_cache_stats.hits
+        ):
             return None
 
         self._mm_cache_stats = MultiModalCacheStats()
@@ -461,6 +480,16 @@ class BaseRenderer(ABC, Generic[_T]):
         if not token_ids:
             return
 
+        if (
+            type(token_ids) is _ValidatedTokenIds
+            and token_ids.tokenizer is tokenizer
+        ):
+            max_token_id = self.model_config.get_vocab_size() - 1
+            if tokenizer is not None:
+                max_token_id = max(tokenizer.max_token_id, max_token_id)
+            if token_ids.max_token_id <= max_token_id:
+                return
+
         max_input_id = max(token_ids)
         min_input_id = min(token_ids)
 
@@ -581,6 +610,11 @@ class BaseRenderer(ABC, Generic[_T]):
             raise VLLMValidationError(
                 "You must pass at least one prompt", parameter="prompt"
             )
+        if len(prompts) == 1:
+            p0 = prompts[0]
+            if not isinstance(p0, bytes):
+                return [p0]
+            return [await self._render_prompt_async(p0)]
 
         return await asyncio.gather(
             *(self._render_prompt_async(prompt) for prompt in prompts)
@@ -628,6 +662,8 @@ class BaseRenderer(ABC, Generic[_T]):
         prompt: "TextPrompt",
         *,
         offset_mapping: Sequence[tuple[int, int]] | None = None,
+        trusted_max_token_id: int | None = None,
+        trusted_tokenizer: Any = None,
     ) -> "TokensPrompt":
         """Build a TokensPrompt from already-extracted token ids.
 
@@ -635,13 +671,18 @@ class BaseRenderer(ABC, Generic[_T]):
         a BatchEncoding; pass it only when offsets were requested, and it
         is attached as ``prompt_token_offsets``.
         """
+        ids_out: list[int] = (
+            _ValidatedTokenIds(token_ids, trusted_max_token_id, trusted_tokenizer)
+            if trusted_max_token_id is not None
+            else list(token_ids)
+        )
         if offset_mapping is not None:
             return TokensPrompt(
-                prompt_token_ids=list(token_ids),
+                prompt_token_ids=ids_out,
                 prompt_token_offsets=[(int(s), int(e)) for s, e in offset_mapping],
                 **prompt,
             )
-        return TokensPrompt(prompt_token_ids=list(token_ids), **prompt)
+        return TokensPrompt(prompt_token_ids=ids_out, **prompt)
 
     @staticmethod
     def _apply_prompt_char_offset(
@@ -670,7 +711,40 @@ class BaseRenderer(ABC, Generic[_T]):
         params: TokenizeParams,
     ) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
+        trusted_max_id = (
+            getattr(tokenizer, "max_token_id", None)
+            if hasattr(tokenizer, "vllm_encode_ids")
+            else None
+        )
         want_offsets = self._wants_offsets(prompt, params)
+        if (
+            not want_offsets
+            and (encode_ids_fn := getattr(tokenizer, "vllm_encode_ids", None))
+            is not None
+        ):
+            if (
+                params.truncation_side is not None
+                and params.truncate_prompt_tokens is not None
+            ):
+                max_length = None
+            else:
+                max_length = params.truncate_prompt_tokens
+                if max_length is not None and max_length < 0:
+                    max_length = params.max_truncation_tokens
+                elif max_length is None and params.max_input_tokens is not None:
+                    max_length = params.max_input_tokens + 1
+            ids = encode_ids_fn(
+                prompt["prompt"],
+                add_special_tokens=params.add_special_tokens,
+                max_length=max_length,
+            )
+            if ids is not None:
+                return self._build_tokens_prompt(
+                    ids,
+                    prompt,
+                    trusted_max_token_id=trusted_max_id,
+                    trusted_tokenizer=tokenizer,
+                )
         kwargs = params.get_encode_kwargs()
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
@@ -679,6 +753,8 @@ class BaseRenderer(ABC, Generic[_T]):
             encoding["input_ids"],
             prompt,
             offset_mapping=encoding["offset_mapping"] if want_offsets else None,
+            trusted_max_token_id=trusted_max_id,
+            trusted_tokenizer=tokenizer,
         )
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:
@@ -854,6 +930,8 @@ class BaseRenderer(ABC, Generic[_T]):
         prompts: Sequence[DictPrompt],
         params: TokenizeParams,
     ) -> list[TokPrompt]:
+        if len(prompts) == 1:
+            return [await self.tokenize_prompt_async(prompts[0], params)]
         return await asyncio.gather(
             *(self.tokenize_prompt_async(prompt, params) for prompt in prompts)
         )
@@ -1324,6 +1402,51 @@ class BaseRenderer(ABC, Generic[_T]):
 
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
+
+        if len(prompts) == 1:
+            p0 = prompts[0]
+            if (
+                isinstance(p0, dict)
+                and "encoder_prompt" not in p0
+                and "multi_modal_data" not in p0
+                and "prompt_embeds" not in p0
+                and not tok_params.needs_detokenization
+            ):
+                tok = self.tokenizer
+                can_inline = "prompt_token_ids" in p0 or (
+                    "prompt" in p0
+                    and isinstance(p0["prompt"], str)
+                    and len(p0["prompt"]) <= 2048
+                    and self._tokenize_prompt_async
+                    is getattr(self, "_default_tokenize_prompt_async", None)
+                    and tok is not None
+                    and getattr(tok, "vllm_encode_ids", None) is not None
+                )
+                if can_inline:
+                    tok_p = self._tokenize_singleton_prompt(p0, tok_params)
+                    tok_prompts = [tok_p]
+                    if prompt_extras:
+                        self._apply_prompt_extras(tok_prompts, prompt_extras)
+                    return [
+                        self.process_for_engine(
+                            tok_p,
+                            arrival_time,
+                            skip_mm_cache=skip_mm_cache,
+                            tok_params=tok_params,
+                        )
+                    ]
+
+            dict_prompts = await self.render_prompts_async(prompts)
+            tok_prompts = [await self.tokenize_prompt_async(dict_prompts[0], tok_params)]
+            self._apply_prompt_extras(tok_prompts, prompt_extras)
+            return [
+                await self.process_for_engine_async(
+                    tok_prompts[0],
+                    arrival_time,
+                    skip_mm_cache=skip_mm_cache,
+                    tok_params=tok_params,
+                )
+            ]
 
         dict_prompts = await self.render_prompts_async(prompts)
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)

@@ -268,6 +268,149 @@ def _get_llg_tokenizer(tokenizer: TokenizerLike) -> Any:
     return tokenizer.llg_tokenizer if is_mistral_tokenizer(tokenizer) else None
 
 
+def _coerce_logit_bias(
+    logit_bias: dict[int, float] | dict[str, float] | None,
+) -> dict[int, float] | None:
+    """Validate and clamp ``logit_bias`` entries into ``[-100.0, 100.0]``."""
+    if logit_bias is None:
+        return None
+    try:
+        return {
+            int(token): min(100.0, max(-100.0, bias))
+            for token, bias in logit_bias.items()
+        }
+    except (ValueError, TypeError):
+        invalid_keys = []
+        converted_logit_bias = {}
+        for token, bias in logit_bias.items():
+            try:
+                token_id = int(token)
+            except (ValueError, TypeError):
+                invalid_keys.append(token)
+                continue
+            converted_logit_bias[token_id] = min(100.0, max(-100.0, bias))
+        if invalid_keys:
+            raise VLLMValidationError(
+                f"logit_bias contains key(s) that cannot be "
+                f"converted to integer token IDs: {invalid_keys!r}",
+                parameter="logit_bias",
+                value=invalid_keys,
+            ) from None
+        return converted_logit_bias
+
+
+_OPENAI_SAMPLING_DEFAULTS: dict[str, Any] = {
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+}
+
+
+def build_request_sampling_params(
+    req: Any,
+    *,
+    max_tokens: int,
+    default_sampling_params: dict[str, Any] | None,
+    logprobs: int | None,
+    prompt_logprobs: int | None,
+    output_kind: RequestOutputKind,
+    structured_outputs: StructuredOutputsParams | None,
+) -> "SamplingParams":
+    """Construct ``SamplingParams`` directly from a validated API request."""
+    defaults = default_sampling_params or {}
+    req_defaults = getattr(req, "_DEFAULT_SAMPLING_PARAMS", _OPENAI_SAMPLING_DEFAULTS)
+
+    if req_defaults is _OPENAI_SAMPLING_DEFAULTS or req_defaults == _OPENAI_SAMPLING_DEFAULTS:
+        if (rep := req.repetition_penalty) is None:
+            rep = defaults.get("repetition_penalty", 1.0)
+        if (pres := req.presence_penalty) is None:
+            pres = defaults.get("presence_penalty", 0.0)
+        if (freq := req.frequency_penalty) is None:
+            freq = defaults.get("frequency_penalty", 0.0)
+        if (temp := req.temperature) is None:
+            temp = defaults.get("temperature", 1.0)
+        if (top_p := req.top_p) is None:
+            top_p = defaults.get("top_p", 1.0)
+        if (top_k := req.top_k) is None:
+            top_k = defaults.get("top_k", 0)
+        if (min_p := req.min_p) is None:
+            min_p = defaults.get("min_p", 0.0)
+    else:
+        resolved = {
+            name: (
+                val
+                if (val := getattr(req, name)) is not None
+                else defaults.get(name, default)
+            )
+            for name, default in req_defaults.items()
+        }
+        rep = resolved["repetition_penalty"]
+        pres = resolved["presence_penalty"]
+        freq = resolved["frequency_penalty"]
+        temp = resolved["temperature"]
+        top_p = resolved["top_p"]
+        top_k = resolved["top_k"]
+        min_p = resolved["min_p"]
+
+    if (skip_special_tokens := req.skip_special_tokens) is None:
+        skip_special_tokens = defaults.get("skip_special_tokens", True)
+
+    stop_token_ids = req.stop_token_ids
+    default_stop_ids = defaults.get("stop_token_ids")
+    if default_stop_ids:
+        if not stop_token_ids:
+            stop_token_ids = list(default_stop_ids)
+        else:
+            stop_token_ids = list(
+                dict.fromkeys([*stop_token_ids, *default_stop_ids])
+            )
+
+    extra_args: dict[str, Any] = dict(req.vllm_xargs) if req.vllm_xargs else {}
+    if req.kv_transfer_params:
+        extra_args["kv_transfer_params"] = req.kv_transfer_params
+    if req.ec_transfer_params:
+        extra_args["ec_transfer_params"] = req.ec_transfer_params
+
+    return SamplingParams(
+        n=1 if req.n is None else req.n,
+        presence_penalty=0.0 if pres is None else pres,
+        frequency_penalty=0.0 if freq is None else freq,
+        repetition_penalty=1.0 if rep is None else rep,
+        temperature=1.0 if temp is None else temp,
+        watermarking=req.watermarking,
+        top_p=1.0 if top_p is None else top_p,
+        top_k=0 if top_k is None else top_k,
+        min_p=0.0 if min_p is None else min_p,
+        seed=req.seed,
+        stop=req.stop,
+        stop_token_ids=stop_token_ids,
+        bad_words=req.bad_words,
+        thinking_token_budget=req.thinking_token_budget,
+        include_stop_str_in_output=req.include_stop_str_in_output,
+        ignore_eos=req.ignore_eos,
+        max_tokens=max_tokens,
+        min_tokens=req.min_tokens,
+        logprobs=logprobs,
+        prompt_logprobs=prompt_logprobs,
+        logprob_token_ids=req.logprob_token_ids or None,
+        skip_special_tokens=skip_special_tokens,
+        spaces_between_special_tokens=req.spaces_between_special_tokens,
+        output_kind=output_kind,
+        stream_interval=req.stream_interval,
+        structured_outputs=structured_outputs,
+        logit_bias=_coerce_logit_bias(req.logit_bias),
+        allowed_token_ids=req.allowed_token_ids,
+        extra_args=extra_args or None,
+        skip_clone=True,
+        repetition_detection=req.repetition_detection,
+        routed_experts_prompt_start=req.routed_experts_prompt_start,
+    )
+
+
 class SamplingParams(
     PydanticMsgspecMixin,
     msgspec.Struct,
@@ -492,32 +635,7 @@ class SamplingParams(
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
     ) -> "SamplingParams":
-        if logit_bias is not None:
-            # Fast path uses a dict comprehension; on failure we iterate once
-            # to identify the exact offending entry for the error message.
-            try:
-                logit_bias = {
-                    int(token): min(100.0, max(-100.0, bias))
-                    for token, bias in logit_bias.items()
-                }
-            except (ValueError, TypeError):
-                invalid_keys = []
-                converted_logit_bias = {}
-                for token, bias in logit_bias.items():
-                    try:
-                        token_id = int(token)
-                    except (ValueError, TypeError):
-                        invalid_keys.append(token)
-                        continue
-                    converted_logit_bias[token_id] = min(100.0, max(-100.0, bias))
-                if invalid_keys:
-                    raise VLLMValidationError(
-                        f"logit_bias contains key(s) that cannot be "
-                        f"converted to integer token IDs: {invalid_keys!r}",
-                        parameter="logit_bias",
-                        value=invalid_keys,
-                    ) from None
-                logit_bias = converted_logit_bias
+        logit_bias = _coerce_logit_bias(logit_bias)
 
         return SamplingParams(
             n=1 if n is None else n,
@@ -574,9 +692,10 @@ class SamplingParams(
         if self.seed == -1:
             self.seed = None
 
-        self.thinking_token_budget = validate_thinking_token_budget(
-            self.thinking_token_budget
-        )
+        if self.thinking_token_budget is not None:
+            self.thinking_token_budget = validate_thinking_token_budget(
+                self.thinking_token_budget
+            )
 
         if self.stop is None:
             self.stop = []
@@ -585,13 +704,17 @@ class SamplingParams(
 
         if self.stop_token_ids is None:
             self.stop_token_ids = []
-        else:
+        elif len(self.stop_token_ids) > 1:
             self.stop_token_ids = list(dict.fromkeys(self.stop_token_ids))
+        elif type(self.stop_token_ids) is not list:
+            self.stop_token_ids = list(self.stop_token_ids)
 
         if self.bad_words is None:
             self.bad_words = []
-        else:
+        elif len(self.bad_words) > 1:
             self.bad_words = list(dict.fromkeys(self.bad_words))
+        elif type(self.bad_words) is not list:
+            self.bad_words = list(self.bad_words)
 
         if self.logprobs is True:
             self.logprobs = 1
@@ -607,9 +730,9 @@ class SamplingParams(
         self._verify_args()
 
         if (
-            envs.VLLM_BATCH_INVARIANT
-            and self.temperature >= _SAMPLING_EPS
+            self.temperature >= _SAMPLING_EPS
             and self.seed is None
+            and envs.VLLM_BATCH_INVARIANT
         ):
             logger.warning_once(
                 "Random sampling without an explicit seed may not be batch "
@@ -624,7 +747,8 @@ class SamplingParams(
             self._verify_greedy_sampling()
 
         # eos_token_id is added to this by the engine
-        self._all_stop_token_ids.update(self.stop_token_ids)
+        if self.stop_token_ids:
+            self._all_stop_token_ids.update(self.stop_token_ids)
 
         if self.skip_reading_prefix_cache is None:
             # If prefix caching is enabled,
@@ -731,12 +855,14 @@ class SamplingParams(
                 value=self.prompt_logprobs,
             )
         assert isinstance(self.stop_token_ids, list)
-        if not all(isinstance(st_id, int) for st_id in self.stop_token_ids):
+        if self.stop_token_ids and not all(
+            isinstance(st_id, int) for st_id in self.stop_token_ids
+        ):
             raise VLLMValidationError(
                 f"stop_token_ids must contain only integers, got {self.stop_token_ids}."
             )
         assert isinstance(self.stop, list)
-        if any(not stop_str for stop_str in self.stop):
+        if self.stop and any(not stop_str for stop_str in self.stop):
             raise VLLMValidationError("stop cannot contain an empty string.")
         if self.stop and not self.detokenize:
             raise VLLMValidationError(
@@ -744,7 +870,7 @@ class SamplingParams(
                 "Set detokenize=True to use stop."
             )
         assert isinstance(self.bad_words, list)
-        if any(not bad_word for bad_word in self.bad_words):
+        if self.bad_words and any(not bad_word for bad_word in self.bad_words):
             raise VLLMValidationError(
                 f"bad_words cannot contain an empty string. "
                 f"Got bad_words={self.bad_words}"
@@ -902,6 +1028,37 @@ class SamplingParams(
         """If skip_clone is True, uses shallow copy instead of deep copy."""
         if self.skip_clone:
             return copy.copy(self)
+
+        d = self.__dict__
+        if (
+            type(self) is SamplingParams
+            and self.extra_args is None
+            and self.structured_outputs is None
+            and self.repetition_detection is None
+            and self.prompt_logprob_token_ids is None
+            and (not d or (len(d) == 1 and "sampling_type" in d))
+        ):
+            cloned = copy.copy(self)
+            if cloned.stop:
+                cloned.stop = cloned.stop.copy()  # type: ignore[union-attr]
+            if cloned.stop_token_ids:
+                cloned.stop_token_ids = cloned.stop_token_ids.copy()
+            cloned._all_stop_token_ids = cloned._all_stop_token_ids.copy()
+            if cloned.bad_words:
+                cloned.bad_words = cloned.bad_words.copy()
+            if cloned._bad_words_token_ids:
+                cloned._bad_words_token_ids = [
+                    toks.copy() for toks in cloned._bad_words_token_ids
+                ]
+            if cloned.allowed_token_ids is not None:
+                cloned.allowed_token_ids = cloned.allowed_token_ids.copy()
+            if cloned.logprob_token_ids is not None:
+                cloned.logprob_token_ids = cloned.logprob_token_ids.copy()
+            if cloned.logit_bias is not None:
+                cloned.logit_bias = cloned.logit_bias.copy()
+            if cloned.trace_decode_token_ids is not None:
+                cloned.trace_decode_token_ids = cloned.trace_decode_token_ids.copy()
+            return cloned
 
         return copy.deepcopy(self)
 

@@ -865,6 +865,236 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
+_SM80_EXT_CACHED = None
+_FA2_VARLEN_FWD_CACHED = None
+_FA2_CHECKED = False
+_IS_SM80_CACHED: bool | None = None
+
+
+def _is_sm80() -> bool:
+    global _IS_SM80_CACHED
+    val = _IS_SM80_CACHED
+    if val is None:
+        val = current_platform.is_cuda() and current_platform.is_device_capability(
+            (8, 0)
+        )
+        _IS_SM80_CACHED = val
+    return val
+
+
+def _get_sm80_ext_fast():
+    global _SM80_EXT_CACHED
+    ext = _SM80_EXT_CACHED
+    if ext is None:
+        from vllm._gemma4_sm80_ops import get_gemma4_sm80_ext
+
+        ext = get_gemma4_sm80_ext()
+        _SM80_EXT_CACHED = ext
+    return ext
+
+
+def _get_fa2_varlen_fwd():
+    global _FA2_VARLEN_FWD_CACHED, _FA2_CHECKED
+    if not _FA2_CHECKED:
+        try:
+            from vllm.vllm_flash_attn import flash_attn_varlen_func  # noqa: F401
+
+            fa2_ns = getattr(torch.ops, "_vllm_fa2_C", None)
+            fn = getattr(fa2_ns, "varlen_fwd", None) if fa2_ns is not None else None
+        except Exception:
+            fn = None
+        _FA2_VARLEN_FWD_CACHED = fn
+        _FA2_CHECKED = True
+    return _FA2_VARLEN_FWD_CACHED
+
+
+def _run_fa2_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    window_size: tuple[int, int] | list[int],
+    block_table: torch.Tensor,
+    fa2_fwd=None,
+) -> None:
+    if fa2_fwd is None:
+        fa2_fwd = _get_fa2_varlen_fwd()
+    if (
+        fa2_fwd is not None
+        and block_table.dtype == torch.int32
+        and block_table.stride(-1) == 1
+        and cu_seqlens_q.dtype == torch.int32
+        and cu_seqlens_q.is_contiguous()
+        and seqused_k.dtype == torch.int32
+        and seqused_k.is_contiguous()
+    ):
+        logger.info_once(
+            "Enabled SM80 direct _vllm_fa2_C.varlen_fwd paged prefill on head_size=256"
+        )
+        fa2_fwd(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_q,
+            seqused_k,
+            None,
+            block_table,
+            None,
+            max_seqlen_q,
+            max_seqlen_k,
+            0.0,
+            softmax_scale,
+            False,
+            True,
+            window_size[0],
+            window_size[1],
+            0.0,
+            False,
+            0,
+            None,
+        )
+        return
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    logger.info_once(
+        "Enabled SM80 zero-copy C++ FA2 paged prefill on head_size=256"
+    )
+    flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        max_seqlen_q=max_seqlen_q,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=list(window_size),
+        softcap=0.0,
+        block_table=block_table,
+        fa_version=2,
+    )
+
+
+def _run_sm80_fa2_tail(
+    rc: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    window_size: tuple[int, int] | list[int],
+    block_table: torch.Tensor,
+    num_decode_reqs: int,
+    cu_seqlens_q_prefill: torch.Tensor | None,
+    fa2_fwd=None,
+) -> None:
+    if rc == 2:
+        num_seqs = seqused_k.shape[0]
+        _run_fa2_varlen(
+            q[num_decode_reqs:],
+            k,
+            v,
+            out[num_decode_reqs:],
+            cu_seqlens_q_prefill,
+            max_seqlen_q,
+            seqused_k[num_decode_reqs:num_seqs],
+            max_seqlen_k,
+            softmax_scale,
+            window_size,
+            block_table[num_decode_reqs:num_seqs],
+            fa2_fwd=fa2_fwd,
+        )
+    else:
+        _run_fa2_varlen(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            max_seqlen_q,
+            seqused_k,
+            max_seqlen_k,
+            softmax_scale,
+            window_size,
+            block_table,
+            fa2_fwd=fa2_fwd,
+        )
+
+
+def unified_attention_sm80_fast(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    window_size: tuple[int, int] | list[int],
+    block_table: torch.Tensor,
+    softmax_segm_output: torch.Tensor | None,
+    softmax_segm_max: torch.Tensor | None,
+    softmax_segm_expsum: torch.Tensor | None,
+    num_decode_reqs: int = 0,
+    cu_seqlens_q_prefill: torch.Tensor | None = None,
+) -> bool:
+    """Fast-path dispatcher for SM80 bfloat16 GQA=8 causal attention."""
+    rc = _get_sm80_ext_fast().dispatch_sm80_fast_attn(
+        out,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        softmax_scale,
+        window_size[0],
+        window_size[1],
+        block_table,
+        softmax_segm_output,
+        softmax_segm_max,
+        softmax_segm_expsum,
+        num_decode_reqs,
+        cu_seqlens_q_prefill,
+    )
+    if rc == 1:
+        return True
+    if rc == 0:
+        return False
+    _run_sm80_fa2_tail(
+        rc,
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        softmax_scale,
+        window_size,
+        block_table,
+        num_decode_reqs,
+        cu_seqlens_q_prefill,
+        fa2_fwd=_get_fa2_varlen_fwd(),
+    )
+    return True
+
+
 def unified_attention(
     q,
     k,
@@ -916,6 +1146,8 @@ def unified_attention(
     # Split the pruned sliding-window range across the 3D segments (see
     # SEGMENT_WINDOW). Default False keeps the original partition.
     segment_sliding_window: bool = False,
+    num_decode_reqs: int = 0,
+    cu_seqlens_q_prefill: torch.Tensor | None = None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -1027,8 +1259,9 @@ def unified_attention(
     # (hd=512 global GQA=8 where default BM=16, warps=4 spills 14 regs/thread at
     # BLOCK_Q=2, and hd=256 sliding GQA<=8). Strictly gated on max_seqlen_q >
     # MAX_3D_QUERY_LEN so both 3D decode and 2D high-batch decode stay untouched.
+    is_sm80 = _is_sm80()
     is_sm80_prefill = (
-        current_platform.is_device_capability((8, 0))
+        is_sm80
         and max_seqlen_q > MAX_3D_QUERY_LEN
         and num_queries_per_kv <= 8
         and q.element_size() == 2
@@ -1044,67 +1277,65 @@ def unified_attention(
     )
     plain_sm80_prefill = is_sm80_prefill and not use_mm_prefix and softcap <= 0
     if (
-        plain_sm80_prefill
+        is_sm80
         and use_causal
         and not is_batch_invariant
+        and not use_td
+        and window_size[1] <= 0
         and output_scale is None
         and q_descale is None
-        and q.stride(-1) == 1
-        and out.stride(-1) == 1
-        and k.stride(-1) == 1
-        and v.stride(-1) == 1
-        and q.dtype == k.dtype == v.dtype == out.dtype
+        and softcap <= 0
+        and not use_mm_prefix
+        and kv_quant_mode == KVQuantMode.NONE
+        and not use_alibi_slopes
+        and not use_qq_bias
+        and not use_rswa
+        and sinks is None
+        and not use_per_seq_causal
+        and chunk_lookback < 0
     ):
-        if (
-            head_size == 256
-            and block_size % 16 == 0
-            and q.dtype in (torch.bfloat16, torch.float16)
+        if unified_attention_sm80_fast(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+            block_table=block_table,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+            num_decode_reqs=num_decode_reqs,
+            cu_seqlens_q_prefill=cu_seqlens_q_prefill,
         ):
-            from vllm.vllm_flash_attn import flash_attn_varlen_func
-
-            logger.info_once(
-                "Enabled SM80 zero-copy C++ FA2 paged prefill on head_size=256"
-            )
-            flash_attn_varlen_func(
-                q=q,
-                k=k,
-                v=v,
-                out=out,
-                max_seqlen_q=max_seqlen_q,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_k=max_seqlen_k,
-                seqused_k=seqused_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=list(window_size),
-                softcap=0.0,
-                block_table=block_table,
-                fa_version=2,
-            )
             return
         if (
-            head_size == 512
-            and num_queries_per_kv == 8
-            and block_size % 32 == 0
-            and window_size[0] < 0
-            and q.dtype == torch.bfloat16
-            and q.stride(1) == 512
-            and out.stride(1) == 512
+            plain_sm80_prefill
+            and head_size == 256
+            and block_size % 16 == 0
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and q.stride(-1) == 1
+            and out.stride(-1) == 1
+            and k.stride(-1) == 1
+            and v.stride(-1) == 1
+            and q.dtype == k.dtype == v.dtype == out.dtype
         ):
-            from vllm._gemma4_sm80_ops import paged_fa2_hd512
-
-            logger.info_once(
-                "Enabled SM80 CUDA mma.sync pipelined Paged FA2 prefill on head_size=512"
-            )
-            paged_fa2_hd512(
-                out=out,
-                q=q,
-                k_cache=k,
-                v_cache=v,
-                block_table=block_table,
-                seqused_k=seqused_k,
-                cu_seqlens_q=cu_seqlens_q,
-                scale=softmax_scale,
+            _run_fa2_varlen(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                max_seqlen_q,
+                seqused_k,
+                max_seqlen_k,
+                softmax_scale,
+                window_size,
+                block_table,
             )
             return
     stage_v_after_softmax = False

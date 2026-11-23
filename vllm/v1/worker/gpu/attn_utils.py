@@ -81,6 +81,8 @@ class FastPrefillBatchMetadata:
     logits_indices_padded: torch.Tensor
     num_logits_indices: int
     max_logits_per_req: int
+    logits_query_start_loc: torch.Tensor | None = None
+    logits_query_start_loc_cpu: torch.Tensor | None = None
 
 
 class FastPrefillHelper:
@@ -103,9 +105,12 @@ class FastPrefillHelper:
         has_prefill: bool,
         batch_desc: "BatchExecutionDescriptor",
         num_active_loras: int = 0,
+        has_prompt_logprobs: bool = False,
+        cu_num_logits: torch.Tensor | None = None,
     ) -> FastPrefillBatchMetadata | None:
         if (
             not has_prefill
+            or has_prompt_logprobs
             or batch_desc.cg_mode == CUDAGraphMode.FULL
             or batch_desc.num_ubatches > 1
             # LoRA metadata describes the full batch, not the logits-only batch.
@@ -116,9 +121,6 @@ class FastPrefillHelper:
         num_logits = logits_indices.shape[0]
         assert num_logits > 0
         buf[:num_logits].copy_(logits_indices)
-        # There might be leftover indices in buf[num_logits:] from previous
-        # iterations. Broadcast the scalar GPU-side to keep them valid.
-        buf[num_logits:] = logits_indices[-1]
         # Pad so the model's KV-sharing layers run their reduced (logits-only)
         # batch at a captured piecewise cudagraph size. Pre-capture, or with
         # cudagraphs off, dispatch returns the unpadded count.
@@ -129,11 +131,20 @@ class FastPrefillHelper:
             num_active_loras=num_active_loras,
         )
         num_logits_padded = min(desc.num_tokens, self.max_num_tokens)
+        # Broadcast the last valid logit index only across the active padded
+        # slice rather than filling the full max_num_tokens buffer.
+        if num_logits_padded > num_logits:
+            buf[num_logits:num_logits_padded] = logits_indices[-1]
+        logits_query_start_loc_cpu = (
+            torch.from_numpy(cu_num_logits_np) if cu_num_logits is not None else None
+        )
         return FastPrefillBatchMetadata(
             logits_indices_padded=buf[:num_logits_padded],
             num_logits_indices=num_logits,
             # Largest per-request logits count, known on the host.
             max_logits_per_req=int(np.diff(cu_num_logits_np).max()),
+            logits_query_start_loc=cu_num_logits,
+            logits_query_start_loc_cpu=logits_query_start_loc_cpu,
         )
 
 
@@ -461,14 +472,48 @@ def bind_kv_caches(
     return kv_caches
 
 
+import weakref as _weakref
+
+_SLOT_MAPPINGS_BY_LAYER_FALLBACK: dict[
+    int, dict[tuple[int, int, int, int], dict[str, torch.Tensor]]
+] = {}
+
+
 def build_slot_mappings_by_layer(
     slot_mappings: torch.Tensor, kv_cache_config: KVCacheConfig
 ) -> dict[str, torch.Tensor]:
+    cfg_cache = getattr(kv_cache_config, "_slot_mappings_cache", None)
+    if cfg_cache is None:
+        cfg_id = id(kv_cache_config)
+        cfg_cache = _SLOT_MAPPINGS_BY_LAYER_FALLBACK.get(cfg_id)
+        if cfg_cache is None:
+            cfg_cache = {}
+            try:
+                setattr(kv_cache_config, "_slot_mappings_cache", cfg_cache)
+            except Exception:
+                _SLOT_MAPPINGS_BY_LAYER_FALLBACK[cfg_id] = cfg_cache
+                _weakref.finalize(
+                    kv_cache_config,
+                    _SLOT_MAPPINGS_BY_LAYER_FALLBACK.pop,
+                    cfg_id,
+                    None,
+                )
+    key = (
+        slot_mappings.data_ptr(),
+        slot_mappings.shape[1],
+        slot_mappings.stride(0),
+        slot_mappings.device.index if slot_mappings.device.index is not None else -1,
+    )
+    cached = cfg_cache.get(key)
+    if cached is not None:
+        return cached
     slot_mappings_by_layer: dict[str, torch.Tensor] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
     for slot_mapping, kv_cache_group in zip(slot_mappings, kv_cache_groups):
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
+    if len(cfg_cache) < 64:
+        cfg_cache[key] = slot_mappings_by_layer
     return slot_mappings_by_layer
 
 
@@ -540,6 +585,8 @@ def build_attn_metadata(
                 logits_indices_padded=fast_prefill.logits_indices_padded,
                 num_logits_indices=fast_prefill.num_logits_indices,
                 max_logits_per_req=fast_prefill.max_logits_per_req,
+                logits_query_start_loc=fast_prefill.logits_query_start_loc,
+                logits_query_start_loc_cpu=fast_prefill.logits_query_start_loc_cpu,
             )
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,

@@ -29,29 +29,146 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
+_EMPTY_KWARGS: dict[str, Any] = {}
+
+
+class _ImmediateFuture(Future):
+    """Lock-free completed Future for synchronous UniProcExecutor RPCs."""
+
+    def __init__(self, value: Any = None, exc: BaseException | None = None):
+        # Skip Future.__init__() to avoid allocating Condition/RLock per step.
+        self._imm_result = value
+        self._imm_exc = exc
+
+    def cancel(self) -> bool:
+        return False
+
+    def cancelled(self) -> bool:
+        return False
+
+    def running(self) -> bool:
+        return False
+
+    def done(self) -> bool:
+        return True
+
+    def result(self, timeout: float | None = None) -> Any:
+        if self._imm_exc is not None:
+            raise self._imm_exc
+        return self._imm_result
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        return self._imm_exc
+
+    def add_done_callback(self, fn: Callable[[Future], Any]) -> None:
+        try:
+            fn(self)
+        except Exception:
+            logger.exception("exception calling callback for %r", self)
+
+    def __repr__(self) -> str:
+        state = "raised" if self._imm_exc is not None else "finished"
+        return f"<{type(self).__name__} at {id(self):#x} state={state}>"
+
+
+_NONE_SINGLE_FUTURE = _ImmediateFuture(None)
+
+
 class AsyncOutputFuture(Future):
     def __init__(self, async_output: AsyncModelRunnerOutput, single_value: bool):
+        # Skip Future.__init__() to avoid Condition/RLock churn per step.
         self.async_output = async_output
         self.single_value = single_value
-        super().__init__()
+        self._resolved = False
+        self._value: Any = None
+        self._exc: BaseException | None = None
+        self._done_callbacks: list[Callable[[Future], Any]] | None = None
 
-    def result(self, timeout=None):
+    def _resolve(self) -> None:
+        if self._resolved:
+            return
+        try:
+            output = self.async_output.get_output()
+            self._value = output if self.single_value else [output]
+        except Exception as e:
+            self._exc = e
+        self._resolved = True
+        if self._done_callbacks is not None:
+            callbacks = self._done_callbacks
+            self._done_callbacks = None
+            for cb in callbacks:
+                try:
+                    cb(self)
+                except Exception:
+                    logger.exception("exception calling callback for %r", self)
+
+    def cancel(self) -> bool:
+        return False
+
+    def cancelled(self) -> bool:
+        return False
+
+    def running(self) -> bool:
+        return False
+
+    def done(self) -> bool:
+        return self._resolved
+
+    def set_result(self, result: Any) -> None:
+        self._value = result
+        self._exc = None
+        self._resolved = True
+
+    def set_exception(self, exception: BaseException | None) -> None:
+        self._exc = exception
+        self._resolved = True
+
+    def result(self, timeout: float | None = None):
         if timeout is not None:
             raise RuntimeError("timeout not implemented")
 
-        if not super().done():
+        if not self._resolved:
+            self._resolve()
+        if self._exc is not None:
+            raise self._exc
+        return self._value
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        if timeout is not None:
+            raise RuntimeError("timeout not implemented")
+
+        if not self._resolved:
+            self._resolve()
+        return self._exc
+
+    def add_done_callback(self, fn: Callable[[Future], Any]) -> None:
+        if self._resolved:
             try:
-                output = self.async_output.get_output()
-                self.set_result(output if self.single_value else [output])
-            except Exception as e:
-                self.set_exception(e)
-        return super().result()
+                fn(self)
+            except Exception:
+                logger.exception("exception calling callback for %r", self)
+            return
+        if self._done_callbacks is None:
+            self._done_callbacks = [fn]
+        else:
+            self._done_callbacks.append(fn)
+
+    def __repr__(self) -> str:
+        if not self._resolved:
+            state = "pending"
+        elif self._exc is not None:
+            state = "raised"
+        else:
+            state = "finished"
+        return f"<{type(self).__name__} at {id(self):#x} state={state}>"
 
 
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
+        self._sample_tokens_fn = None
+        self._cached_driver_worker = None
         distributed_init_method, rank, local_rank = self._distributed_args()
         kwargs = dict(
             vllm_config=self.vllm_config,
@@ -73,6 +190,20 @@ class UniProcExecutor(Executor):
         else:
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
+        self._cached_driver_worker = self.driver_worker
+        self._execute_model_fn = None
+        if (
+            type(self.driver_worker) is WorkerWrapperBase
+            and "sample_tokens" not in self.driver_worker.__dict__
+        ):
+            self._sample_tokens_fn = self.driver_worker.worker.sample_tokens
+            if (
+                type(self.driver_worker).execute_model is WorkerWrapperBase.execute_model
+                and "execute_model" not in self.driver_worker.__dict__
+            ):
+                self._execute_model_fn = self.driver_worker.worker.execute_model
+        else:
+            self._sample_tokens_fn = self.driver_worker.sample_tokens
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
@@ -97,7 +228,7 @@ class UniProcExecutor(Executor):
         single_value: bool = False,
     ) -> Any:
         if kwargs is None:
-            kwargs = {}
+            kwargs = _EMPTY_KWARGS
 
         if not non_block:
             result = run_method(self.driver_worker, method, args, kwargs)
@@ -109,16 +240,34 @@ class UniProcExecutor(Executor):
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
                 return AsyncOutputFuture(result, single_value)
-            future = Future[Any]()
-            future.set_result(result if single_value else [result])
+            if single_value and result is None:
+                return _NONE_SINGLE_FUTURE
+            return _ImmediateFuture(result if single_value else [result])
         except Exception as e:
-            future = Future[Any]()
-            future.set_exception(e)
-        return future
+            return _ImmediateFuture(exc=e)
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        if (
+            non_block
+            and self.driver_worker is getattr(self, "_cached_driver_worker", None)
+            and "collective_rpc" not in self.__dict__
+            and type(self).collective_rpc is UniProcExecutor.collective_rpc
+        ):
+            exec_fn = getattr(self, "_execute_model_fn", None)
+            if exec_fn is not None and (
+                self.driver_worker.mm_receiver_cache is None
+                or not scheduler_output.scheduled_new_reqs
+            ):
+                result = exec_fn(scheduler_output)
+            else:
+                result = self.driver_worker.execute_model(scheduler_output)
+            if result is None:
+                return _NONE_SINGLE_FUTURE
+            if isinstance(result, AsyncModelRunnerOutput):
+                return AsyncOutputFuture(result, True)
+            return _ImmediateFuture(result)
         output = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
@@ -134,6 +283,27 @@ class UniProcExecutor(Executor):
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        fn = getattr(self, "_sample_tokens_fn", None)
+        if (
+            fn is not None
+            and self.driver_worker is getattr(self, "_cached_driver_worker", None)
+            and "collective_rpc" not in self.__dict__
+            and type(self).collective_rpc is UniProcExecutor.collective_rpc
+        ):
+            if not non_block:
+                result = fn(grammar_output)
+                if isinstance(result, AsyncModelRunnerOutput):
+                    return result.get_output()
+                return result
+            try:
+                result = fn(grammar_output)
+            except Exception as e:
+                return _ImmediateFuture(exc=e)
+            if isinstance(result, AsyncModelRunnerOutput):
+                return AsyncOutputFuture(result, True)
+            if result is None:
+                return _NONE_SINGLE_FUTURE
+            return _ImmediateFuture(result)
         return self.collective_rpc(
             "sample_tokens",
             args=(grammar_output,),

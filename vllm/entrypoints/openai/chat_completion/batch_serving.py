@@ -158,7 +158,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 max_model_len,
                 request.max_completion_tokens
                 if request.max_completion_tokens is not None
-                else request.max_tokens,
+                else request._raw_max_tokens(),
                 self._extract_prompt_len(engine_prompt),
                 self.default_sampling_params,
                 self.override_max_tokens,
@@ -336,7 +336,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                         )
                     message.content = last_msg_content + (message.content or "")
 
-                choice_data = ChatCompletionResponseChoice(
+                choice_data = ChatCompletionResponseChoice.model_construct(
                     index=prompt_idx,
                     message=message,
                     logprobs=logprobs,
@@ -354,7 +354,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         for counts in mm_token_counts or ():
             mm_total.update(counts)
 
-        usage = UsageInfo(
+        usage = UsageInfo.model_construct(
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             total_tokens=total_prompt_tokens + total_completion_tokens,
@@ -369,7 +369,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
 
         choices.sort(key=lambda c: c.index)
 
-        return ChatCompletionResponse(
+        return ChatCompletionResponse.model_construct(
             id=request_id,
             created=created_time,
             model=model_name,

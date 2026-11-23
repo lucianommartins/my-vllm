@@ -718,14 +718,33 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_error_detail(scheduler_output),
+        grammar_output = (
+            self.scheduler.get_grammar_bitmask(scheduler_output)
+            if scheduler_output.has_structured_output_requests
+            else None
+        )
+        if (
+            self.log_stats
+            and self.vllm_config.observability_config.enable_logging_iteration_details
         ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+            with (
+                self.capture_iteration_details(scheduler_output) as iteration_details,
+                self.log_error_detail(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+        else:
+            iteration_details = None
+            try:
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+            except Exception:
+                dump_engine_exception(
+                    self.vllm_config, scheduler_output, self.scheduler.make_stats()
+                )
+                raise
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -733,8 +752,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        self._attach_iteration_details(engine_core_outputs, iteration_details)
-        self._attach_weight_version(engine_core_outputs)
+        if iteration_details is not None:
+            self._attach_iteration_details(engine_core_outputs, iteration_details)
+        if engine_core_outputs:
+            self._attach_weight_version(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -771,14 +792,31 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        log_details = (
+            self.log_stats
+            and self.vllm_config.observability_config.enable_logging_iteration_details
+        )
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
+            if log_details:
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+            else:
+                try:
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+                except Exception:
+                    dump_engine_exception(
+                        self.vllm_config,
+                        scheduler_output,
+                        self.scheduler.make_stats(),
+                    )
+                    raise
             if not self.is_mm_encoder_only:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -789,8 +827,10 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
+                    grammar_output = (
+                        self.scheduler.get_grammar_bitmask(scheduler_output)
+                        if scheduler_output.has_structured_output_requests
+                        else None
                     )
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
@@ -818,16 +858,29 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
-        with (
-            self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_error_detail(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                # None from sample_tokens() implies that the original execute_model()
-                # call failed - raise that exception.
-                exec_model_fut.result()
-                raise RuntimeError("unexpected error")
+        if log_details:
+            with (
+                self.capture_iteration_details(scheduler_output) as iteration_details,
+                self.log_error_detail(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    # None from sample_tokens() implies that the original execute_model()
+                    # call failed - raise that exception.
+                    exec_model_fut.result()
+                    raise RuntimeError("unexpected error")
+        else:
+            iteration_details = None
+            try:
+                model_output = future.result()
+                if model_output is None:
+                    exec_model_fut.result()
+                    raise RuntimeError("unexpected error")
+            except Exception:
+                dump_engine_exception(
+                    self.vllm_config, scheduler_output, self.scheduler.make_stats()
+                )
+                raise
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -835,8 +888,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        self._attach_iteration_details(engine_core_outputs, iteration_details)
-        self._attach_weight_version(engine_core_outputs)
+        if iteration_details is not None:
+            self._attach_iteration_details(engine_core_outputs, iteration_details)
+        if engine_core_outputs:
+            self._attach_weight_version(engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -854,8 +909,10 @@ class EngineCore:
                     )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
+            grammar_output = (
+                self.scheduler.get_grammar_bitmask(deferred_scheduler_output)
+                if deferred_scheduler_output.has_structured_output_requests
+                else None
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
@@ -863,13 +920,23 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def _process_aborts_queue(self):
-        if not self.aborts_queue.empty():
-            request_ids = []
-            while not self.aborts_queue.empty():
-                ids = self.aborts_queue.get_nowait()
-                # Should be a list here, but also handle string just in case.
-                request_ids.extend((ids,) if isinstance(ids, str) else ids)
-            # More efficient to abort all as a single batch.
+        q = self.aborts_queue
+        raw_q = getattr(q, "queue", None)
+        if raw_q is not None:
+            if not raw_q:
+                return
+        elif q.empty():
+            return
+        request_ids = []
+        while True:
+            try:
+                ids = q.get_nowait()
+            except queue.Empty:
+                break
+            # Should be a list here, but also handle string just in case.
+            request_ids.extend((ids,) if isinstance(ids, str) else ids)
+        # More efficient to abort all as a single batch.
+        if request_ids:
             self.abort_requests(request_ids)
 
     def shutdown(self):
@@ -1800,7 +1867,11 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
-        get_watch_dog().feed()
+        wd = getattr(self, "_watchdog", None)
+        if wd is None:
+            wd = get_watch_dog()
+            self._watchdog = wd
+        wd.feed()
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
@@ -2231,6 +2302,11 @@ class EngineCoreProc(EngineCore):
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
                 buffers = encoder.encode_into(outputs, buffer)
+                if len(buffers) == 1 and buffers[0] is buffer and len(buffer) <= 4096:
+                    sockets[client_index].send(buffer, copy=True)
+                    if len(reuse_buffers) < max_reuse_bufs:
+                        reuse_buffers.append(buffer)
+                    continue
                 tracker = self._send_msg_tracking_payload(
                     sockets[client_index], buffers
                 )

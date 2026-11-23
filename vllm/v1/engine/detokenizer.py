@@ -192,8 +192,13 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         # Look up DecodeStream on the module so backend patches (e.g. the
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
+        # Prime DecodeStream with at most the trailing 64 prompt tokens so
+        # multi-kilotoken prompts avoid linear Rust pre-decoding stalls on step 1.
+        prompt_ids = request.prompt_token_ids
+        if len(prompt_ids) > 64:
+            prompt_ids = prompt_ids[-64:]
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=prompt_ids,
             skip_special_tokens=self.skip_special_tokens,
         )
 
@@ -219,6 +224,43 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
                 # No added tokens.
                 self.spaces_between_special_tokens = True
 
+    _delta_only = False
+    _pending_delta = ""
+
+    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
+        if len(new_token_ids) == 1 and not stop_terminated and not self.stop:
+            next_token_id = new_token_ids[0]
+            try:
+                token = self.stream.step(self.tokenizer, next_token_id)
+            except (OverflowError, TypeError, Exception) as e:
+                token = self._handle_step_error(next_token_id, e)
+            if not self.spaces_between_special_tokens:
+                special_token = self.added_token_ids.get(next_token_id)
+                is_special = special_token is not None
+                if is_special and self.last_special:
+                    token = special_token
+                self.last_special = is_special
+            self.token_ids.append(next_token_id)
+            if token:
+                if self._delta_only:
+                    prev = self._pending_delta
+                    self._pending_delta = token if not prev else prev + token
+                else:
+                    self.output_text += token
+            return None
+        return super().update(new_token_ids, stop_terminated)
+
+    def get_next_output_text(self, finished: bool, delta: bool) -> str:
+        if self._delta_only and delta:
+            pending = self._pending_delta
+            if pending:
+                self._pending_delta = ""
+            if not self.output_text:
+                return pending
+            tail = super().get_next_output_text(finished, True)
+            return tail if not pending else (pending + tail if tail else pending)
+        return super().get_next_output_text(finished, delta)
+
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)
 
@@ -232,31 +274,33 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         return token or ""
 
-    def _protected_step(self, next_token_id: int) -> str | None:
-        try:
-            token = self.stream.step(self.tokenizer, next_token_id)
-        except (OverflowError, TypeError):
+    def _handle_step_error(self, next_token_id: int, e: Exception) -> str | None:
+        if isinstance(e, (OverflowError, TypeError)):
             # Handle rare observed overflow, still to be diagnosed.
             # See https://github.com/vllm-project/vllm/issues/21951.
             logger.exception("Encountered invalid token id: %r", next_token_id)
-            token = None
-        except Exception as e:
-            if not str(e).startswith(INVALID_PREFIX_ERR_MSG):
-                raise e
-            # Recover from edge case where tokenizer can produce non-monotonic,
-            # invalid UTF-8 output, which breaks the internal state of
-            # tokenizers' DecodeStream.
-            # See https://github.com/vllm-project/vllm/issues/17448.
-            logger.warning(
-                "Encountered invalid prefix detokenization error"
-                " for request %s, resetting decode stream.",
-                self.request_id,
-            )
-            self.stream = tokenizers.decoders.DecodeStream(
-                skip_special_tokens=self.skip_special_tokens
-            )
-            token = self.stream.step(self.tokenizer, next_token_id)
-        return token
+            return None
+        if not str(e).startswith(INVALID_PREFIX_ERR_MSG):
+            raise e
+        # Recover from edge case where tokenizer can produce non-monotonic,
+        # invalid UTF-8 output, which breaks the internal state of
+        # tokenizers' DecodeStream.
+        # See https://github.com/vllm-project/vllm/issues/17448.
+        logger.warning(
+            "Encountered invalid prefix detokenization error"
+            " for request %s, resetting decode stream.",
+            self.request_id,
+        )
+        self.stream = tokenizers.decoders.DecodeStream(
+            skip_special_tokens=self.skip_special_tokens
+        )
+        return self.stream.step(self.tokenizer, next_token_id)
+
+    def _protected_step(self, next_token_id: int) -> str | None:
+        try:
+            return self.stream.step(self.tokenizer, next_token_id)
+        except (OverflowError, TypeError, Exception) as e:
+            return self._handle_step_error(next_token_id, e)
 
 
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):

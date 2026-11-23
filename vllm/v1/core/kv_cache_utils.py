@@ -23,7 +23,12 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
-from vllm.utils.hashing import xxhash, xxhash_cbor
+from vllm.utils.hashing import (
+    sha256_cbor,
+    sha256_cbor_block_plain,
+    xxhash,
+    xxhash_cbor,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -59,6 +64,9 @@ BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 ExternalBlockHash: TypeAlias = bytes | int
 
 
+_GROUP_ID_BYTES = tuple(i.to_bytes(4, "big", signed=False) for i in range(64))
+
+
 def make_block_hash_with_group_id(
     block_hash: BlockHash, group_id: int
 ) -> BlockHashWithGroupId:
@@ -68,6 +76,8 @@ def make_block_hash_with_group_id(
     the block hash bytes.  This representation avoids creating tuples while
     still allowing us to recover both components when needed.
     """
+    if 0 <= group_id < 64:
+        return BlockHashWithGroupId(block_hash + _GROUP_ID_BYTES[group_id])
     return BlockHashWithGroupId(block_hash + group_id.to_bytes(4, "big", signed=False))
 
 
@@ -521,6 +531,79 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
 
 
+class _LifoFreeBlockStack:
+    """Fast C-list-backed free block pool for ``enable_caching=False``.
+
+    Stores free blocks in reversed order so the front of the queue is at the
+    tail of ``_buf``, yielding O(k) slice pops/prepends without linked-list
+    pointer churn while preserving exact ``FreeKVCacheBlockQueue`` order.
+    """
+
+    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        self._buf: list[KVCacheBlock] = blocks[::-1]
+        self.num_free_blocks: int = len(blocks)
+
+    def popleft(self) -> KVCacheBlock:
+        if self.num_free_blocks == 0:
+            raise ValueError("No free blocks available")
+        self.num_free_blocks -= 1
+        return self._buf.pop()
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        if self.num_free_blocks < n:
+            raise ValueError(
+                f"Cannot get {n} free blocks from the pool "
+                f"(only {self.num_free_blocks} available)"
+            )
+        self.num_free_blocks -= n
+        buf = self._buf
+        ret = buf[-n:]
+        ret.reverse()
+        del buf[-n:]
+        return ret
+
+    def append(self, block: KVCacheBlock) -> None:
+        self._buf.insert(0, block)
+        self.num_free_blocks += 1
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        if not blocks:
+            return
+        self._buf[0:0] = reversed(blocks)
+        self.num_free_blocks += len(blocks)
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        if not blocks:
+            return
+        self._buf.extend(reversed(blocks))
+        self.num_free_blocks += len(blocks)
+
+    def remove(self, block: KVCacheBlock) -> None:
+        self._buf.remove(block)
+        self.num_free_blocks -= 1
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        return self._buf[::-1]
+
+    def iter_blocks_after(
+        self,
+        cursor: KVCacheBlock | None,
+    ) -> Iterator[KVCacheBlock]:
+        buf = self._buf
+        if cursor is None:
+            for block in reversed(buf):
+                yield block
+            return
+        try:
+            idx = len(buf) - 1 - buf[::-1].index(cursor)
+        except ValueError:
+            return
+        for i in range(idx - 1, -1, -1):
+            yield buf[i]
+
+
 def _gen_mm_extra_hash_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[list[Any], int]:
@@ -732,6 +815,15 @@ def hash_block_tokens(
     """
     if not parent_block_hash:
         parent_block_hash = NONE_HASH
+
+    if (
+        extra_keys is None
+        and hash_function is sha256_cbor
+        and isinstance(parent_block_hash, bytes)
+    ):
+        fast_digest = sha256_cbor_block_plain(parent_block_hash, curr_block_token_ids)
+        if fast_digest is not None:
+            return BlockHash(fast_digest)
 
     curr_block_token_ids_tuple = tuple(curr_block_token_ids)
     return BlockHash(
@@ -995,6 +1087,32 @@ def get_request_block_hasher(
             request.block_hashes[-1] if request.block_hashes else None
         )
         new_block_hashes: list[BlockHash] = []
+        if (
+            not num_hash_lookahead_tokens
+            and not mm_features
+            and not request.lora_request
+            and request.prompt_embeds is None
+        ):
+            all_tokens = request._all_token_ids
+            cache_salt = request.cache_salt
+            while start_token_idx + hash_block_size <= num_tokens:
+                end_token_idx = start_token_idx + hash_block_size
+                extra_keys = (
+                    (("cache_salt", cache_salt),)
+                    if (start_token_idx == 0 and cache_salt)
+                    else None
+                )
+                block_hash = hash_block_tokens(
+                    caching_hash_fn,
+                    prev_block_hash_value,
+                    all_tokens[start_token_idx:end_token_idx],
+                    extra_keys,
+                )
+                new_block_hashes.append(block_hash)
+                start_token_idx = end_token_idx
+                prev_block_hash_value = block_hash
+            return new_block_hashes
+
         while True:
             end_token_idx = start_token_idx + hash_block_size
             if end_token_idx > num_tokens:
@@ -1035,6 +1153,8 @@ def get_request_block_hasher(
 
         return new_block_hashes
 
+    request_block_hasher._hash_block_size = hash_block_size  # type: ignore[attr-defined]
+    request_block_hasher._num_lookahead = num_hash_lookahead_tokens  # type: ignore[attr-defined]
     return request_block_hasher
 
 
@@ -1237,6 +1357,11 @@ class BlockHashListWithBlockSize:
 
         if isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
+            if step == 1:
+                if start >= stop:
+                    return []
+                sf = self.scale_factor
+                return self.block_hashes[(start + 1) * sf - 1 : stop * sf : sf]
             return [self._get_value_at(i) for i in range(start, stop, step)]
 
         raise TypeError(f"Invalid index type: {type(idx)!r}")

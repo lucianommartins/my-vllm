@@ -24,10 +24,11 @@ from itertools import islice
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.config.utils import getattr_iter
 from vllm.distributed import (
     get_pp_group,
@@ -64,6 +65,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
@@ -488,6 +490,20 @@ class Gemma4MLP(nn.Module):
             import vllm._gemma4_sm80_ops  # noqa: F401
 
             logger.info_once("Enabled SM80 Gemma4 skinny M<=4 deterministic GEMVs")
+        self._use_e2b_sm80_mlp = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and get_tensor_model_parallel_world_size() == 1
+            and hidden_size == 1536
+            and intermediate_size in (6144, 12288)
+            and hidden_activation == "gelu_pytorch_tanh"
+            and isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+        )
+        if self._use_e2b_sm80_mlp:
+            import vllm._gemma4_e2b_proj_ops  # noqa: F401
+
+            logger.info_once("Enabled SM80 Gemma4 E2B MLP projection kernels")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
@@ -501,6 +517,17 @@ class Gemma4MLP(nn.Module):
         ):
             x = torch.ops.vllm.gemma4_mlp_gate_up_gelu(x, self.gate_up_proj.weight)
             return torch.ops.vllm.gemma4_skinny_linear(x, self.down_proj.weight, 4)
+        if (
+            self._use_e2b_sm80_mlp
+            and x.dtype == torch.bfloat16
+            and type(self.gate_up_proj) is MergedColumnParallelLinear
+            and type(self.down_proj) is RowParallelLinear
+            and self.gate_up_proj.weight.dtype == torch.bfloat16
+            and self.down_proj.weight.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            x = torch.ops.vllm.e2b_mlp_gate_up_gelu(x, self.gate_up_proj.weight)
+            return torch.ops.vllm.e2b_skinny_linear(x, self.down_proj.weight)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -783,6 +810,50 @@ class Gemma4Attention(nn.Module):
         if self._use_sm80_skinny_attn_proj:
             import vllm._gemma4_sm80_ops  # noqa: F401
 
+        self._use_e2b_attn_proj = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and tp_size == 1
+            and hidden_size == 1536
+            and not config.attention_bias
+            and isinstance(
+                (self.q_proj if self.is_kv_shared_layer else self.qkv_proj).quant_method,
+                UnquantizedLinearMethod,
+            )
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and self.q_size in (2048, 4096)
+        )
+        if self._use_e2b_attn_proj:
+            import vllm._gemma4_e2b_proj_ops  # noqa: F401
+
+            logger.info_once("Enabled SM80 Gemma4 E2B attention projection kernels")
+
+        rope_angles = getattr(self.rotary_emb, "rope_angles", None)
+        if rope_angles is None:
+            rope_angles = getattr(self.rotary_emb, "rotary_dim", self.head_dim) // 2
+        self._rope_angles = int(rope_angles)
+        self._use_fused_q_norm_rope = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and self.is_kv_shared_layer
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and self.head_dim in (256, 512)
+            and 0 <= self._rope_angles <= self.head_dim // 2
+            and self._rope_angles % 32 == 0
+        )
+        if self._use_fused_q_norm_rope:
+            import vllm._gemma4_e2b_proj_ops  # noqa: F401
+
+            if self.rotary_emb.cos_sin_cache.dtype != torch.bfloat16:
+                self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(
+                    torch.bfloat16
+                )
+            logger.info_once(
+                "Enabled fused Gemma4 KV-shared Q-Norm+RoPE on head_dim=%d (rope_angles=%d)",
+                self.head_dim,
+                self._rope_angles,
+            )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -791,11 +862,43 @@ class Gemma4Attention(nn.Module):
     ) -> torch.Tensor:
         if self.is_kv_shared_layer:
             # Shared KV: only Q is projected; K/V come from the target layer.
-            q, _ = self.q_proj(hidden_states)
-            q = q.unflatten(-1, (self.num_heads, self.head_dim))
-            q = self.q_norm(q)
-            q = q.flatten(-2, -1)
-            q, _ = self.rotary_emb(positions, q, None)
+            if (
+                self._use_e2b_attn_proj
+                and hidden_states.dtype == torch.bfloat16
+                and type(self.q_proj) is ColumnParallelLinear
+                and self.q_proj.weight.dtype == torch.bfloat16
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                q = torch.ops.vllm.e2b_skinny_linear(
+                    hidden_states, self.q_proj.weight
+                )
+            else:
+                q, _ = self.q_proj(hidden_states)
+            if (
+                self._use_fused_q_norm_rope
+                and q.dtype == torch.bfloat16
+                and q.dim() == 2
+                and q.stride(-1) == 1
+                and q.stride(0) % 8 == 0
+                and self.q_norm.weight.dtype == torch.bfloat16
+                and self.rotary_emb.cos_sin_cache.dtype == torch.bfloat16
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(q)
+                q = torch.ops.vllm.gemma4_q_norm_rope(
+                    q,
+                    positions.reshape(-1),
+                    self.q_norm.weight,
+                    cos_sin_cache,
+                    self.q_norm.variance_epsilon,
+                    self.head_dim,
+                    self._rope_angles,
+                )
+            else:
+                q = q.unflatten(-1, (self.num_heads, self.head_dim))
+                q = self.q_norm(q)
+                q = q.flatten(-2, -1)
+                q, _ = self.rotary_emb(positions, q, None)
             attn_output = self.attn(q, None, None)
         else:
             # For k_eq_v, K weights are loaded into both K and V slots of
@@ -809,6 +912,16 @@ class Gemma4Attention(nn.Module):
             ):
                 qkv = torch.ops.vllm.gemma4_skinny_linear(
                     hidden_states, self.qkv_proj.weight, 2
+                )
+            elif (
+                self._use_e2b_attn_proj
+                and hidden_states.dtype == torch.bfloat16
+                and type(self.qkv_proj) is QKVParallelLinear
+                and self.qkv_proj.weight.dtype == torch.bfloat16
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                qkv = torch.ops.vllm.e2b_skinny_linear(
+                    hidden_states, self.qkv_proj.weight
                 )
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
@@ -898,6 +1011,16 @@ class Gemma4Attention(nn.Module):
         ):
             output = torch.ops.vllm.gemma4_skinny_linear(
                 attn_output, self.o_proj.weight, 2 if self.is_sliding else 1
+            )
+        elif (
+            self._use_e2b_attn_proj
+            and attn_output.dtype == torch.bfloat16
+            and type(self.o_proj) is RowParallelLinear
+            and self.o_proj.weight.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            output = torch.ops.vllm.e2b_skinny_linear(
+                attn_output, self.o_proj.weight
             )
         else:
             output, _ = self.o_proj(attn_output)
@@ -1062,6 +1185,26 @@ class Gemma4DecoderLayer(nn.Module):
             and self.enable_moe_block
             and self.per_layer_input_gate is None
         )
+        self._use_sm80_e2b_ple_norms = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and self.hidden_size == 1536
+            and self.hidden_size_per_layer_input == 256
+            and not self.enable_moe_block
+            and self.per_layer_input_gate is not None
+            and self.per_layer_projection is not None
+            and self.post_per_layer_input_norm is not None
+            and getattr(self.per_layer_input_gate, "bias", None) is None
+            and getattr(self.per_layer_projection, "bias", None) is None
+            and hasattr(self.per_layer_input_gate, "weight")
+            and self.per_layer_input_gate.weight.shape == (256, 1536)
+            and hasattr(self.per_layer_projection, "weight")
+            and self.per_layer_projection.weight.shape == (1536, 256)
+            and type(self.per_layer_input_gate.quant_method).__name__
+            == "UnquantizedLinearMethod"
+            and type(self.per_layer_projection.quant_method).__name__
+            == "UnquantizedLinearMethod"
+        )
         self._root_size_bf16_f = (
             float(self.router.root_size.to(torch.bfloat16).item())
             if self.router is not None
@@ -1111,6 +1254,61 @@ class Gemma4DecoderLayer(nn.Module):
             self.layer_scalar,
             next_norm_weight,
             self.post_feedforward_layernorm.variance_epsilon,
+        )
+
+    def forward_sm80_e2b_ple_cross_norm(
+        self,
+        positions: torch.Tensor,
+        normed_hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        layer_per_input: torch.Tensor,
+        next_norm_weight: torch.Tensor | None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert self.per_layer_input_gate is not None
+        assert self.per_layer_projection is not None
+        assert self.post_per_layer_input_norm is not None
+        attn_out = self.self_attn(
+            positions=positions,
+            hidden_states=normed_hidden_states,
+            **kwargs,
+        )
+        res1, ffn_in = torch.ops.vllm.gemma4_e2b_post_attn_pre_ffn_norms(
+            attn_out,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
+        mlp_out = self.mlp(ffn_in)
+        res2, gated_ple = torch.ops.vllm.gemma4_e2b_post_ffn_ple_gate(
+            mlp_out,
+            res1,
+            self.post_feedforward_layernorm.weight,
+            self.per_layer_input_gate.weight,
+            layer_per_input,
+            self.post_feedforward_layernorm.variance_epsilon,
+        )
+        ple_proj = torch.ops.vllm.gemma4_e2b_ple_proj_gemv(
+            gated_ple,
+            self.per_layer_projection.weight,
+        )
+        if next_norm_weight is None:
+            res_out = torch.ops.vllm.gemma4_e2b_ple_post_norm_scalar(
+                ple_proj,
+                res2,
+                self.post_per_layer_input_norm.weight,
+                self.layer_scalar,
+                self.post_per_layer_input_norm.variance_epsilon,
+            )
+            return res_out, None
+        return torch.ops.vllm.gemma4_e2b_ple_post_norm_scalar_next_norm(
+            ple_proj,
+            res2,
+            self.post_per_layer_input_norm.weight,
+            self.layer_scalar,
+            next_norm_weight,
+            self.post_per_layer_input_norm.variance_epsilon,
         )
 
     def forward(
@@ -1206,6 +1404,42 @@ def _run_decoder_layers(
     return hidden_states
 
 
+def _run_sm80_e2b_ple_decoder_layers(
+    decoder_layers: list[Gemma4DecoderLayer],
+    layer_idx_start: int,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    ple_layers: torch.Tensor,
+    final_norm_weight: torch.Tensor | None,
+    normed_cur: torch.Tensor | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    """Run E2B decoder layers with contiguous [35, M, 256] PLE + cross-layer RMSNorms."""
+    num_active = len(decoder_layers)
+    residual_cur = hidden_states
+    if normed_cur is None:
+        normed_cur = decoder_layers[0].input_layernorm(residual_cur)
+    for idx, layer in enumerate(decoder_layers):
+        nxt_w = (
+            decoder_layers[idx + 1].input_layernorm.weight
+            if idx + 1 < num_active
+            else final_norm_weight
+        )
+        assert normed_cur is not None
+        residual_cur, normed_cur = layer.forward_sm80_e2b_ple_cross_norm(
+            positions,
+            normed_cur,
+            residual_cur,
+            ple_layers[layer_idx_start + idx],
+            nxt_w,
+            **kwargs,
+        )
+    if final_norm_weight is not None:
+        assert normed_cur is not None
+        return normed_cur
+    return residual_cur
+
+
 @support_torch_compile(
     enable_if=lambda vllm_config: vllm_config.cache_config.kv_sharing_fast_prefill
 )
@@ -1264,9 +1498,46 @@ class Gemma4SelfDecoderLayers(nn.Module):
         self.register_buffer(
             "per_layer_projection_scale", per_layer_projection_scale, persistent=False
         )
+        self._use_sm80_e2b_ple_norms = False
+        self._use_sm80_e2b_embed = False
+        self._use_sm80_e2b_ple_from_ids = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.normalizer
+
+    def _embed_input_ids_sm80(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if (
+            self._use_sm80_e2b_embed
+            and input_ids.ndim == 1
+            and input_ids.dtype in (torch.int64, torch.int32)
+        ):
+            return torch.ops.vllm.gemma4_e2b_embed_scale(
+                input_ids,
+                self.embed_tokens.weight,
+                self.normalizer,
+            )
+        return self.embed_input_ids(input_ids)
+
+    def _embed_input_ids_norm_sm80(
+        self,
+        input_ids: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self._use_sm80_e2b_embed
+            and input_ids.ndim == 1
+            and input_ids.dtype in (torch.int64, torch.int32)
+            and norm_weight.dtype == torch.bfloat16
+        ):
+            return torch.ops.vllm.gemma4_e2b_embed_scale_and_norm(
+                input_ids,
+                self.embed_tokens.weight,
+                self.normalizer,
+                norm_weight,
+                eps,
+            )
+        return self._embed_input_ids_sm80(input_ids), None
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
         """Get per-layer embeddings from embed_tokens_per_layer.
@@ -1322,6 +1593,76 @@ class Gemma4SelfDecoderLayers(nn.Module):
             return per_layer_projection
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
+    def _compute_sm80_ple_layers(
+        self,
+        hidden_states: torch.Tensor,
+        raw_ple: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Compute [35, M, 256] PLE activations with fused SM80 E2B kernels."""
+        assert self.per_layer_model_projection is not None
+        assert self.per_layer_projection_norm is not None
+        assert self.per_layer_projection_scale is not None
+        assert self.per_layer_input_scale is not None
+        ple_proj = torch.ops.vllm.gemma4_e2b_model_proj_gemv(
+            hidden_states,
+            self.per_layer_model_projection.weight,
+        )
+        return torch.ops.vllm.gemma4_e2b_project_ple_combine(
+            ple_proj,
+            raw_ple,
+            self.per_layer_projection_norm.weight,
+            self.per_layer_projection_scale,
+            self.per_layer_input_scale,
+            self.per_layer_projection_norm.variance_epsilon,
+        )
+
+    def _compute_sm80_ple_layers_from_ids(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        layer_offset: int = 0,
+        num_out_layers: int = 35,
+    ) -> torch.Tensor:
+        """Compute [num_out_layers, M, 256] PLE directly from input_ids without raw buffer."""
+        assert self.per_layer_model_projection is not None
+        assert self.embed_tokens_per_layer is not None
+        assert self.per_layer_projection_norm is not None
+        assert self.per_layer_projection_scale is not None
+        assert self.embed_scale_per_layer is not None
+        assert self.per_layer_input_scale is not None
+        w_proj = self.per_layer_model_projection.weight
+        if layer_offset == 0 and num_out_layers == 35:
+            ple_proj = torch.ops.vllm.gemma4_e2b_model_proj_gemv(
+                hidden_states,
+                w_proj,
+            )
+        else:
+            row_start = layer_offset * 256
+            row_end = row_start + num_out_layers * 256
+            ple_proj = F.linear(hidden_states, w_proj[row_start:row_end])
+        return torch.ops.vllm.gemma4_e2b_project_ple_combine_from_ids(
+            ple_proj,
+            input_ids,
+            self.embed_tokens_per_layer.weight,
+            self.per_layer_projection_norm.weight,
+            self.per_layer_projection_scale,
+            self.embed_scale_per_layer,
+            self.per_layer_input_scale,
+            self.vocab_size_per_layer_input,
+            layer_offset,
+            self.per_layer_projection_norm.variance_epsilon,
+        )
+
+    def _resolve_inputs_and_raw_ple(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        per_layer_inputs: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if inputs_embeds is not None:
+            return inputs_embeds, per_layer_inputs
+        return self.embed_input_ids(input_ids), self.get_per_layer_inputs(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1330,17 +1671,70 @@ class Gemma4SelfDecoderLayers(nn.Module):
         per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-            per_layer_inputs = self.project_per_layer_inputs(
-                hidden_states, per_layer_inputs
+        if self._use_sm80_e2b_ple_norms:
+            if (
+                inputs_embeds is None
+                and per_layer_inputs is None
+                and input_ids is not None
+                and self._use_sm80_e2b_ple_from_ids
+                and input_ids.ndim == 1
+                and input_ids.dtype in (torch.int64, torch.int32)
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                ln0 = self.decoder_layers[0].input_layernorm
+                hidden_states, normed_0 = self._embed_input_ids_norm_sm80(
+                    input_ids, ln0.weight, ln0.variance_epsilon
+                )
+                ple_layers = self._compute_sm80_ple_layers_from_ids(
+                    hidden_states, input_ids
+                )
+                hidden_states = _run_sm80_e2b_ple_decoder_layers(
+                    self.decoder_layers,
+                    self.layer_idx_start,
+                    positions,
+                    hidden_states,
+                    ple_layers,
+                    final_norm_weight=None,
+                    normed_cur=normed_0,
+                    **kwargs,
+                )
+                return hidden_states, ple_layers
+            hidden_states, raw_ple = self._resolve_inputs_and_raw_ple(
+                input_ids, inputs_embeds, per_layer_inputs
             )
-        else:
-            hidden_states = self.embed_input_ids(input_ids)
-            per_layer_embeds = self.get_per_layer_inputs(input_ids)
-            per_layer_inputs = self.project_per_layer_inputs(
-                hidden_states, per_layer_embeds
+            if (
+                hidden_states.dtype == torch.bfloat16
+                and (raw_ple is None or raw_ple.dtype == torch.bfloat16)
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                ple_layers = self._compute_sm80_ple_layers(hidden_states, raw_ple)
+                hidden_states = _run_sm80_e2b_ple_decoder_layers(
+                    self.decoder_layers,
+                    self.layer_idx_start,
+                    positions,
+                    hidden_states,
+                    ple_layers,
+                    final_norm_weight=None,
+                    **kwargs,
+                )
+                return hidden_states, ple_layers
+            per_layer_inputs = self.project_per_layer_inputs(hidden_states, raw_ple)
+            hidden_states = _run_decoder_layers(
+                self.decoder_layers,
+                self.layer_idx_start,
+                positions,
+                hidden_states,
+                per_layer_inputs,
+                **kwargs,
             )
+            if per_layer_inputs is not None:
+                per_layer_inputs = per_layer_inputs.permute(1, 0, 2).contiguous()
+            return hidden_states, per_layer_inputs
+
+        hidden_states, raw_ple = self._resolve_inputs_and_raw_ple(
+            input_ids, inputs_embeds, per_layer_inputs
+        )
+        per_layer_inputs = self.project_per_layer_inputs(hidden_states, raw_ple)
 
         hidden_states = _run_decoder_layers(
             self.decoder_layers,
@@ -1366,10 +1760,13 @@ class Gemma4CrossDecoderLayers(nn.Module):
         prefix: str = "",
         decoder_layers: list[Gemma4DecoderLayer],
         layer_idx_start: int,
+        norm: RMSNorm | None = None,
     ):
         super().__init__()
         self.decoder_layers = decoder_layers
         self.layer_idx_start = layer_idx_start
+        self.norm = norm
+        self._use_sm80_e2b_ple_norms = False
 
     def forward(
         self,
@@ -1378,7 +1775,26 @@ class Gemma4CrossDecoderLayers(nn.Module):
         per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        return _run_decoder_layers(
+        if self._use_sm80_e2b_ple_norms and per_layer_inputs is not None:
+            if (
+                hidden_states.dtype == torch.bfloat16
+                and per_layer_inputs.dtype == torch.bfloat16
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                return _run_sm80_e2b_ple_decoder_layers(
+                    self.decoder_layers,
+                    self.layer_idx_start,
+                    positions,
+                    hidden_states,
+                    per_layer_inputs,
+                    final_norm_weight=(
+                        self.norm.weight if self.norm is not None else None
+                    ),
+                    **kwargs,
+                )
+            per_layer_inputs = per_layer_inputs.permute(1, 0, 2)
+
+        hidden_states = _run_decoder_layers(
             self.decoder_layers,
             self.layer_idx_start,
             positions,
@@ -1386,6 +1802,9 @@ class Gemma4CrossDecoderLayers(nn.Module):
             per_layer_inputs,
             **kwargs,
         )
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
 @support_torch_compile(
@@ -1538,9 +1957,90 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                 prefix=f"{prefix}.cross_decoder",
                 decoder_layers=self.layers[first_kv_shared_layer_idx:],
                 layer_idx_start=first_kv_shared_layer_idx,
+                norm=self.norm,
             )
 
         self.fast_prefill_enabled = cache_config.kv_sharing_fast_prefill
+
+        can_sm80_e2b_ple = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and get_pp_group().is_first_rank
+            and get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+            and (self.end_layer - self.start_layer) == 35
+            and config.hidden_size == 1536
+            and self.hidden_size_per_layer_input == 256
+            and getattr(self.self_decoder, "per_layer_model_projection", None)
+            is not None
+            and getattr(self.self_decoder, "per_layer_projection_norm", None)
+            is not None
+            and getattr(self.self_decoder, "per_layer_projection_scale", None)
+            is not None
+            and getattr(self.self_decoder, "per_layer_input_scale", None) is not None
+            and hasattr(self.self_decoder.per_layer_model_projection, "weight")
+            and self.self_decoder.per_layer_model_projection.weight.shape == (8960, 1536)
+            and getattr(self.self_decoder.per_layer_model_projection, "bias", None)
+            is None
+            and type(
+                self.self_decoder.per_layer_model_projection.quant_method
+            ).__name__
+            == "UnquantizedLinearMethod"
+            and all(
+                not isinstance(l, PPMissingLayer)
+                and l._use_sm80_e2b_ple_norms
+                and l.input_layernorm.variance_epsilon == self.norm.variance_epsilon
+                and l.post_per_layer_input_norm.variance_epsilon
+                == self.norm.variance_epsilon
+                for l in self.layers[self.start_layer : self.end_layer]
+            )
+        )
+        self._use_sm80_e2b_ple_norms = can_sm80_e2b_ple and not self.fast_prefill_enabled
+        self._use_sm80_e2b_ple_norms_fast_prefill = (
+            can_sm80_e2b_ple and self.fast_prefill_enabled
+        )
+        can_sm80_e2b_embed = (
+            can_sm80_e2b_ple
+            and self.normalizer.dtype == torch.bfloat16
+            and getattr(self.embed_tokens, "tp_size", 0) == 1
+            and type(self.embed_tokens.quant_method).__name__
+            == "UnquantizedEmbeddingMethod"
+            and hasattr(self.embed_tokens, "weight")
+            and self.embed_tokens.weight.dtype == torch.bfloat16
+            and self.embed_tokens.weight.ndim == 2
+            and self.embed_tokens.weight.shape[1] == 1536
+        )
+        can_sm80_e2b_ple_from_ids = (
+            can_sm80_e2b_ple
+            and getattr(self, "embed_tokens_per_layer", None) is not None
+            and getattr(self.embed_tokens_per_layer, "tp_size", 0) == 1
+            and type(self.embed_tokens_per_layer.quant_method).__name__
+            == "UnquantizedEmbeddingMethod"
+            and hasattr(self.embed_tokens_per_layer, "weight")
+            and self.embed_tokens_per_layer.weight.dtype == torch.bfloat16
+            and self.embed_tokens_per_layer.weight.ndim == 2
+            and self.embed_tokens_per_layer.weight.shape[1] == 8960
+            and getattr(self, "embed_scale_per_layer", None) is not None
+            and self.self_decoder.vocab_size_per_layer_input > 0
+        )
+        self._use_sm80_e2b_embed = can_sm80_e2b_embed
+        self._use_sm80_e2b_ple_from_ids = can_sm80_e2b_ple_from_ids
+        if can_sm80_e2b_ple:
+            from vllm import _gemma4_e2b_sm80_ops  # noqa: F401
+
+            self.self_decoder._use_sm80_e2b_ple_norms = (
+                self._use_sm80_e2b_ple_norms_fast_prefill
+            )
+            self.self_decoder._use_sm80_e2b_embed = can_sm80_e2b_embed
+            self.self_decoder._use_sm80_e2b_ple_from_ids = can_sm80_e2b_ple_from_ids
+            self.cross_decoder._use_sm80_e2b_ple_norms = (
+                self._use_sm80_e2b_ple_norms_fast_prefill
+            )
+            logger.info_once(
+                "Enabled SM80 Gemma4 E2B fused PLE + cross-layer Multi-RMSNorms (fast_prefill=%s, from_ids=%s)",
+                self.fast_prefill_enabled,
+                can_sm80_e2b_ple_from_ids,
+            )
 
         if self.fast_prefill_enabled:
             # Allocate static buffers for CUDAGraph
@@ -1558,12 +2058,21 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                 self.hidden_size_per_layer_input
                 and self.hidden_size_per_layer_input > 0
             ):
-                self.per_layer_inputs = torch.zeros(
+                ple_shape = (
                     (
+                        config.num_hidden_layers,
+                        max_num_tokens,
+                        self.hidden_size_per_layer_input,
+                    )
+                    if self._use_sm80_e2b_ple_norms_fast_prefill
+                    else (
                         max_num_tokens,
                         config.num_hidden_layers,
                         self.hidden_size_per_layer_input,
-                    ),
+                    )
+                )
+                self.per_layer_inputs = torch.zeros(
+                    ple_shape,
                     dtype=vllm_config.model_config.dtype,
                     device=device,
                 )
@@ -1654,7 +2163,8 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         **kwargs,
     ) -> torch.Tensor:
         logits_indices_padded, num_logits_indices = None, None
-        attn_metadata = get_forward_context().attn_metadata
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is not None:
             assert isinstance(attn_metadata, dict)
@@ -1665,40 +2175,125 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                 logits_indices_padded = layer_attn_metadata.logits_indices_padded
                 num_logits_indices = layer_attn_metadata.num_logits_indices
 
+        if logits_indices_padded is None:
+            # Pure decode / prompt_logprobs / LoRA fallback: skip arange, clone,
+            # gather, and scatter completely. Pass tensors directly in FULL
+            # CUDAGraph or eager mode; stage into static buffers in PIECEWISE
+            # mode so cross_decoder replay keeps capture input addresses.
+            if forward_context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE:
+                self_decoder_hidden_states, per_layer_inputs = self.self_decoder(
+                    input_ids=input_ids,
+                    positions=positions,
+                    inputs_embeds=inputs_embeds,
+                    per_layer_inputs=per_layer_inputs,
+                    **kwargs,
+                )
+                return self.cross_decoder(
+                    positions,
+                    self_decoder_hidden_states,
+                    per_layer_inputs,
+                    **kwargs,
+                )
+
+            batch_size = positions.size(0)
+            self.positions[:batch_size].copy_(positions)
+            self_decoder_hidden_states, per_layer_inputs = self.self_decoder(
+                input_ids=input_ids,
+                positions=self.positions[:batch_size],
+                inputs_embeds=inputs_embeds,
+                per_layer_inputs=per_layer_inputs,
+                **kwargs,
+            )
+            self.hidden_states[:batch_size].copy_(self_decoder_hidden_states)
+            if self.per_layer_inputs is not None and per_layer_inputs is not None:
+                if self._use_sm80_e2b_ple_norms_fast_prefill:
+                    self.per_layer_inputs[:, :batch_size].copy_(per_layer_inputs)
+                    cross_per_layer = self.per_layer_inputs[:, :batch_size]
+                else:
+                    self.per_layer_inputs[:batch_size].copy_(per_layer_inputs)
+                    cross_per_layer = self.per_layer_inputs[:batch_size]
+            else:
+                cross_per_layer = None
+            return self.cross_decoder(
+                self.positions[:batch_size],
+                self.hidden_states[:batch_size],
+                cross_per_layer,
+                **kwargs,
+            )
+
         batch_size = positions.size(0)
         self.positions[:batch_size].copy_(positions)
-        self_decoder_hidden_states, per_layer_inputs = self.self_decoder(
-            input_ids=input_ids,
-            positions=self.positions[:batch_size],
-            inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_inputs,
-            **kwargs,
-        )
-
-        if logits_indices_padded is None:
-            logits_indices_padded = torch.arange(
-                batch_size,
-                dtype=positions.dtype,
-                device=positions.device,
-            )
-
-        # NOTE: Keep .clone() until fix in
-        # https://github.com/vllm-project/vllm/pull/22282
-        hidden_states = self_decoder_hidden_states.clone()
-
         num_padded = logits_indices_padded.size(0)
-        self.positions[:num_padded].copy_(positions[logits_indices_padded])
-        self.hidden_states[:num_padded].copy_(
-            self_decoder_hidden_states[logits_indices_padded]
-        )
-        if self.per_layer_inputs is not None and per_layer_inputs is not None:
-            self.per_layer_inputs[:num_padded].copy_(
-                per_layer_inputs[logits_indices_padded]
+
+        if (
+            batch_size > 512
+            and input_ids is not None
+            and inputs_embeds is None
+            and per_layer_inputs is None
+            and self._use_sm80_e2b_ple_norms_fast_prefill
+            and self.self_decoder._use_sm80_e2b_ple_from_ids
+            and input_ids.ndim == 1
+            and input_ids.dtype in (torch.int64, torch.int32)
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            ln0 = self.self_decoder.decoder_layers[0].input_layernorm
+            hs, normed_0 = self.self_decoder._embed_input_ids_norm_sm80(
+                input_ids, ln0.weight, ln0.variance_epsilon
             )
+            ple15 = self.self_decoder._compute_sm80_ple_layers_from_ids(
+                hs, input_ids, layer_offset=0, num_out_layers=15
+            )
+            self_decoder_hidden_states = _run_sm80_e2b_ple_decoder_layers(
+                self.self_decoder.decoder_layers,
+                self.self_decoder.layer_idx_start,
+                self.positions[:batch_size],
+                hs,
+                ple15,
+                final_norm_weight=None,
+                normed_cur=normed_0,
+                **kwargs,
+            )
+            hidden_states = self_decoder_hidden_states.clone()
+            self.positions[:num_padded].copy_(positions[logits_indices_padded])
+            self.hidden_states[:num_padded].copy_(
+                self_decoder_hidden_states[logits_indices_padded]
+            )
+            if self.per_layer_inputs is not None:
+                ids_keep = input_ids[logits_indices_padded]
+                hs_keep = hs[logits_indices_padded]
+                ple20 = self.self_decoder._compute_sm80_ple_layers_from_ids(
+                    hs_keep, ids_keep, layer_offset=15, num_out_layers=20
+                )
+                self.per_layer_inputs[15:, :num_padded].copy_(ple20)
+        else:
+            self_decoder_hidden_states, per_layer_inputs = self.self_decoder(
+                input_ids=input_ids,
+                positions=self.positions[:batch_size],
+                inputs_embeds=inputs_embeds,
+                per_layer_inputs=per_layer_inputs,
+                **kwargs,
+            )
+
+            # NOTE: Keep .clone() until fix in
+            # https://github.com/vllm-project/vllm/pull/22282
+            hidden_states = self_decoder_hidden_states.clone()
+
+            self.positions[:num_padded].copy_(positions[logits_indices_padded])
+            self.hidden_states[:num_padded].copy_(
+                self_decoder_hidden_states[logits_indices_padded]
+            )
+            if self.per_layer_inputs is not None and per_layer_inputs is not None:
+                if self._use_sm80_e2b_ple_norms_fast_prefill:
+                    self.per_layer_inputs[15:, :num_padded].copy_(
+                        per_layer_inputs[15:, logits_indices_padded, :]
+                    )
+                else:
+                    self.per_layer_inputs[:num_padded].copy_(
+                        per_layer_inputs[logits_indices_padded]
+                    )
 
         # Update batch_descriptor so the cross-decoder's piecewise
         # CUDAGraphWrapper dispatches to the correct (reduced) batch size.
-        forward_context = get_forward_context()
         orig_batch_desc = forward_context.batch_descriptor
         if orig_batch_desc is not None:
             forward_context.batch_descriptor = replace(
@@ -1706,7 +2301,11 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             )
 
         cross_per_layer = (
-            self.per_layer_inputs[:num_padded]
+            (
+                self.per_layer_inputs[:, :num_padded]
+                if self._use_sm80_e2b_ple_norms_fast_prefill
+                else self.per_layer_inputs[:num_padded]
+            )
             if self.per_layer_inputs is not None
             else None
         )
@@ -1740,33 +2339,71 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if self.fast_prefill_enabled:
-            hidden_states = self.fast_prefill_forward(
+            return self.fast_prefill_forward(
                 input_ids,
                 positions,
                 inputs_embeds,
                 per_layer_inputs,
                 **kwargs,
             )
-            hidden_states = self.norm(hidden_states)
-            return hidden_states
 
         # Normal (non-fast-prefill) path with PP support
         if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-                # When called from the multimodal wrapper, raw PLE
-                # embeddings are pre-computed and passed explicitly.
-                # Project them through per_layer_model_projection.
-                per_layer_inputs = self.project_per_layer_inputs(
-                    hidden_states, per_layer_inputs
+            if (
+                self._use_sm80_e2b_ple_norms
+                and inputs_embeds is None
+                and per_layer_inputs is None
+                and input_ids is not None
+                and self._use_sm80_e2b_ple_from_ids
+                and input_ids.ndim == 1
+                and input_ids.dtype in (torch.int64, torch.int32)
+                and len(self.aux_hidden_state_layers) == 0
+                and not envs.VLLM_BATCH_INVARIANT
+                and self.layers[self.start_layer].per_layer_input_gate.weight.dtype
+                == torch.bfloat16
+            ):
+                ln0 = self.layers[self.start_layer].input_layernorm
+                hidden_states, normed_0 = self.self_decoder._embed_input_ids_norm_sm80(
+                    input_ids, ln0.weight, ln0.variance_epsilon
                 )
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-                # Compute per-layer inputs for PLE
-                per_layer_embeds = self.get_per_layer_inputs(input_ids)
-                per_layer_inputs = self.project_per_layer_inputs(
-                    hidden_states, per_layer_embeds
+                ple_layers = self.self_decoder._compute_sm80_ple_layers_from_ids(
+                    hidden_states, input_ids
                 )
+                return _run_sm80_e2b_ple_decoder_layers(
+                    self.layers[self.start_layer : self.end_layer],
+                    0,
+                    positions,
+                    hidden_states,
+                    ple_layers,
+                    final_norm_weight=self.norm.weight,
+                    normed_cur=normed_0,
+                    **kwargs,
+                )
+            hidden_states, raw_ple = self.self_decoder._resolve_inputs_and_raw_ple(
+                input_ids, inputs_embeds, per_layer_inputs
+            )
+            if (
+                self._use_sm80_e2b_ple_norms
+                and len(self.aux_hidden_state_layers) == 0
+                and not envs.VLLM_BATCH_INVARIANT
+                and hidden_states.dtype == torch.bfloat16
+                and (raw_ple is None or raw_ple.dtype == torch.bfloat16)
+                and self.layers[self.start_layer].per_layer_input_gate.weight.dtype
+                == torch.bfloat16
+            ):
+                ple_layers = self.self_decoder._compute_sm80_ple_layers(
+                    hidden_states, raw_ple
+                )
+                return _run_sm80_e2b_ple_decoder_layers(
+                    self.layers[self.start_layer : self.end_layer],
+                    0,
+                    positions,
+                    hidden_states,
+                    ple_layers,
+                    final_norm_weight=self.norm.weight,
+                    **kwargs,
+                )
+            per_layer_inputs = self.project_per_layer_inputs(hidden_states, raw_ple)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -2023,6 +2660,33 @@ class Gemma4ForCausalLM(
             config.vocab_size,
             soft_cap=getattr(config, "final_logit_softcapping", None),
         )
+        self._sm80_fused_lm_head_fn = None
+        self._sm80_lm_head_soft_cap = 0.0
+        if (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and not self.logits_processor.logits_as_input
+            and self.logits_processor.soft_cap is not None
+            and float(self.logits_processor.scale) == 1.0
+            and self.lm_head.tp_size == 1
+            and isinstance(
+                self.lm_head.quant_method,
+                (UnquantizedLinearMethod, UnquantizedEmbeddingMethod),
+            )
+            and getattr(self.lm_head, "bias", None) is None
+            and self.logits_processor.org_vocab_size == self.lm_head.weight.shape[0]
+            and self.lm_head.weight.dtype == torch.bfloat16
+            and (
+                self.logits_processor.head_dtype is None
+                or self.logits_processor.head_dtype == torch.bfloat16
+            )
+            and self.lm_head.weight.shape[1] == 1536
+            and (self.lm_head.weight.shape[0] & 7) == 0
+        ):
+            from vllm._gemma4_e2b_proj_ops import e2b_lm_head_softcap
+
+            self._sm80_fused_lm_head_fn = e2b_lm_head_softcap
+            self._sm80_lm_head_soft_cap = float(self.logits_processor.soft_cap)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -2065,6 +2729,20 @@ class Gemma4ForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        if (
+            self._sm80_fused_lm_head_fn is not None
+            and hidden_states.dim() == 2
+            and 1 <= hidden_states.size(0) <= 32
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and not torch.is_grad_enabled()
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            return self._sm80_fused_lm_head_fn(
+                hidden_states,
+                self.lm_head.weight,
+                self._sm80_lm_head_soft_cap,
+            )
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

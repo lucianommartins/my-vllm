@@ -320,6 +320,8 @@ class EncoderCacheManager:
             list is cleared after this call.
 
         """
+        if not self.freed:
+            return []
         # An entry evicted early in the scheduling pass can be allocated again
         # later in the same pass. Keep its worker-side tensor in that case.
         freed = [mm_hash for mm_hash in self.freed if mm_hash not in self.cached]

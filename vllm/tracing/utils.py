@@ -6,10 +6,15 @@ from collections.abc import Mapping
 from vllm.logger import init_logger
 from vllm.utils.func_utils import run_once
 
+try:
+    from starlette.datastructures import Headers as _StarletteHeaders
+except ImportError:
+    _StarletteHeaders = None  # type: ignore[assignment,misc]
+
 logger = init_logger(__name__)
 
 # Standard W3C headers used for context propagation
-TRACE_HEADERS = ["traceparent", "tracestate"]
+TRACE_HEADERS = ("traceparent", "tracestate")
 
 
 class SpanAttributes:
@@ -55,7 +60,12 @@ class LoadingSpanAttributes:
 
 def contains_trace_headers(headers: Mapping[str, str]) -> bool:
     """Check if the provided headers dictionary contains trace context."""
-    return any(h in headers for h in TRACE_HEADERS)
+    if _StarletteHeaders is not None and type(headers) is _StarletteHeaders:
+        for k, _ in headers._list:
+            if k == b"traceparent" or k == b"tracestate":
+                return True
+        return False
+    return "traceparent" in headers or "tracestate" in headers
 
 
 def extract_trace_headers(headers: Mapping[str, str]) -> Mapping[str, str]:

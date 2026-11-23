@@ -783,25 +783,30 @@ def report_usage_stats(
 
 
 _PROFILER_FUNC = None
+_NULL_CONTEXT = contextlib.nullcontext()
 
 
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     global _PROFILER_FUNC
 
+    if _PROFILER_FUNC is _NULL_CONTEXT:
+        return _NULL_CONTEXT
+
     # fast path assume it is set
     if _PROFILER_FUNC is not None:
         return _PROFILER_FUNC(name)
 
-    func = contextlib.nullcontext
     if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
-        func = record_function
+        _PROFILER_FUNC = record_function
     elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
         import nvtx
 
-        func = nvtx.annotate
+        _PROFILER_FUNC = nvtx.annotate
+    else:
+        _PROFILER_FUNC = _NULL_CONTEXT
+        return _NULL_CONTEXT
 
-    _PROFILER_FUNC = func
-    return func(name)
+    return _PROFILER_FUNC(name)
 
 
 def tensor_data(tensor: torch.Tensor) -> memoryview:

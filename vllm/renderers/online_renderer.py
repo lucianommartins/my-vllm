@@ -208,6 +208,29 @@ class OnlineRenderer:
         self.log_error_stack = log_error_stack
         self.supports_browsing = False
         self.supports_code_interpreter = False
+        self._cached_tok: Any = None
+        self._cached_is_mistral: bool = False
+        self._cached_needs_tokenize: bool = bool(model_config.enable_prompt_embeds)
+        self._sync_tok_flags()
+        self._gemma4_fast_render_fn: Any = None
+        try:
+            from vllm.renderers.hf import HfRenderer
+
+            if type(renderer).render_chat_async is HfRenderer.render_chat_async:
+                self._gemma4_fast_render_fn = renderer._try_fast_render_gemma4_chat
+        except Exception:
+            pass
+
+    def _sync_tok_flags(self) -> tuple[bool, bool]:
+        """Refresh cached tokenizer capability flags when tokenizer changes."""
+        tok = self.renderer.tokenizer
+        if tok is not self._cached_tok:
+            self._cached_tok = tok
+            self._cached_is_mistral = is_mistral_tokenizer(tok)
+            self._cached_needs_tokenize = bool(
+                self._cached_is_mistral or self.model_config.enable_prompt_embeds
+            )
+        return self._cached_is_mistral, self._cached_needs_tokenize
 
     def warmup(self) -> None:
         self.renderer.warmup(
@@ -236,6 +259,7 @@ class OnlineRenderer:
         request: ChatCompletionRequest,
         *,
         skip_mm_cache: bool = False,
+        _build_conversation: bool = True,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """Core preprocessing logic for chat requests (no model/engine check).
 
@@ -251,8 +275,9 @@ class OnlineRenderer:
         tokenizer = self.renderer.tokenizer
 
         tool_parser = self.parser.tool_parser_cls if self.parser is not None else None
+        is_mistral, _ = self._sync_tok_flags()
 
-        if is_mistral_tokenizer(tokenizer):
+        if is_mistral:
             # because of issues with pydantic we need to potentially
             # re-serialize the tool_calls field of the request
             _mt.maybe_serialize_tool_calls(request)  # type: ignore[arg-type]
@@ -261,9 +286,7 @@ class OnlineRenderer:
 
         # Check if tool parsing is unavailable (common condition)
         tool_parsing_unavailable = (
-            tool_parser is None
-            and not is_mistral_tokenizer(tokenizer)
-            and not self.use_harmony
+            tool_parser is None and not is_mistral and not self.use_harmony
         )
 
         # Validate tool_choice when tool parsing is required but unavailable
@@ -306,16 +329,33 @@ class OnlineRenderer:
             if error_check_ret is not None:
                 return error_check_ret
 
-            conversation, engine_inputs = await self.preprocess_chat(
-                request,
-                request.messages,
-                default_template=self.chat_template,
-                default_template_content_format=self.chat_template_content_format,
-                default_template_kwargs=self.default_chat_template_kwargs,
-                tool_dicts=tool_dicts,
-                parser=self.parser,
-                skip_mm_cache=skip_mm_cache,
-            )
+            if (
+                not _build_conversation
+                and type(self).preprocess_chat is OnlineRenderer.preprocess_chat
+                and "preprocess_chat" not in self.__dict__
+            ):
+                conversation, engine_inputs = await self.preprocess_chat(
+                    request,
+                    request.messages,
+                    default_template=self.chat_template,
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=self.default_chat_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    parser=self.parser,
+                    skip_mm_cache=skip_mm_cache,
+                    _build_conversation=False,
+                )
+            else:
+                conversation, engine_inputs = await self.preprocess_chat(
+                    request,
+                    request.messages,
+                    default_template=self.chat_template,
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=self.default_chat_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    parser=self.parser,
+                    skip_mm_cache=skip_mm_cache,
+                )
         else:
             # For GPT-OSS.
             self.adjust_harmony_request(request)
@@ -774,6 +814,7 @@ class OnlineRenderer:
         parser: type[Parser] | None = None,
         *,
         skip_mm_cache: bool = False,
+        _build_conversation: bool = True,
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
         """Copied from GenerateBaseServing._preprocess_chat."""
         renderer = self.renderer
@@ -784,28 +825,38 @@ class OnlineRenderer:
         )
         mm_config = self.model_config.multimodal_config
 
-        default_template_kwargs = merge_kwargs(
-            default_template_kwargs,
-            dict(
-                tools=tool_dicts,
-                tokenize=(
-                    is_mistral_tokenizer(renderer.tokenizer)
-                    or self.model_config.enable_prompt_embeds
-                ),
-            ),
-        )
+        _, needs_tokenize = self._sync_tok_flags()
+        if tool_dicts is None and not default_template_kwargs:
+            resolved_default_kw: dict[str, Any] = {"tokenize": needs_tokenize}
+        else:
+            resolved_default_kw = merge_kwargs(
+                default_template_kwargs,
+                dict(tools=tool_dicts, tokenize=needs_tokenize),
+            )
 
         tok_params = request.build_tok_params(self.model_config)
-        build_kwargs: dict[str, Any] = {}
-        if isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
-            build_kwargs["reasoning_effort_map"] = self.reasoning_effort_map
-        chat_params = request.build_chat_params(
-            default_template, default_template_content_format, **build_kwargs
-        ).with_defaults(
-            default_template_kwargs,
-            default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
-            default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
-        )
+        default_media_io = mm_config.media_io_kwargs if mm_config else None
+        req_mm_proc_kw = getattr(request, "mm_processor_kwargs", None)
+        if isinstance(request, ChatCompletionRequest):
+            chat_params = request.build_chat_params(
+                default_template,
+                default_template_content_format,
+                reasoning_effort_map=self.reasoning_effort_map,
+                _default_chat_template_kwargs=resolved_default_kw,
+                _default_media_io_kwargs=default_media_io,
+                _default_mm_processor_kwargs=req_mm_proc_kw,
+            )
+        else:
+            build_kwargs: dict[str, Any] = {}
+            if isinstance(request, ResponsesRequest):
+                build_kwargs["reasoning_effort_map"] = self.reasoning_effort_map
+            chat_params = request.build_chat_params(
+                default_template, default_template_content_format, **build_kwargs
+            ).with_defaults(
+                resolved_default_kw,
+                default_media_io_kwargs=default_media_io,
+                default_mm_processor_kwargs=req_mm_proc_kw,
+            )
 
         reuse_ids = _reused_prompt_token_ids(request, renderer, messages)
         if reuse_ids:
@@ -818,17 +869,35 @@ class OnlineRenderer:
                 reuse_ids, cache_salt=getattr(request, "cache_salt", None)
             )
         else:
-            (conversation,), (engine_input,) = await renderer.render_chat_async(
-                [messages],
-                chat_params,
-                tok_params,
-                prompt_extras={
-                    k: v
-                    for k in ("mm_processor_kwargs", "cache_salt")
-                    if (v := getattr(request, k, None)) is not None
-                },
-                skip_mm_cache=skip_mm_cache,
-            )
+            cache_salt = getattr(request, "cache_salt", None)
+            prompt_extras: dict[str, Any] = {}
+            if req_mm_proc_kw is not None:
+                prompt_extras["mm_processor_kwargs"] = req_mm_proc_kw
+            if cache_salt is not None:
+                prompt_extras["cache_salt"] = cache_salt
+            fast_res = None
+            fast_fn = getattr(self, "_gemma4_fast_render_fn", None)
+            if (
+                fast_fn is not None
+                and "render_chat_async" not in renderer.__dict__
+            ):
+                fast_res = fast_fn(
+                    messages,
+                    chat_params,
+                    tok_params,
+                    prompt_extras,
+                    _build_conversation=_build_conversation,
+                )
+            if fast_res is not None:
+                (conversation,), (engine_input,) = fast_res
+            else:
+                (conversation,), (engine_input,) = await renderer.render_chat_async(
+                    [messages],
+                    chat_params,
+                    tok_params,
+                    prompt_extras=prompt_extras,
+                    skip_mm_cache=skip_mm_cache,
+                )
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser

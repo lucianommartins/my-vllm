@@ -622,6 +622,50 @@ def _warmup_kernels(
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
+
+    # Warm long/non-div16 prefill shapes (e.g. 2D prefill retiling,
+    # unaligned QKV-norm-RoPE tails, and num_tokens>=256 multi-warp QKV
+    # norm+RoPE+cache variants) that the 2-token warmup step cannot hit.
+    long_prompt_len = min(
+        257,
+        model_runner.max_model_len - 2,
+        model_runner.scheduler_config.max_num_batched_tokens,
+    )
+    if (
+        long_prompt_len > prompt_len
+        and long_prompt_len >= 16
+        and not model_runner.is_pooling_model
+        and not model_runner.is_encoder_decoder
+        and not null_blocks
+        and num_spec_steps == 0
+    ):
+        long_block_counts = [block_count(long_prompt_len, s) for s in kv_cache_specs]
+        total_long_blocks = sum(long_block_counts)
+        if 1 + total_long_blocks <= num_committable_kv_blocks(model_runner):
+            ensure_kv_cache_blocks(model_runner, 1 + total_long_blocks)
+            next_block_id = 1
+            long_ids = ["_warmup_prefill_0_"]
+            long_tokens = list(range(long_prompt_len))
+            long_prefill = SchedulerOutput.make_empty()
+            long_prefill.scheduled_new_reqs = [
+                NewRequestData.from_request(
+                    Request(
+                        long_ids[0],
+                        long_tokens,
+                        sampling_params,
+                        None,
+                    ),
+                    block_ids=tuple(_alloc_blocks(n) for n in long_block_counts),
+                    prefill_token_ids=long_tokens,
+                )
+            ]
+            long_prefill.num_scheduled_tokens = {long_ids[0]: long_prompt_len}
+            long_prefill.total_num_scheduled_tokens = long_prompt_len
+            worker_execute_model(long_prefill)
+            worker_sample_tokens(None)
+            long_cleanup = SchedulerOutput.make_empty()
+            long_cleanup.finished_req_ids = set(long_ids)
+            worker_execute_model(long_cleanup)
     if model_runner.speculator is not None:
         # Reset state for drafters that learn across requests.
         model_runner.speculator.reset_state()

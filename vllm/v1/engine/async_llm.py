@@ -4,7 +4,8 @@ import asyncio
 import os
 import socket
 import time
-from collections.abc import AsyncGenerator, Iterable, Mapping
+import weakref
+from collections.abc import AsyncGenerator, Awaitable, Iterable, Mapping
 from copy import copy
 from typing import Any
 
@@ -56,7 +57,7 @@ from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import CheckpointState, EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
-from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.v1.engine.core_client import AsyncMPClient, EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import (
@@ -440,6 +441,9 @@ class AsyncLLM(EngineClient):
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
+            and not getattr(
+                self.vllm_config.cache_config, "kv_sharing_fast_prefill_auto", False
+            )
             and not is_pooling
             and params.prompt_logprobs
         ):
@@ -498,7 +502,11 @@ class AsyncLLM(EngineClient):
                     request_id,
                     prompt,
                     params,
-                    supported_tasks=await self.get_supported_tasks(),
+                    supported_tasks=(
+                        self._supported_tasks
+                        if hasattr(self, "_supported_tasks")
+                        else await self.get_supported_tasks()
+                    ),
                     arrival_time=arrival_time,
                     lora_request=lora_request,
                     tokenization_kwargs=tokenization_kwargs,
@@ -515,7 +523,11 @@ class AsyncLLM(EngineClient):
                     request_id,
                     prompt,
                     params,
-                    supported_tasks=await self.get_supported_tasks(),
+                    supported_tasks=(
+                        self._supported_tasks
+                        if hasattr(self, "_supported_tasks")
+                        else await self.get_supported_tasks()
+                    ),
                     arrival_time=arrival_time,
                     lora_request=lora_request,
                     tokenization_kwargs=tokenization_kwargs,
@@ -618,7 +630,11 @@ class AsyncLLM(EngineClient):
         self._validate_streaming_input_sampling_params(sampling_params)
 
         inputs = dict(
-            supported_tasks=await self.get_supported_tasks(),
+            supported_tasks=(
+                self._supported_tasks
+                if hasattr(self, "_supported_tasks")
+                else await self.get_supported_tasks()
+            ),
             arrival_time=arrival_time,
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
@@ -875,6 +891,7 @@ class AsyncLLM(EngineClient):
         # Ensure that the task doesn't have a circular ref back to the AsyncLLM
         # object, or else it won't be garbage collected and cleaned up properly.
         engine_core = self.engine_core
+        engine_core_ref = weakref.ref(engine_core)
         output_processor = self.output_processor
         log_stats = self.log_stats
         # We use a mutable list for logger_manager so that it can be updated
@@ -887,75 +904,188 @@ class AsyncLLM(EngineClient):
         mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
 
+        def _finish_outputs(
+            outputs: Any,
+            iteration_stats: IterationStats | None,
+            pending_aborts: list[list[str]] | None,
+        ) -> Awaitable[Any] | None:
+            if outputs.scheduler_stats is not None:
+                output_processor.update_scheduler_stats(outputs.scheduler_stats)
+
+            # 4) Logging.
+            # TODO(rob): make into a coroutine and launch it in
+            # background thread once Prometheus overhead is non-trivial.
+            if logger_ref[0]:
+                logger_ref[0].record(
+                    engine_idx=outputs.engine_index,
+                    scheduler_stats=outputs.scheduler_stats,
+                    iteration_stats=iteration_stats,
+                    mm_cache_stats=renderer.stat_mm_cache(),
+                )
+
+            if not pending_aborts:
+                return None
+
+            ec = engine_core_ref()
+            if ec is None:
+                return None
+            pending_coros: list[Awaitable[Any]] | None = None
+            fast_abort = getattr(ec, "_try_abort_requests", None)
+            for reqs in pending_aborts:
+                fut = (
+                    fast_abort(reqs)
+                    if fast_abort is not None
+                    else ec.abort_requests_async(reqs)
+                )
+                if fut is not None:
+                    if pending_coros is None:
+                        pending_coros = [fut]
+                    else:
+                        pending_coros.append(fut)
+            if pending_coros is None:
+                return None
+
+            async def _await_aborts() -> None:
+                for fut in pending_coros:
+                    await fut
+
+            return _await_aborts()
+
+        async def _handle_outputs_chunked(
+            outputs: Any,
+            iteration_stats: IterationStats | None,
+            num_outputs: int,
+        ) -> None:
+            engine_core_outputs = outputs.outputs
+            for start in range(0, num_outputs, chunk_size):
+                end = start + chunk_size
+                outputs_slice = engine_core_outputs[start:end]
+                if mm_processor_cache is not None:
+                    missing_hashes: list[str] | None = None
+                    for eco in outputs_slice:
+                        if eco.mm_cache_miss_hashes:
+                            if missing_hashes is None:
+                                missing_hashes = list(eco.mm_cache_miss_hashes)
+                            else:
+                                missing_hashes.extend(eco.mm_cache_miss_hashes)
+                    if missing_hashes:
+                        # Mark before publishing errors so even queued
+                        # renders invalidate before their next cache lookup.
+                        renderer.queue_mm_cache_invalidations(missing_hashes)
+
+                # 2) Process EngineCoreOutputs.
+                processed_outputs = output_processor.process_outputs(
+                    outputs_slice,
+                    outputs.timestamp,
+                    iteration_stats,
+                    weight_version=outputs.weight_version,
+                )
+                # NOTE: RequestOutputs are pushed to their queues.
+                assert not processed_outputs.request_outputs
+
+                # Allow other asyncio tasks to run between chunks
+                if end < num_outputs:
+                    await asyncio.sleep(0)
+
+                # 3) Abort any reqs that finished due to stop strings.
+                if processed_outputs.reqs_to_abort:
+                    ec = engine_core_ref()
+                    if ec is not None:
+                        fast_abort = getattr(ec, "_try_abort_requests", None)
+                        fut = (
+                            fast_abort(processed_outputs.reqs_to_abort)
+                            if fast_abort is not None
+                            else ec.abort_requests_async(
+                                processed_outputs.reqs_to_abort
+                            )
+                        )
+                        if fut is not None:
+                            await fut
+
+            fin = _finish_outputs(outputs, iteration_stats, None)
+            if fin is not None:
+                await fin
+
+        def _handle_outputs(outputs: Any) -> Awaitable[Any] | None:
+            engine_core_outputs = outputs.outputs
+            num_outputs = len(engine_core_outputs)
+            iteration_stats = (
+                IterationStats() if (log_stats and num_outputs) else None
+            )
+
+            if num_outputs > chunk_size:
+                return _handle_outputs_chunked(outputs, iteration_stats, num_outputs)
+
+            pending_aborts: list[list[str]] | None = None
+            if num_outputs:
+                if mm_processor_cache is not None:
+                    missing_hashes: list[str] | None = None
+                    for eco in engine_core_outputs:
+                        if eco.mm_cache_miss_hashes:
+                            if missing_hashes is None:
+                                missing_hashes = list(eco.mm_cache_miss_hashes)
+                            else:
+                                missing_hashes.extend(eco.mm_cache_miss_hashes)
+                    if missing_hashes:
+                        renderer.queue_mm_cache_invalidations(missing_hashes)
+
+                processed_outputs = output_processor.process_outputs(
+                    engine_core_outputs,
+                    outputs.timestamp,
+                    iteration_stats,
+                    weight_version=outputs.weight_version,
+                )
+                assert not processed_outputs.request_outputs
+                if processed_outputs.reqs_to_abort:
+                    pending_aborts = [processed_outputs.reqs_to_abort]
+
+            return _finish_outputs(outputs, iteration_stats, pending_aborts)
+
+        def _handle_error(e: Exception, from_cancel: bool = False) -> None:
+            if from_cancel:
+                output_processor.propagate_error(e)
+                return
+            if get_elastic_ep_rank_retired() and isinstance(e, EngineDeadError):
+                logger.info(
+                    "[Elastic EP] Retired rank stopped receiving EngineCore outputs"
+                )
+                output_processor.propagate_error(e)
+                return
+            logger.exception("AsyncLLM output_handler failed.")
+            output_processor.propagate_error(e)
+
+        if (
+            isinstance(engine_core, AsyncMPClient)
+            and type(engine_core).get_output_async is AsyncMPClient.get_output_async
+            and "get_output_async" not in engine_core.__dict__
+        ):
+            engine_core.set_output_handlers(_handle_outputs, _handle_error)
+            engine_core._ensure_output_queue_task()
+            oq = engine_core.outputs_queue
+            if oq is not None and not oq.empty():
+                while not oq.empty():
+                    item = oq.get_nowait()
+                    if isinstance(item, Exception):
+                        _handle_error(
+                            engine_core._format_exception(item), from_cancel=False
+                        )
+                        break
+                    res = _handle_outputs(item)
+                    if res is not None:
+                        asyncio.create_task(res)
+            self.output_handler = engine_core.resources.output_queue_task
+            return
+
         async def output_handler():
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
-                    num_outputs = len(outputs.outputs)
-
-                    iteration_stats = (
-                        IterationStats() if (log_stats and num_outputs) else None
-                    )
-
-                    # Split outputs into chunks of at most
-                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
-                    # event loop for too long.
-                    engine_core_outputs = outputs.outputs
-                    for start in range(0, num_outputs, chunk_size):
-                        end = start + chunk_size
-                        outputs_slice = engine_core_outputs[start:end]
-                        if mm_processor_cache is not None:
-                            missing_hashes = [
-                                mm_hash
-                                for eco in outputs_slice
-                                for mm_hash in eco.mm_cache_miss_hashes or ()
-                            ]
-                            # Mark before publishing errors so even queued
-                            # renders invalidate before their next cache lookup.
-                            renderer.queue_mm_cache_invalidations(missing_hashes)
-
-                        # 2) Process EngineCoreOutputs.
-                        processed_outputs = output_processor.process_outputs(
-                            outputs_slice,
-                            outputs.timestamp,
-                            iteration_stats,
-                            weight_version=outputs.weight_version,
-                        )
-                        # NOTE: RequestOutputs are pushed to their queues.
-                        assert not processed_outputs.request_outputs
-
-                        # Allow other asyncio tasks to run between chunks
-                        if end < num_outputs:
-                            await asyncio.sleep(0)
-
-                        # 3) Abort any reqs that finished due to stop strings.
-                        if processed_outputs.reqs_to_abort:
-                            await engine_core.abort_requests_async(
-                                processed_outputs.reqs_to_abort
-                            )
-
-                    output_processor.update_scheduler_stats(outputs.scheduler_stats)
-
-                    # 4) Logging.
-                    # TODO(rob): make into a coroutine and launch it in
-                    # background thread once Prometheus overhead is non-trivial.
-                    if logger_ref[0]:
-                        logger_ref[0].record(
-                            engine_idx=outputs.engine_index,
-                            scheduler_stats=outputs.scheduler_stats,
-                            iteration_stats=iteration_stats,
-                            mm_cache_stats=renderer.stat_mm_cache(),
-                        )
+                    res = _handle_outputs(outputs)
+                    if res is not None:
+                        await res
             except Exception as e:
-                if get_elastic_ep_rank_retired() and isinstance(e, EngineDeadError):
-                    logger.info(
-                        "[Elastic EP] Retired rank stopped receiving EngineCore outputs"
-                    )
-                    output_processor.propagate_error(e)
-                    return
-                logger.exception("AsyncLLM output_handler failed.")
-                output_processor.propagate_error(e)
+                _handle_error(e, from_cancel=False)
 
         self.output_handler = asyncio.create_task(output_handler())
 

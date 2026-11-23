@@ -9,6 +9,7 @@ from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import Any, Final, cast
 
+import orjson
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -74,6 +75,130 @@ from vllm.utils.serial_utils import numpy2base64
 
 logger = init_logger(__name__)
 
+_SIMPLE_DELTA_FIELDS: Final = frozenset(("role", "content", "reasoning"))
+_SSE_DONE_BYTES = b"data: [DONE]\n\n"
+
+
+def _fast_chat_stream_json(
+    *,
+    request_id: str,
+    chunk_object_type: str,
+    created_time: int,
+    model_name: str,
+    choice_dict: dict[str, Any],
+    kv_transfer_params: dict[str, Any] | None = None,
+    has_kv_transfer_params: bool = False,
+    system_fingerprint: str | None = None,
+    prompt_token_ids: list[int] | None = None,
+    has_prompt_token_ids: bool = False,
+    prompt_text: str | None = None,
+    has_prompt_text: bool = False,
+    _sse_bytes: bool = False,
+    _sse_wrap: bool = False,
+) -> str | bytes:
+    payload: dict[str, Any] = {
+        "id": request_id,
+        "object": chunk_object_type,
+        "created": created_time,
+        "choices": [choice_dict],
+        "model": model_name,
+    }
+    if has_kv_transfer_params:
+        payload["kv_transfer_params"] = kv_transfer_params
+    if system_fingerprint is not None:
+        payload["system_fingerprint"] = system_fingerprint
+    if has_prompt_token_ids:
+        payload["prompt_token_ids"] = prompt_token_ids
+    if has_prompt_text:
+        payload["prompt_text"] = prompt_text
+    raw = orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
+    if _sse_bytes:
+        return b"data: " + raw + b"\n\n"
+    raw_str = raw.decode("utf-8")
+    return f"data: {raw_str}\n\n" if _sse_wrap else raw_str
+
+
+def _build_simple_chat_sse_bytes_tpl(
+    *,
+    request_id: str,
+    chunk_object_type: str,
+    created_time: int,
+    model_name: str,
+    choice_index: int,
+    delta_field: str,
+) -> tuple[bytes, bytes]:
+    p1 = orjson.dumps(
+        {
+            "id": request_id,
+            "object": chunk_object_type,
+            "created": created_time,
+        },
+        option=orjson.OPT_SERIALIZE_NUMPY,
+    )[:-1]
+    p2 = (
+        f',"choices":[{{"index":{choice_index},"delta":{{"{delta_field}":'
+    ).encode("utf-8")
+    p3 = b'},"logprobs":null,"finish_reason":null,"token_ids":null}],'
+    p4 = orjson.dumps(
+        {"model": model_name, "kv_transfer_params": None},
+        option=orjson.OPT_SERIALIZE_NUMPY,
+    )[1:]
+    return b"data: " + p1 + p2, p3 + p4 + b"\n\n"
+
+
+def _format_simple_chat_sse(
+    tpl_cache: dict[tuple[int, str], tuple[bytes, bytes, str, str]],
+    *,
+    request_id: str,
+    chunk_object_type: str,
+    created_time: int,
+    model_name: str,
+    choice_index: int,
+    delta_field: str,
+    value: Any,
+    sse_bytes: bool,
+    sse_wrap: bool = False,
+) -> str | bytes:
+    """Format a simple decode delta chunk via cached JSON prefix/suffix."""
+    key = (choice_index, delta_field)
+    tpl = tpl_cache.get(key)
+    if tpl is None:
+        prefix_b, suffix_b = _build_simple_chat_sse_bytes_tpl(
+            request_id=request_id,
+            chunk_object_type=chunk_object_type,
+            created_time=created_time,
+            model_name=model_name,
+            choice_index=choice_index,
+            delta_field=delta_field,
+        )
+        prefix_s = prefix_b[6:].decode("utf-8")
+        suffix_s = suffix_b[:-2].decode("utf-8")
+        tpl = (prefix_b, suffix_b, prefix_s, suffix_s)
+        tpl_cache[key] = tpl
+    val_bytes = (
+        orjson.dumps(value)
+        if type(value) is str
+        else orjson.dumps(value, option=orjson.OPT_SERIALIZE_NUMPY)
+    )
+    if sse_bytes:
+        return tpl[0] + val_bytes + tpl[1]
+    frame_str = f"{tpl[2]}{val_bytes.decode('utf-8')}{tpl[3]}"
+    return f"data: {frame_str}\n\n" if sse_wrap else frame_str
+
+
+def _format_chat_sse_item(
+    chunk: ChatCompletionStreamResponse | ErrorResponse,
+    sse_bytes: bool,
+) -> str | bytes:
+    if isinstance(chunk, ErrorResponse):
+        data = chunk.model_dump_json()
+    else:
+        data = chunk.model_dump_json(
+            exclude_unset=True, exclude_none=not chunk.choices
+        )
+    frame = f"data: {data}\n\n"
+    return frame.encode("utf-8") if sse_bytes else frame
+
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
     """Sum per-modality placeholder tokens from ``mm_placeholders``.
@@ -107,7 +232,7 @@ def _make_prompt_tokens_details(
         and not mm_token_counts
     ):
         return None
-    return PromptTokenUsageInfo(
+    return PromptTokenUsageInfo.model_construct(
         cached_tokens=num_cached_tokens,
         created_cache_tokens=num_cache_creation_tokens,
         multimodal_tokens=mm_token_counts or None,
@@ -117,7 +242,9 @@ def _make_prompt_tokens_details(
 def _make_completion_tokens_details(
     reasoning_tokens: int,
 ) -> CompletionTokenUsageInfo:
-    return CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
+    return CompletionTokenUsageInfo.model_construct(
+        reasoning_tokens=reasoning_tokens
+    )
 
 
 class OpenAIServingChat(GenerateBaseServing):
@@ -264,6 +391,8 @@ class OpenAIServingChat(GenerateBaseServing):
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
+        *,
+        _build_conversation: bool = True,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """Validate the model and preprocess a chat completion request.
 
@@ -282,13 +411,30 @@ class OpenAIServingChat(GenerateBaseServing):
 
         self._preflight(request.n or 1)
 
-        return await self.online_renderer.render_chat(request)
+        online_renderer = self.online_renderer
+        if (
+            not _build_conversation
+            and type(online_renderer).render_chat is OnlineRenderer.render_chat
+            and "render_chat" not in online_renderer.__dict__
+        ):
+            return await online_renderer.render_chat(
+                request, _build_conversation=False
+            )
+        return await online_renderer.render_chat(request)
 
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        *,
+        _yield_bytes: bool = False,
+        _raw_json: bool = False,
+    ) -> (
+        AsyncGenerator[str | bytes, None]
+        | ChatCompletionResponse
+        | ErrorResponse
+        | bytes
+    ):
         """Chat Completion API similar to OpenAI's API.
 
         See https://platform.openai.com/docs/api-reference/chat/create
@@ -296,22 +442,48 @@ class OpenAIServingChat(GenerateBaseServing):
         Chat Completion API.
         """
         return await self._with_kv_transfer_rejection_cleanup(
-            self._create_chat_completion(request, raw_request), request, raw_request
+            self._create_chat_completion(
+                request,
+                raw_request,
+                _yield_bytes=_yield_bytes,
+                _raw_json=_raw_json,
+            ),
+            request,
+            raw_request,
         )
 
     async def _create_chat_completion(
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
-    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        *,
+        _yield_bytes: bool = False,
+        _raw_json: bool = False,
+    ) -> (
+        AsyncGenerator[str | bytes, None]
+        | ChatCompletionResponse
+        | ErrorResponse
+        | bytes
+    ):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
-        chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        chat_template_kwargs: dict[str, Any] | None = None
         parser: Parser | None = None
         if self.parser_cls is not None:
+            chat_template_kwargs = self._effective_chat_template_kwargs(request)
             parser = self._make_parser(request, tokenizer, chat_template_kwargs)
-        result = await self.render_chat_request(request)
+        if (
+            not request.echo
+            and type(self).render_chat_request
+            is OpenAIServingChat.render_chat_request
+            and "render_chat_request" not in self.__dict__
+        ):
+            result = await self.render_chat_request(
+                request, _build_conversation=False
+            )
+        else:
+            result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
@@ -321,7 +493,7 @@ class OpenAIServingChat(GenerateBaseServing):
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
 
-        request_metadata = RequestResponseMetadata(request_id=request_id)
+        request_metadata = RequestResponseMetadata.model_construct(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
@@ -350,7 +522,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 max_model_len,
                 request.max_completion_tokens
                 if request.max_completion_tokens is not None
-                else request.max_tokens,
+                else request._raw_max_tokens(),
                 self._extract_prompt_len(engine_input),
                 self.default_sampling_params,
                 self.override_max_tokens,
@@ -423,6 +595,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 request_metadata,
                 chat_template_kwargs=chat_template_kwargs,
                 mm_token_counts=mm_token_counts,
+                _yield_bytes=_yield_bytes,
             )
 
         return await self.chat_completion_full_generator(
@@ -435,6 +608,7 @@ class OpenAIServingChat(GenerateBaseServing):
             request_metadata,
             parser=parser,
             mm_token_counts=mm_token_counts,
+            _raw_json=_raw_json,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -451,7 +625,11 @@ class OpenAIServingChat(GenerateBaseServing):
         ``assemble_chat_message_fields``. The default returns a plain
         `ChatMessage`.
         """
-        return ChatMessage(*args, **kwargs)
+        return (
+            ChatMessage.model_construct(**kwargs)
+            if not args
+            else ChatMessage(*args, **kwargs)
+        )
 
     def _finalize_response_message(
         self,
@@ -469,7 +647,7 @@ class OpenAIServingChat(GenerateBaseServing):
         """
         return message
 
-    async def chat_completion_stream_generator(
+    def chat_completion_stream_generator(
         self,
         request: ChatCompletionRequest,
         result_generator: AsyncIterator[RequestOutput],
@@ -480,31 +658,23 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         chat_template_kwargs: dict[str, Any] | None = None,
         mm_token_counts: dict[str, int] | None = None,
-    ) -> AsyncGenerator[str, None]:
-        try:
-            async for chunk in self.chat_completion_stream_generator_raw(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                conversation,
-                tokenizer,
-                request_metadata,
-                chat_template_kwargs=chat_template_kwargs,
-                mm_token_counts=mm_token_counts,
-            ):
-                if isinstance(chunk, ErrorResponse):
-                    data = chunk.model_dump_json()
-                else:
-                    data = chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=not chunk.choices
-                    )
-                yield f"data: {data}\n\n"
-        except Exception as e:
-            logger.exception("Error serializing chat completion stream.")
-            data = self.create_streaming_error_response(e)
-            yield f"data: {data}\n\n"
-        yield "data: [DONE]\n\n"
+        *,
+        _yield_bytes: bool = False,
+    ) -> AsyncGenerator[str | bytes, None]:
+        return self._iter_chat_stream(  # type: ignore[return-value]
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+            chat_template_kwargs=chat_template_kwargs,
+            mm_token_counts=mm_token_counts,
+            serialize_sse=True,
+            _sse_bytes=_yield_bytes,
+            _wrap_sse=True,
+        )
 
     async def chat_completion_stream_generator_raw(
         self,
@@ -519,12 +689,57 @@ class OpenAIServingChat(GenerateBaseServing):
         mm_token_counts: dict[str, int] | None = None,
     ) -> AsyncGenerator[ChatCompletionStreamResponse | ErrorResponse, None]:
         """Yield chat chunks or errors without serializing them into SSE frames."""
+        async for chunk in self._iter_chat_stream(
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+            chat_template_kwargs=chat_template_kwargs,
+            mm_token_counts=mm_token_counts,
+            serialize_sse=False,
+        ):
+            assert not isinstance(chunk, str)
+            yield chunk
+
+    async def _iter_chat_stream(
+        self,
+        request: ChatCompletionRequest,
+        result_generator: AsyncIterator[RequestOutput],
+        request_id: str,
+        model_name: str,
+        conversation: list[ConversationMessage],
+        tokenizer: TokenizerLike,
+        request_metadata: RequestResponseMetadata,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        mm_token_counts: dict[str, int] | None = None,
+        *,
+        serialize_sse: bool = False,
+        _sse_bytes: bool = False,
+        _wrap_sse: bool = False,
+    ) -> AsyncGenerator[ChatCompletionStreamResponse | ErrorResponse | str | bytes, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        sse_tpls: dict[tuple[int, str], tuple[bytes, bytes, str, str]] = {}
+        wrap_str = _wrap_sse and not _sse_bytes
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
+        fast_simple_sse_0 = (
+            serialize_sse
+            and _sse_bytes
+            and self.parser_cls is None
+            and num_choices == 1
+            and not request.return_token_ids
+            and not request.return_weight_versions
+            and not (self.enable_log_outputs and self.request_logger)
+        )
+        simple_prefix_0_b: bytes | None = None
+        simple_suffix_0_b: bytes | None = None
+        orjson_dumps = orjson.dumps
         # TODO: Remove once all reasoning parsers use the Parser Engine.
         generated_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
         previous_reasoning_tokens = [0] * num_choices
@@ -562,7 +777,12 @@ class OpenAIServingChat(GenerateBaseServing):
                 ]
         except Exception as e:
             logger.exception("Error in parser creation.")
-            yield self.create_error_response(e)
+            err = self.create_error_response(e)
+            if _wrap_sse:
+                yield _format_chat_sse_item(err, _sse_bytes)
+                yield _SSE_DONE_BYTES if _sse_bytes else "data: [DONE]\n\n"
+            else:
+                yield err
             return
 
         stream_options = request.stream_options
@@ -571,9 +791,54 @@ class OpenAIServingChat(GenerateBaseServing):
         )
 
         last_res: RequestOutput | None = None
+        fast_mid_sse_0 = (
+            fast_simple_sse_0
+            and not include_continuous_usage
+            and not request.logprobs
+        )
+        fast_mid_toks_0 = 0
         try:
             async for res in result_generator:
                 last_res = res
+                if (
+                    fast_mid_sse_0
+                    and not first_iteration
+                    and simple_prefix_0_b is not None
+                    and not finish_reason_sent[0]
+                ):
+                    res_outputs = res.outputs
+                    if len(res_outputs) == 1:
+                        out = res_outputs[0]
+                        if (
+                            out.finish_reason is None
+                            and out.stop_reason is None
+                            and out.index == 0
+                        ):
+                            d_text = out.text
+                            d_toks = out.token_ids
+                            fast_mid_toks_0 += len(d_toks)
+                            if (
+                                d_text
+                                or d_toks
+                                or fast_mid_toks_0
+                                or processors[0].num_output_tokens
+                            ):
+                                val_b = (
+                                    orjson_dumps(d_text)
+                                    if type(d_text) is str
+                                    else orjson_dumps(
+                                        d_text, option=orjson.OPT_SERIALIZE_NUMPY
+                                    )
+                                )
+                                yield (
+                                    simple_prefix_0_b  # type: ignore[operator]
+                                    + val_b
+                                    + simple_suffix_0_b  # type: ignore[operator]
+                                )
+                            continue
+                    if fast_mid_toks_0:
+                        processors[0].num_output_tokens += fast_mid_toks_0
+                        fast_mid_toks_0 = 0
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -595,6 +860,30 @@ class OpenAIServingChat(GenerateBaseServing):
                     # NOTE num_choices defaults to 1 so this usually executes
                     # once per request
                     for i in range(num_choices):
+                        if serialize_sse and not include_continuous_usage:
+                            yield _fast_chat_stream_json(
+                                request_id=request_id,
+                                chunk_object_type=chunk_object_type,
+                                created_time=created_time,
+                                model_name=model_name,
+                                choice_dict={
+                                    "index": i,
+                                    "delta": {"role": role, "content": ""},
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                },
+                                prompt_token_ids=(
+                                    res.prompt_token_ids
+                                    if request.return_token_ids
+                                    else None
+                                ),
+                                has_prompt_token_ids=True,
+                                prompt_text=prompt_text,
+                                has_prompt_text=True,
+                                _sse_bytes=_sse_bytes,
+                                _sse_wrap=wrap_str,
+                            )
+                            continue
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=DeltaMessage(
@@ -622,7 +911,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
                         # if continuous usage stats are requested, add it
                         if include_continuous_usage:
-                            chunk.usage = UsageInfo(
+                            chunk.usage = UsageInfo.model_construct(
                                 prompt_tokens=num_prompt_tokens,
                                 completion_tokens=0,
                                 total_tokens=num_prompt_tokens,
@@ -641,7 +930,11 @@ class OpenAIServingChat(GenerateBaseServing):
                                 ),
                             )
 
-                        yield chunk
+                        yield (
+                            _format_chat_sse_item(chunk, _sse_bytes)
+                            if _wrap_sse
+                            else chunk
+                        )
 
                     # Send response to echo the input portion of the
                     # last message
@@ -670,7 +963,7 @@ class OpenAIServingChat(GenerateBaseServing):
                                     model=model_name,
                                 )
                                 if include_continuous_usage:
-                                    chunk.usage = UsageInfo(
+                                    chunk.usage = UsageInfo.model_construct(
                                         prompt_tokens=num_prompt_tokens,
                                         completion_tokens=0,
                                         total_tokens=num_prompt_tokens,
@@ -681,7 +974,11 @@ class OpenAIServingChat(GenerateBaseServing):
                                         ),
                                     )
 
-                                yield chunk
+                                yield (
+                                    _format_chat_sse_item(chunk, _sse_bytes)
+                                    if _wrap_sse
+                                    else chunk
+                                )
                     first_iteration = False
 
                 for output in res.outputs:
@@ -717,6 +1014,135 @@ class OpenAIServingChat(GenerateBaseServing):
                         # Chunked prefill case, don't return empty chunks
                         continue
 
+                    include_token_ids = (
+                        request.return_token_ids and not processor.hide_metadata
+                    )
+                    if (
+                        serialize_sse
+                        and parser is None
+                        and logprobs is None
+                        and not include_continuous_usage
+                        and not request.return_weight_versions
+                    ):
+                        processor.num_output_tokens += len(output.token_ids)
+                        if output.finish_reason is not None:
+                            finish_reason = resolve_finish_reason(
+                                output.finish_reason,
+                                request,
+                                processor.tools_streamed,
+                            )
+                            finish_reason_sent[i] = True
+                        else:
+                            finish_reason = None
+
+                        if (
+                            self.enable_log_outputs
+                            and self.request_logger
+                        ):
+                            previous_texts[i] += delta_text
+                            if delta_text and self.enable_log_deltas:
+                                self.request_logger.log_outputs(
+                                    request_id=request_id,
+                                    outputs=delta_text,
+                                    output_token_ids=as_list(output.token_ids),
+                                    finish_reason=output.finish_reason,
+                                    is_streaming=True,
+                                    delta=True,
+                                )
+
+                        if (
+                            output.finish_reason is None
+                            and not include_token_ids
+                            and not finish_reason_sent[i]
+                        ):
+                            if fast_simple_sse_0:
+                                if simple_prefix_0_b is None:
+                                    simple_prefix_0_b, simple_suffix_0_b = (
+                                        _build_simple_chat_sse_bytes_tpl(
+                                            request_id=request_id,
+                                            chunk_object_type=chunk_object_type,
+                                            created_time=created_time,
+                                            model_name=model_name,
+                                            choice_index=0,
+                                            delta_field="content",
+                                        )
+                                    )
+                                val_b = (
+                                    orjson_dumps(delta_text)
+                                    if type(delta_text) is str
+                                    else orjson_dumps(
+                                        delta_text, option=orjson.OPT_SERIALIZE_NUMPY
+                                    )
+                                )
+                                yield simple_prefix_0_b + val_b + simple_suffix_0_b
+                                continue
+                            yield _format_simple_chat_sse(
+                                sse_tpls,
+                                request_id=request_id,
+                                chunk_object_type=chunk_object_type,
+                                created_time=created_time,
+                                model_name=model_name,
+                                choice_index=i,
+                                delta_field="content",
+                                value=delta_text,
+                                sse_bytes=_sse_bytes,
+                                sse_wrap=wrap_str,
+                            )
+                            continue
+                        if (
+                            not delta_text
+                            and not output.token_ids
+                            and not processor.num_output_tokens
+                        ):
+                            d_dict: dict[str, Any] = {}
+                        else:
+                            d_dict = {"content": delta_text}
+                        tok_ids = (
+                            as_list(output.token_ids) if include_token_ids else None
+                        )
+                        if output.finish_reason is None:
+                            choice_dict: dict[str, Any] = {
+                                "index": i,
+                                "delta": d_dict,
+                                "logprobs": None,
+                                "finish_reason": None,
+                                "token_ids": tok_ids,
+                            }
+                        else:
+                            choice_dict = {
+                                "index": i,
+                                "delta": d_dict,
+                                "logprobs": None,
+                                "finish_reason": finish_reason,
+                                "stop_reason": output.stop_reason,
+                                "token_ids": tok_ids,
+                                "weight_versions": None,
+                            }
+                        stamp_fp = (
+                            self.system_fingerprint
+                            if (
+                                not include_usage
+                                and self.system_fingerprint is not None
+                                and finish_reason is not None
+                            )
+                            else None
+                        )
+                        yield _fast_chat_stream_json(
+                            request_id=request_id,
+                            chunk_object_type=chunk_object_type,
+                            created_time=created_time,
+                            model_name=model_name,
+                            choice_dict=choice_dict,
+                            kv_transfer_params=(
+                                res.kv_transfer_params if finish_reason_sent[i] else None
+                            ),
+                            has_kv_transfer_params=True,
+                            system_fingerprint=stamp_fp,
+                            _sse_bytes=_sse_bytes,
+                            _sse_wrap=wrap_str,
+                        )
+                        continue
+
                     delta_message, finish_reason = processor.step(
                         delta_text,
                         as_list(output.token_ids),
@@ -724,7 +1150,8 @@ class OpenAIServingChat(GenerateBaseServing):
                         res.prompt_token_ids,
                     )
 
-                    previous_texts[i] += delta_text
+                    if self.enable_log_outputs and self.request_logger:
+                        previous_texts[i] += delta_text
 
                     if parser is not None and self._include_reasoning_tokens_details:
                         generated_token_ids[i].extend(output.token_ids)
@@ -786,6 +1213,87 @@ class OpenAIServingChat(GenerateBaseServing):
                     include_token_ids = (
                         request.return_token_ids and not hide_stream_metadata
                     )
+                    d_set = delta_message.__pydantic_fields_set__
+                    if (
+                        serialize_sse
+                        and logprobs is None
+                        and not include_continuous_usage
+                        and not request.return_weight_versions
+                        and not delta_message.model_extra
+                        and not delta_message.tool_calls
+                        and not (d_set - _SIMPLE_DELTA_FIELDS)
+                    ):
+                        if (
+                            output.finish_reason is None
+                            and not include_token_ids
+                            and not finish_reason_sent[i]
+                            and len(d_set) == 1
+                        ):
+                            delta_field = next(iter(d_set))
+                            yield _format_simple_chat_sse(
+                                sse_tpls,
+                                request_id=request_id,
+                                chunk_object_type=chunk_object_type,
+                                created_time=created_time,
+                                model_name=model_name,
+                                choice_index=i,
+                                delta_field=delta_field,
+                                value=getattr(delta_message, delta_field),
+                                sse_bytes=_sse_bytes,
+                                sse_wrap=wrap_str,
+                            )
+                            continue
+                        d_dict = {
+                            k: getattr(delta_message, k)
+                            for k in _SIMPLE_DELTA_FIELDS
+                            if k in d_set
+                        }
+                        tok_ids = (
+                            as_list(output.token_ids) if include_token_ids else None
+                        )
+                        if output.finish_reason is None:
+                            choice_dict: dict[str, Any] = {
+                                "index": i,
+                                "delta": d_dict,
+                                "logprobs": None,
+                                "finish_reason": None,
+                                "token_ids": tok_ids,
+                            }
+                        else:
+                            finish_reason_sent[i] = True
+                            choice_dict = {
+                                "index": i,
+                                "delta": d_dict,
+                                "logprobs": None,
+                                "finish_reason": finish_reason,
+                                "stop_reason": output.stop_reason,
+                                "token_ids": tok_ids,
+                                "weight_versions": None,
+                            }
+                        stamp_fp = (
+                            self.system_fingerprint
+                            if (
+                                not include_usage
+                                and self.system_fingerprint is not None
+                                and choice_dict["finish_reason"] is not None
+                            )
+                            else None
+                        )
+                        yield _fast_chat_stream_json(
+                            request_id=request_id,
+                            chunk_object_type=chunk_object_type,
+                            created_time=created_time,
+                            model_name=model_name,
+                            choice_dict=choice_dict,
+                            kv_transfer_params=(
+                                res.kv_transfer_params if finish_reason_sent[i] else None
+                            ),
+                            has_kv_transfer_params=True,
+                            system_fingerprint=stamp_fp,
+                            _sse_bytes=_sse_bytes,
+                            _sse_wrap=wrap_str,
+                        )
+                        continue
 
                     if output.finish_reason is None:
                         # Send token-by-token response for each request.n
@@ -844,7 +1352,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     # handle usage stats if requested & if continuous
                     if include_continuous_usage:
                         completion_tokens = processor.num_output_tokens
-                        chunk.usage = UsageInfo(
+                        chunk.usage = UsageInfo.model_construct(
                             prompt_tokens=num_prompt_tokens,
                             completion_tokens=completion_tokens,
                             total_tokens=num_prompt_tokens + completion_tokens,
@@ -857,7 +1365,15 @@ class OpenAIServingChat(GenerateBaseServing):
                             ),
                         )
 
-                    yield chunk
+                    yield (
+                        _format_chat_sse_item(chunk, _sse_bytes)
+                        if _wrap_sse
+                        else chunk
+                    )
+
+            if fast_mid_toks_0:
+                processors[0].num_output_tokens += fast_mid_toks_0
+                fast_mid_toks_0 = 0
 
             if self._include_reasoning_tokens_details and not include_continuous_usage:
                 for i, processor in enumerate(processors):
@@ -871,7 +1387,7 @@ class OpenAIServingChat(GenerateBaseServing):
             # is sent, send the usage
             if include_usage:
                 completion_tokens = sum(p.num_output_tokens for p in processors)
-                final_usage = UsageInfo(
+                final_usage = UsageInfo.model_construct(
                     prompt_tokens=num_prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
@@ -908,7 +1424,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             stream_per_request_metrics = PerRequestMetrics()
                         stream_per_request_metrics.speculative_decoding = spec_stats
 
-                final_usage_chunk = ChatCompletionStreamResponse(
+                final_usage_chunk = ChatCompletionStreamResponse.model_construct(
                     id=request_id,
                     object=chunk_object_type,
                     created=created_time,
@@ -918,11 +1434,15 @@ class OpenAIServingChat(GenerateBaseServing):
                     system_fingerprint=self.system_fingerprint,
                     metrics=stream_per_request_metrics,
                 )
-                yield final_usage_chunk
+                yield (
+                    _format_chat_sse_item(final_usage_chunk, _sse_bytes)
+                    if _wrap_sse
+                    else final_usage_chunk
+                )
 
             # report to FastAPI middleware aggregate usage across all choices
             num_completion_tokens = sum(p.num_output_tokens for p in processors)
-            request_metadata.final_usage_info = UsageInfo(
+            request_metadata.final_usage_info = UsageInfo.model_construct(
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
@@ -953,12 +1473,16 @@ class OpenAIServingChat(GenerateBaseServing):
                     )
 
         except GenerationError as e:
-            yield self.create_error_response(
+            err = self.create_error_response(
                 str(e), err_type="InternalServerError", status_code=e.status_code
             )
+            yield _format_chat_sse_item(err, _sse_bytes) if _wrap_sse else err
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
-            yield self.create_error_response(e)
+            err = self.create_error_response(e)
+            yield _format_chat_sse_item(err, _sse_bytes) if _wrap_sse else err
+        if _wrap_sse:
+            yield _SSE_DONE_BYTES if _sse_bytes else "data: [DONE]\n\n"
 
     async def chat_completion_full_generator(
         self,
@@ -971,7 +1495,9 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         parser: Parser | None = None,
         mm_token_counts: dict[str, int] | None = None,
-    ) -> ErrorResponse | ChatCompletionResponse:
+        *,
+        _raw_json: bool = False,
+    ) -> ErrorResponse | ChatCompletionResponse | bytes:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 
@@ -990,6 +1516,17 @@ class OpenAIServingChat(GenerateBaseServing):
 
         choices: list[ChatCompletionResponseChoice] = []
         total_reasoning_tokens = 0
+        can_raw = (
+            _raw_json
+            and len(final_res.outputs) == 1
+            and not request.logprobs
+            and not request.return_weight_versions
+            and not (self.enable_log_outputs and self.request_logger)
+            and not self.enable_per_request_metrics
+            and not self.enable_prompt_tokens_details
+            and final_res.prompt_logprobs is None
+            and final_res.outputs[0].spec_decode_metrics is None
+        )
 
         role = self.get_chat_request_role(request)
         for i, output in enumerate(final_res.outputs):
@@ -1044,6 +1581,88 @@ class OpenAIServingChat(GenerateBaseServing):
                 enable_auto_tools=self.enable_auto_tools,
                 parser_cls=self.parser_cls,
             )
+            routed_experts_b64 = (
+                numpy2base64(output.routed_experts)
+                if output.routed_experts is not None
+                else None
+            )
+            if can_raw and not fields.tool_calls:
+                msg_content = fields.content
+                if request.echo:
+                    last_msg_content: str | list[dict[str, str]] = ""
+                    if (
+                        conversation
+                        and "content" in conversation[-1]
+                        and conversation[-1].get("role") == role
+                    ):
+                        last_msg_content = conversation[-1]["content"] or ""
+                    if isinstance(last_msg_content, list):
+                        last_msg_content = "\n".join(
+                            msg["text"] for msg in last_msg_content
+                        )
+                    msg_content = last_msg_content + (msg_content or "")
+                assert final_res.prompt_token_ids is not None
+                num_prompt_tokens = len(final_res.prompt_token_ids)
+                if final_res.encoder_prompt_token_ids is not None:
+                    num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
+                num_generated_tokens = len(output.token_ids)
+                payload = {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": output.index,
+                            "message": {
+                                "role": role,
+                                "content": msg_content,
+                                "refusal": None,
+                                "audio": None,
+                                "function_call": None,
+                                "reasoning": fields.reasoning,
+                            },
+                            "logprobs": None,
+                            "finish_reason": resolve_finish_reason(
+                                output.finish_reason, request, False
+                            ),
+                            "stop_reason": output.stop_reason,
+                            "token_ids": (
+                                as_list(output.token_ids)
+                                if request.return_token_ids and not suppress_metadata
+                                else None
+                            ),
+                            "routed_experts": routed_experts_b64,
+                            "weight_versions": None,
+                        }
+                    ],
+                    "service_tier": None,
+                    "system_fingerprint": self.system_fingerprint,
+                    "usage": {
+                        "prompt_tokens": num_prompt_tokens,
+                        "total_tokens": num_prompt_tokens + num_generated_tokens,
+                        "completion_tokens": num_generated_tokens,
+                        "completion_tokens_details": (
+                            {"reasoning_tokens": total_reasoning_tokens}
+                            if self._include_reasoning_tokens_details
+                            else None
+                        ),
+                    },
+                    "prompt_logprobs": None,
+                    "prompt_token_ids": (
+                        final_res.prompt_token_ids
+                        if request.return_token_ids
+                        else None
+                    ),
+                    "prompt_text": (
+                        final_res.prompt if request.return_prompt_text else None
+                    ),
+                    "kv_transfer_params": final_res.kv_transfer_params,
+                    "ec_transfer_params": final_res.ec_transfer_params,
+                    "metrics": None,
+                }
+                return orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
+
             message = self._create_chat_message(
                 role=role,
                 reasoning=fields.reasoning,
@@ -1058,13 +1677,7 @@ class OpenAIServingChat(GenerateBaseServing):
             # metadata cached on the reasoning parser.
             message = self._finalize_response_message(message, parser=parser)
 
-            routed_experts_b64 = (
-                numpy2base64(output.routed_experts)
-                if output.routed_experts is not None
-                else None
-            )
-
-            choice_data = ChatCompletionResponseChoice(
+            choice_data = ChatCompletionResponseChoice.model_construct(
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
@@ -1107,7 +1720,7 @@ class OpenAIServingChat(GenerateBaseServing):
         num_generated_tokens = sum(
             len(output.token_ids) for output in final_res.outputs
         )
-        usage = UsageInfo(
+        usage = UsageInfo.model_construct(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
@@ -1144,7 +1757,7 @@ class OpenAIServingChat(GenerateBaseServing):
         # ``final_res.prompt`` is the rendered chat-templated prompt text
         prompt_text = final_res.prompt if request.return_prompt_text else None
 
-        response = ChatCompletionResponse(
+        response = ChatCompletionResponse.model_construct(
             id=request_id,
             created=created_time,
             model=model_name,

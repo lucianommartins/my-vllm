@@ -10,6 +10,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.worker.gpu.triton_fast_launch import FastTritonLauncher
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
@@ -37,6 +39,170 @@ class InputBuffers:
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+
+        # Preallocated per-step input prep buffers (avoid per-step CUDA/pinned allocs).
+        self.idx_mapping = torch.empty(max_num_reqs, dtype=torch.int64, device=device)
+        self.idx_mapping_i32 = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
+        self.cu_num_logits_arange = torch.arange(
+            max_num_reqs + 1, dtype=torch.int32, device=device
+        )
+        self.cu_num_logits_arange_np = np.arange(max_num_reqs + 1, dtype=np.int32)
+        self.expanded_local_pos_zeros = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.logits_indices_arange = torch.arange(
+            max_num_reqs, dtype=torch.int64, device=device
+        )
+        self.logits_indices = torch.empty(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
+        self._h2d_ring_idx = 0
+        self._q_start_ring_idx = 0
+        self._idx_mapping_cpu = [
+            torch.empty(
+                max_num_reqs, dtype=torch.int64, device="cpu", pin_memory=PIN_MEMORY
+            )
+            for _ in range(4)
+        ]
+        self._idx_mapping_cpu_np = [t.numpy() for t in self._idx_mapping_cpu]
+        self._query_start_loc_cpu = [
+            torch.empty(
+                max_num_reqs + 1, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+            )
+            for _ in range(4)
+        ]
+        self._query_start_loc_cpu_np = [t.numpy() for t in self._query_start_loc_cpu]
+        self._seq_lens_cpu_ub = torch.zeros(max_num_reqs, dtype=torch.int32)
+        self._seq_lens_cpu_ub_np = self._seq_lens_cpu_ub.numpy()
+        self._seq_lens_ub_views: dict[int, tuple[torch.Tensor, np.ndarray]] = {}
+        self._uniform_q_start_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, np.ndarray]
+        ] = {}
+        self._last_uniform_q_start_key: tuple[int, int] | None = None
+        self._last_is_padding_state: tuple[int, int] | None = None
+        self._last_idx_mapping_bytes: bytes | None = None
+        self._last_idx_mapping_np: Any = None
+        self._tok_view_cache: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._req_view_cache: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor],
+        ] = {}
+        self._seq_lens_view_cache: dict[int, torch.Tensor] = {}
+        self._logits_arange_view_cache: dict[int, torch.Tensor] = {}
+
+    def get_tok_views(
+        self, n: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return cached (is_padding[:n], input_ids[:n], positions[:n]) views."""
+        cached = self._tok_view_cache.get(n)
+        if cached is None:
+            cached = (
+                self.is_padding[:n],
+                self.input_ids[:n],
+                self.positions[:n],
+            )
+            if len(self._tok_view_cache) < 256:
+                self._tok_view_cache[n] = cached
+        return cached
+
+    def get_req_views(
+        self, n: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor]:
+        """Return cached per-request buffer slices for length n."""
+        cached = self._req_view_cache.get(n)
+        if cached is None:
+            cached = (
+                self.idx_mapping[:n],
+                self.idx_mapping_i32[:n],
+                self.cu_num_logits_arange[: n + 1],
+                self.cu_num_logits_arange_np[: n + 1],
+                self.expanded_local_pos_zeros[:n],
+            )
+            if len(self._req_view_cache) < 256:
+                self._req_view_cache[n] = cached
+        return cached
+
+    def get_seq_lens_view(self, n: int) -> torch.Tensor:
+        cached = self._seq_lens_view_cache.get(n)
+        if cached is None:
+            cached = self.seq_lens[:n]
+            if len(self._seq_lens_view_cache) < 256:
+                self._seq_lens_view_cache[n] = cached
+        return cached
+
+    def get_logits_arange_view(self, n: int) -> torch.Tensor:
+        cached = self._logits_arange_view_cache.get(n)
+        if cached is None:
+            cached = self.logits_indices_arange[:n]
+            if len(self._logits_arange_view_cache) < 256:
+                self._logits_arange_view_cache[n] = cached
+        return cached
+
+    def get_uniform_decode_query_start_loc(
+        self, num_reqs: int, num_reqs_padded: int
+    ) -> tuple[torch.Tensor, np.ndarray, bool]:
+        """Return cached CPU uniform-decode query_start_loc & whether H2D is needed."""
+        key = (num_reqs, num_reqs_padded)
+        cached = self._uniform_q_start_cache.get(key)
+        if cached is None:
+            t = torch.empty(
+                self.max_num_reqs + 1,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=PIN_MEMORY,
+            )
+            arr = t.numpy()
+            arr[: num_reqs + 1] = np.arange(num_reqs + 1, dtype=np.int32)
+            arr[num_reqs + 1 :] = num_reqs
+            cached = (t, arr[: num_reqs_padded + 1])
+            self._uniform_q_start_cache[key] = cached
+        needs_copy = self._last_uniform_q_start_key != key
+        self._last_uniform_q_start_key = key
+        return cached[0], cached[1], needs_copy
+
+    def next_h2d_slot(
+        self,
+    ) -> tuple[torch.Tensor, np.ndarray, torch.Tensor, np.ndarray]:
+        """Return next pinned H2D staging buffers from a 4-slot ring."""
+        slot = self._h2d_ring_idx
+        self._h2d_ring_idx = (slot + 1) & 3
+        return (
+            self._idx_mapping_cpu[slot],
+            self._idx_mapping_cpu_np[slot],
+            self._query_start_loc_cpu[slot],
+            self._query_start_loc_cpu_np[slot],
+        )
+
+    def next_idx_h2d_slot(self) -> tuple[torch.Tensor, np.ndarray]:
+        """Return next pinned idx_mapping H2D staging buffer from a 4-slot ring."""
+        slot = self._h2d_ring_idx
+        self._h2d_ring_idx = (slot + 1) & 3
+        return self._idx_mapping_cpu[slot], self._idx_mapping_cpu_np[slot]
+
+    def next_qstart_h2d_slot(self) -> tuple[torch.Tensor, np.ndarray]:
+        """Return next pinned query_start_loc H2D staging buffer from a 4-slot ring."""
+        slot = self._q_start_ring_idx
+        self._q_start_ring_idx = (slot + 1) & 3
+        return self._query_start_loc_cpu[slot], self._query_start_loc_cpu_np[slot]
+
+    def seq_lens_ub_buffer(
+        self, num_reqs_padded: int
+    ) -> tuple[torch.Tensor, np.ndarray]:
+        """Return a reusable CPU int32 buffer/numpy view of length num_reqs_padded."""
+        if num_reqs_padded > self._seq_lens_cpu_ub.shape[0]:
+            arr = np.empty(num_reqs_padded, dtype=np.int32)
+            return torch.from_numpy(arr), arr
+        cached = self._seq_lens_ub_views.get(num_reqs_padded)
+        if cached is None:
+            cached = (
+                self._seq_lens_cpu_ub[:num_reqs_padded],
+                self._seq_lens_cpu_ub_np[:num_reqs_padded],
+            )
+            if len(self._seq_lens_ub_views) < 128:
+                self._seq_lens_ub_views[num_reqs_padded] = cached
+        return cached
 
 
 @dataclass
@@ -131,6 +297,11 @@ class InputBatch:
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
 
+    # Optional pre-cast int32 expanded_idx_mapping & cached CPU metadata.
+    expanded_idx_mapping_i32: torch.Tensor | None = None
+    idx_mapping_bytes: bytes | None = None
+    seq_lens_cpu_upper_bound_np: np.ndarray | None = None
+
     @classmethod
     def make_dummy(
         cls,
@@ -146,6 +317,7 @@ class InputBatch:
         req_ids = [f"req_{i}_{random_uuid()}" for i in range(num_reqs)]
         idx_mapping_np = np.arange(num_reqs, dtype=np.intp)
         idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
+        idx_mapping_i32 = torch.arange(num_reqs, dtype=torch.int32, device=device)
         expanded_idx_mapping = idx_mapping
         expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
@@ -171,6 +343,14 @@ class InputBatch:
         query_start_loc_np = np.empty(num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
+        if hasattr(input_buffers, "_last_uniform_q_start_key"):
+            input_buffers._last_uniform_q_start_key = None
+        if hasattr(input_buffers, "_last_is_padding_state"):
+            input_buffers._last_is_padding_state = None
+        if hasattr(input_buffers, "_last_idx_mapping_bytes"):
+            input_buffers._last_idx_mapping_bytes = None
+        if hasattr(input_buffers, "_last_idx_mapping_np"):
+            input_buffers._last_idx_mapping_np = None
         input_buffers.query_start_loc[:1] = 0
         torch.cumsum(
             seq_lens, dim=0, out=input_buffers.query_start_loc[1 : num_reqs + 1]
@@ -225,6 +405,7 @@ class InputBatch:
             has_structured_output_reqs=False,
             prompt_lens=None,
             max_query_len=max_query_len,
+            expanded_idx_mapping_i32=idx_mapping_i32,
         )
 
 
@@ -337,7 +518,11 @@ def prepare_prefill_inputs(
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     num_lookahead = next_prefill_tokens.shape[0]
-    _prepare_prefill_inputs_kernel[(num_reqs,)](
+    _PREPARE_PREFILL_INPUTS_LAUNCHER.launch_on_device(
+        num_reqs,
+        1,
+        1,
+        input_ids.device,
         input_ids,
         next_prefill_tokens,
         next_prefill_tokens.stride(0),
@@ -348,8 +533,8 @@ def prepare_prefill_inputs(
         all_token_ids.stride(0),
         prefill_len,
         num_computed_tokens,
-        BLOCK_SIZE=1024,
-        LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
+        1024,
+        triton.next_power_of_2(num_lookahead),
     )
 
 
@@ -358,6 +543,7 @@ def _prepare_pos_seq_lens_kernel(
     pos_ptr,
     seq_lens_ptr,
     idx_mapping_ptr,
+    idx_mapping_i32_ptr,
     query_start_loc_ptr,
     num_computed_tokens_ptr,
     max_num_reqs,
@@ -374,6 +560,7 @@ def _prepare_pos_seq_lens_kernel(
         return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
+    tl.store(idx_mapping_i32_ptr + req_id, req_state_idx.to(tl.int32))
     num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
 
     start = tl.load(query_start_loc_ptr + req_id)
@@ -396,18 +583,28 @@ def prepare_pos_seq_lens(
     num_computed_tokens: torch.Tensor,
     pos: torch.Tensor,
     seq_lens: torch.Tensor,
+    idx_mapping_i32: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if idx_mapping_i32 is None:
+        idx_mapping_i32 = torch.empty(
+            num_reqs, dtype=torch.int32, device=idx_mapping.device
+        )
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
-    _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
+    _PREPARE_POS_SEQ_LENS_LAUNCHER.launch_on_device(
+        num_reqs + 1,
+        1,
+        1,
+        idx_mapping.device,
         pos,
         seq_lens,
         idx_mapping,
+        idx_mapping_i32,
         query_start_loc,
         num_computed_tokens,
         seq_lens.shape[0],
-        BLOCK_SIZE=1024,
+        1024,
     )
 
 
@@ -483,6 +680,7 @@ def combine_sampled_and_draft_tokens(
     cu_num_logits: torch.Tensor,
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
@@ -491,8 +689,16 @@ def combine_sampled_and_draft_tokens(
     num_reqs = idx_mapping.shape[0]
     num_speculative_steps = draft_tokens.shape[-1]
 
-    logits_indices = torch.empty(num_logits, dtype=torch.int64, device=input_ids.device)
-    _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
+    logits_indices = (
+        torch.empty(num_logits, dtype=torch.int64, device=input_ids.device)
+        if out is None
+        else out[:num_logits]
+    )
+    _COMBINE_SAMPLED_AND_DRAFT_TOKENS_LAUNCHER.launch_on_device(
+        num_reqs,
+        1,
+        1,
+        input_ids.device,
         input_ids,
         idx_mapping,
         last_sampled_tokens,
@@ -503,14 +709,82 @@ def combine_sampled_and_draft_tokens(
         draft_tokens.stride(0),
         cu_num_logits,
         logits_indices,
-        NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
-        # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
-        # last sampled token in addition to all draft tokens.
-        BLOCK_SIZE=triton.next_power_of_2(
-            num_speculative_steps + num_new_sampled_tokens
-        ),
+        triton.next_power_of_2(num_speculative_steps + num_new_sampled_tokens),
+        num_new_sampled_tokens,
     )
     return logits_indices
+
+
+@triton.jit(do_not_specialize=["num_reqs", "max_num_reqs"])
+def _prepare_decode_inputs_kernel(
+    input_ids_ptr,
+    pos_ptr,
+    seq_lens_ptr,
+    idx_mapping_ptr,
+    idx_mapping_i32_ptr,
+    num_computed_tokens_ptr,
+    last_sampled_tokens_ptr,
+    prefill_len_ptr,
+    num_reqs,
+    max_num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_reqs
+    req_state_idx = tl.load(idx_mapping_ptr + offs, mask=mask, other=0)
+    tl.store(idx_mapping_i32_ptr + offs, req_state_idx.to(tl.int32), mask=mask)
+    nc = tl.load(num_computed_tokens_ptr + req_state_idx, mask=mask, other=0)
+    tl.store(pos_ptr + offs, nc, mask=mask)
+    seq_len = nc + 1
+    if max_num_reqs <= BLOCK_SIZE:
+        tl.store(
+            seq_lens_ptr + offs,
+            tl.where(mask, seq_len, 0),
+            mask=offs < max_num_reqs,
+        )
+    else:
+        tl.store(seq_lens_ptr + offs, seq_len, mask=mask)
+        for base in tl.range(num_reqs, max_num_reqs, BLOCK_SIZE):
+            pad_offs = base + tl.arange(0, BLOCK_SIZE)
+            tl.store(seq_lens_ptr + pad_offs, 0, mask=pad_offs < max_num_reqs)
+    prefill_len = tl.load(prefill_len_ptr + req_state_idx, mask=mask, other=0)
+    write_mask = mask & (nc >= prefill_len)
+    last_tok = tl.load(
+        last_sampled_tokens_ptr + req_state_idx, mask=write_mask, other=0
+    )
+    tl.store(input_ids_ptr + offs, last_tok, mask=write_mask)
+
+
+def prepare_decode_inputs_and_logits(
+    input_ids: torch.Tensor,
+    pos: torch.Tensor,
+    seq_lens: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    idx_mapping_i32: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    prefill_len: torch.Tensor,
+) -> None:
+    """Fused single-CTA prep for uniform single-token decode (num_reqs <= 256)."""
+    num_reqs = idx_mapping.shape[0]
+    assert num_reqs <= 256
+    _PREPARE_DECODE_INPUTS_LAUNCHER.launch_on_device(
+        1,
+        1,
+        1,
+        input_ids.device,
+        input_ids,
+        pos,
+        seq_lens,
+        idx_mapping,
+        idx_mapping_i32,
+        num_computed_tokens,
+        last_sampled_tokens,
+        prefill_len,
+        num_reqs,
+        seq_lens.shape[0],
+        256,
+    )
 
 
 @triton.jit
@@ -551,7 +825,11 @@ def get_num_sampled_and_rejected(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     num_rejected = torch.empty_like(num_sampled)
-    _get_num_sampled_and_rejected_kernel[(num_reqs,)](
+    _GET_NUM_SAMPLED_AND_REJECTED_LAUNCHER.launch_on_device(
+        num_reqs,
+        1,
+        1,
+        num_sampled.device,
         num_sampled,
         num_rejected,
         seq_lens,
@@ -560,6 +838,12 @@ def get_num_sampled_and_rejected(
         prefill_len,
     )
     return num_sampled, num_rejected
+
+
+_GET_NUM_SAMPLED_AND_REJECTED_LAUNCHER = FastTritonLauncher(
+    _get_num_sampled_and_rejected_kernel,
+    constexpr_names=(),
+)
 
 
 @triton.jit
@@ -633,6 +917,19 @@ def _post_update_kernel(
         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
 
 
+_V1_EXT_UNSET = object()
+_V1_EXT = _V1_EXT_UNSET
+
+
+def _get_v1_ext():
+    global _V1_EXT
+    if _V1_EXT is _V1_EXT_UNSET:
+        from vllm.v1.worker.gpu._v1_sm80_ops import get_ext
+
+        _V1_EXT = get_ext()
+    return _V1_EXT
+
+
 def post_update(
     # [num_reqs] batch_idx -> req_state_idx; negative index means skip.
     idx_mapping: torch.Tensor,
@@ -658,14 +955,42 @@ def post_update(
     draft_tokens: torch.Tensor | None = None,
     # [max_num_reqs, num_speculative_steps], contiguous; required with draft_tokens
     draft_tokens_out: torch.Tensor | None = None,
+    assume_no_rejected: bool = False,
 ) -> None:
+    if (
+        assume_no_rejected
+        and draft_tokens is None
+        and output_bin_counts is None
+        and last_sampled_tokens.dtype == torch.int64
+        and last_sampled_tokens.stride(0) == 1
+        and sampled_tokens.ndim == 2
+        and sampled_tokens.shape[1] == 1
+        and sampled_tokens.dtype == torch.int64
+        and idx_mapping.dtype == torch.int64
+        and (ext := _get_v1_ext()) is not None
+    ):
+        ext.post_update_sm80(
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            sampled_tokens,
+            num_sampled,
+            query_start_loc,
+            all_token_ids,
+            total_len,
+        )
+        return
     num_reqs = idx_mapping.shape[0]
     if draft_tokens is not None:
         # The kernel uses num_speculative_steps as the row stride of both.
         assert draft_tokens_out is not None
         assert draft_tokens.shape[1] == draft_tokens_out.shape[1]
         assert draft_tokens.is_contiguous() and draft_tokens_out.is_contiguous()
-    _post_update_kernel[(num_reqs,)](
+    _POST_UPDATE_LAUNCHER.launch_on_device(
+        num_reqs,
+        1,
+        1,
+        idx_mapping.device,
         idx_mapping,
         num_computed_tokens,
         last_sampled_tokens,
@@ -682,7 +1007,6 @@ def post_update(
         draft_tokens,
         draft_tokens_out,
         draft_tokens.shape[1] if draft_tokens is not None else 0,
-        num_warps=1,
     )
 
 
@@ -749,11 +1073,42 @@ def expand_idx_mapping(
     expanded_local_pos = torch.empty(
         total_num_logits, dtype=torch.int32, device=idx_mapping.device
     )
-    _expand_idx_mapping_kernel[(num_reqs,)](
+    _EXPAND_IDX_MAPPING_LAUNCHER.launch_on_device(
+        num_reqs,
+        1,
+        1,
+        idx_mapping.device,
         idx_mapping,
         expanded_idx_mapping,
         expanded_local_pos,
         cu_num_logits,
-        BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
+        triton.next_power_of_2(max_expand_len),
     )
     return expanded_idx_mapping, expanded_local_pos
+
+
+_PREPARE_PREFILL_INPUTS_LAUNCHER = FastTritonLauncher(
+    _prepare_prefill_inputs_kernel,
+    constexpr_names=("BLOCK_SIZE", "LOOKAHEAD_BLOCK"),
+)
+_EXPAND_IDX_MAPPING_LAUNCHER = FastTritonLauncher(
+    _expand_idx_mapping_kernel,
+    constexpr_names=("BLOCK_SIZE",),
+)
+_PREPARE_POS_SEQ_LENS_LAUNCHER = FastTritonLauncher(
+    _prepare_pos_seq_lens_kernel,
+    constexpr_names=("BLOCK_SIZE",),
+)
+_COMBINE_SAMPLED_AND_DRAFT_TOKENS_LAUNCHER = FastTritonLauncher(
+    _combine_sampled_and_draft_tokens_kernel,
+    constexpr_names=("BLOCK_SIZE", "NUM_NEW_SAMPLED_TOKENS"),
+)
+_PREPARE_DECODE_INPUTS_LAUNCHER = FastTritonLauncher(
+    _prepare_decode_inputs_kernel,
+    constexpr_names=("BLOCK_SIZE",),
+    compile_kwargs={"num_warps": 2},
+)
+_POST_UPDATE_LAUNCHER = FastTritonLauncher(
+    _post_update_kernel,
+    compile_kwargs={"num_warps": 1},
+)

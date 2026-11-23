@@ -1184,6 +1184,14 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+        # [outputs_cb, error_cb] set by AsyncLLM to bypass outputs_queue.
+        self._output_cb_holder: list[Any] = [None, None]
+        self._sync_input_socket = (
+            zmq.Socket.shadow(self.input_socket)
+            if isinstance(self.input_socket, zmq.asyncio.Socket)
+            else None
+        )
+        self._shadowed_input_socket = self.input_socket
 
         # locally-cached engine status
         self._engine_status: dict[int, dict] = {}
@@ -1202,6 +1210,15 @@ class AsyncMPClient(MPClient):
         except RuntimeError:
             pass
 
+    def set_output_handlers(
+        self,
+        outputs_cb: Callable[[EngineCoreOutputs], Awaitable[None] | None] | None,
+        error_cb: Callable[[Exception, bool], None] | None,
+    ) -> None:
+        """Attach direct output/error callbacks bypassing ``outputs_queue``."""
+        self._output_cb_holder[0] = outputs_cb
+        self._output_cb_holder[1] = error_cb
+
     def _ensure_output_queue_task(self):
         resources = self.resources
         if resources.output_queue_task is not None:
@@ -1212,68 +1229,225 @@ class AsyncMPClient(MPClient):
         decoder = self.decoder
         utility_results = self.utility_results
         outputs_queue = self.outputs_queue
+        cb_holder = self._output_cb_holder
         output_handler: (
             Callable[[AsyncMPClient, EngineCoreOutputs], Awaitable[None]] | None
         ) = getattr(self.__class__, "process_engine_outputs", None)
         _self_ref = weakref.ref(self)
         output_socket = resources.output_socket
         assert output_socket is not None
+        use_shadow = isinstance(output_socket, zmq.asyncio.Socket) and hasattr(
+            output_socket, "underlying"
+        )
 
         notification_callback_handler: (
             Callable[[AsyncMPClient, Sequence[Any]], Any] | None
         ) = getattr(self.__class__, "eep_process_engine_core_notification", None)
 
+        _stop = object()
+
+        async def _run_with_output_handler(
+            client: "AsyncMPClient", outputs: EngineCoreOutputs
+        ) -> Any:
+            assert output_handler is not None
+            await output_handler(client, outputs)
+            if outputs.outputs or outputs.scheduler_stats:
+                outputs_cb = cb_holder[0]
+                if outputs_cb is not None:
+                    res = outputs_cb(outputs)
+                    if res is not None:
+                        await res
+                else:
+                    outputs_queue.put_nowait(outputs)
+
+        def _dispatch_frames(frames: Sequence[zmq.Frame]) -> Any:
+            resources.validate_alive(frames)
+            outputs: EngineCoreOutputs = decoder.decode(frames)
+            if outputs.utility_output:
+                if (
+                    outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID
+                    and notification_callback_handler is not None
+                ):
+                    assert _self_ref is not None
+                    _self = _self_ref()
+                    if not _self:
+                        return _stop
+                    if outputs.utility_output.result is None:
+                        return None
+                    notification_data = outputs.utility_output.result.result
+                    assert isinstance(notification_data, Sequence)
+                    assert len(notification_data) == 2
+                    asyncio.create_task(
+                        notification_callback_handler(_self, notification_data)
+                    )
+                elif outputs.utility_output.call_id == FT_STATUS_CALL_ID:
+                    _self = _self_ref()
+                    if not _self:
+                        return _stop
+                    if outputs.utility_output.result is not None:
+                        _self._engine_status[outputs.engine_index] = (
+                            outputs.utility_output.result.result
+                        )
+                else:
+                    _process_utility_output(
+                        outputs.utility_output, utility_results
+                    )
+                return None
+
+            if output_handler is not None:
+                assert _self_ref is not None
+                _self = _self_ref()
+                if not _self:
+                    # Client has been garbage collected, abort.
+                    return _stop
+                return _run_with_output_handler(_self, outputs)
+
+            if outputs.outputs or outputs.scheduler_stats:
+                outputs_cb = cb_holder[0]
+                if outputs_cb is not None:
+                    return outputs_cb(outputs)
+                outputs_queue.put_nowait(outputs)
+            return None
+
         async def process_outputs_socket():
-            try:
-                while True:
-                    frames = await output_socket.recv_multipart(copy=False)
-                    resources.validate_alive(frames)
-                    outputs: EngineCoreOutputs = decoder.decode(frames)
-                    if outputs.utility_output:
+            reader_armed = False
+            closed = False
+            pending_task: asyncio.Task[Any] | None = None
+            done_fut: asyncio.Future[None] | None = None
+            loop: asyncio.AbstractEventLoop | None = None
+            fd = -1
+
+            def _arm_reader() -> None:
+                nonlocal reader_armed
+                if not reader_armed and not closed and loop is not None:
+                    loop.add_reader(fd, _on_readable)
+                    reader_armed = True
+
+            def _unarm_reader() -> None:
+                nonlocal reader_armed
+                if reader_armed and loop is not None:
+                    with contextlib.suppress(Exception):
+                        loop.remove_reader(fd)
+                    reader_armed = False
+
+            def _emit_error(exc: Exception, from_cancel: bool) -> None:
+                err_cb = cb_holder[1]
+                if err_cb is not None:
+                    formatted = (
+                        EngineDeadError(suppress_context=True)
                         if (
-                            outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID
-                            and notification_callback_handler is not None
-                        ):
-                            assert _self_ref is not None
-                            _self = _self_ref()
-                            if not _self:
-                                return
-                            if outputs.utility_output.result is None:
-                                continue
-                            notification_data = outputs.utility_output.result.result
-                            assert isinstance(notification_data, Sequence)
-                            assert len(notification_data) == 2
-                            asyncio.create_task(
-                                notification_callback_handler(_self, notification_data)
-                            )
-                        elif outputs.utility_output.call_id == FT_STATUS_CALL_ID:
-                            _self = _self_ref()
-                            if not _self:
-                                return
-                            if outputs.utility_output.result is not None:
-                                _self._engine_status[outputs.engine_index] = (
-                                    outputs.utility_output.result.result
-                                )
-                        else:
-                            _process_utility_output(
-                                outputs.utility_output, utility_results
-                            )
-                        continue
+                            not from_cancel
+                            and resources.engine_dead
+                            and not isinstance(exc, EngineDeadError)
+                        )
+                        else exc
+                    )
+                    err_cb(formatted, from_cancel)
+                else:
+                    outputs_queue.put_nowait(exc)
 
-                    if output_handler is not None:
-                        assert _self_ref is not None
-                        _self = _self_ref()
-                        if not _self:
-                            # Client has been garbage collected, abort.
+            def _fail(exc: Exception, from_cancel: bool = False) -> None:
+                nonlocal closed
+                if closed:
+                    return
+                closed = True
+                _unarm_reader()
+                _emit_error(exc, from_cancel)
+                if done_fut is not None and not done_fut.done():
+                    done_fut.set_result(None)
+
+            def _on_pending_done(task: asyncio.Task[Any]) -> None:
+                nonlocal pending_task
+                pending_task = None
+                if closed:
+                    return
+                if task.cancelled():
+                    _fail(EngineDeadError(), from_cancel=True)
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    if isinstance(exc, Exception):
+                        _fail(exc)
+                    elif done_fut is not None and not done_fut.done():
+                        done_fut.set_exception(exc)
+                    return
+                _arm_reader()
+                _on_readable()
+
+            try:
+                if use_shadow:
+                    sync_out = zmq.Socket.shadow(output_socket)
+                    fd = sync_out.FD
+                    loop = asyncio.get_running_loop()
+                    done_fut = loop.create_future()
+
+                    sync_recv = sync_out.recv_multipart
+                    sync_getsockopt = sync_out.getsockopt
+                    pollin_flag = int(zmq.POLLIN)
+                    events_opt = zmq.EVENTS
+                    noblock_flag = int(zmq.NOBLOCK)
+                    again_err = zmq.Again
+
+                    def _on_readable() -> None:
+                        nonlocal closed, pending_task
+                        if closed or pending_task is not None or done_fut.done():
                             return
-                        await output_handler(_self, outputs)
+                        try:
+                            while True:
+                                if not (sync_getsockopt(events_opt) & pollin_flag):
+                                    break
+                                try:
+                                    frames = sync_recv(noblock_flag, copy=False)
+                                except again_err:
+                                    if sync_getsockopt(events_opt) & pollin_flag:
+                                        continue
+                                    break
+                                res = _dispatch_frames(frames)
+                                if res is _stop:
+                                    closed = True
+                                    _unarm_reader()
+                                    if not done_fut.done():
+                                        done_fut.set_result(None)
+                                    return
+                                if res is not None:
+                                    _unarm_reader()
+                                    pending_task = asyncio.create_task(res)
+                                    pending_task.add_done_callback(_on_pending_done)
+                                    return
+                        except Exception as e:
+                            _fail(e)
 
-                    if outputs.outputs or outputs.scheduler_stats:
-                        outputs_queue.put_nowait(outputs)
+                    _arm_reader()
+                    _on_readable()
+                    if not done_fut.done():
+                        await done_fut
+                else:
+                    while True:
+                        frames = await output_socket.recv_multipart(copy=False)
+                        res = _dispatch_frames(frames)
+                        if res is _stop:
+                            return
+                        if res is not None:
+                            await res
             except Exception as e:
-                outputs_queue.put_nowait(e)
+                if not closed:
+                    closed = True
+                    _unarm_reader()
+                    _emit_error(e, False)
             except asyncio.CancelledError:
-                outputs_queue.put_nowait(EngineDeadError())
+                if pending_task is not None and not pending_task.done():
+                    pending_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await pending_task
+                if not closed:
+                    closed = True
+                    _unarm_reader()
+                    _emit_error(EngineDeadError(), True)
+            finally:
+                closed = True
+                _unarm_reader()
+                if pending_task is not None and not pending_task.done():
+                    pending_task.cancel()
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask"
@@ -1311,6 +1485,48 @@ class AsyncMPClient(MPClient):
         # memoryview back to the original owning tensor/ndarray).
         return self.input_socket.send_multipart((engine,) + message, copy=False)
 
+    def _try_send_input(
+        self,
+        request_type: EngineCoreRequestType,
+        request: Any,
+        engine: EngineIdentity | None = None,
+    ) -> Awaitable[Any] | None:
+        if (
+            type(self)._send_input is AsyncMPClient._send_input
+            and type(self)._send_input_message is AsyncMPClient._send_input_message
+            and "_send_input" not in self.__dict__
+            and "_send_input_message" not in self.__dict__
+        ):
+            if engine is None:
+                engine = self.core_engine
+            message = (request_type.value, *self.encoder.encode(request))
+            return self._try_send_input_message(message, engine)
+        return self._send_input(request_type, request, engine)
+
+    def _try_send_input_message(
+        self, message: tuple[bytestr, ...], engine: EngineIdentity
+    ) -> Awaitable[Any] | None:
+        self.ensure_alive()
+        sync_sock = self._sync_input_socket
+        if sync_sock is not None and self.input_socket is self._shadowed_input_socket:
+            frames = (engine,) + message
+            try:
+                sync_sock.send_multipart(frames, zmq.DONTWAIT, copy=False)
+                return None
+            except zmq.Again:
+                return self.input_socket.send_multipart(frames, copy=False)
+        return self.input_socket.send_multipart((engine,) + message, copy=False)
+
+    def _try_abort_requests(self, request_ids: list[str]) -> Awaitable[Any] | None:
+        if request_ids and not self.resources.engine_dead:
+            if (
+                type(self).abort_requests_async is AsyncMPClient.abort_requests_async
+                and "abort_requests_async" not in self.__dict__
+            ):
+                return self._try_send_input(EngineCoreRequestType.ABORT, request_ids)
+            return self.abort_requests_async(request_ids)
+        return None
+
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
@@ -1341,7 +1557,14 @@ class AsyncMPClient(MPClient):
             EngineCoreRequestType.UTILITY.value,
             *self.encoder.encode((self.client_index, call_id, method, args)),
         )
-        await self._send_input_message(message, engine)
+        if (
+            type(self)._send_input_message is AsyncMPClient._send_input_message
+            and "_send_input_message" not in self.__dict__
+        ):
+            if (fut := self._try_send_input_message(message, engine)) is not None:
+                await fut
+        else:
+            await self._send_input_message(message, engine)
         self._ensure_output_queue_task()
         return await future
 
@@ -1350,12 +1573,16 @@ class AsyncMPClient(MPClient):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
-        await self._send_input(EngineCoreRequestType.ADD, request)
+        if (fut := self._try_send_input(EngineCoreRequestType.ADD, request)) is not None:
+            await fut
         self._ensure_output_queue_task()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
-            await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+            if (
+                fut := self._try_send_input(EngineCoreRequestType.ABORT, request_ids)
+            ) is not None:
+                await fut
 
     async def pause_scheduler_async(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -1659,7 +1886,12 @@ class DPAsyncMPClient(AsyncMPClient):
 
         # The engine that receives it wakes the other ranks if they are idle.
         chosen_engine = self.get_core_engine_for_request(request)
-        await self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
+        if (
+            fut := self._try_send_input(
+                EngineCoreRequestType.ADD, request, chosen_engine
+            )
+        ) is not None:
+            await fut
 
         self._ensure_output_queue_task()
 

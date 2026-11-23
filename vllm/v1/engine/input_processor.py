@@ -176,7 +176,9 @@ class InputProcessor:
                         "(VLLM_USE_V2_MODEL_RUNNER=1).",
                         parameter="prompt_logprob_token_ids",
                     )
-                if self.vllm_config.cache_config.kv_sharing_fast_prefill:
+                if self.vllm_config.cache_config.kv_sharing_fast_prefill and not getattr(
+                    self.vllm_config.cache_config, "kv_sharing_fast_prefill_auto", False
+                ):
                     raise VLLMValidationError(
                         "prompt_logprob_token_ids is incorrect with "
                         "--kv-sharing-fast-prefill; disable it for scoring.",
@@ -506,7 +508,7 @@ class InputProcessor:
                 self.generation_config_fields,
                 self.renderer.get_eos_token_id(),
             )
-            if self.tokenizer is not None:
+            if sampling_params.bad_words and self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)

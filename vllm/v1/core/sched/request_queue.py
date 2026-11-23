@@ -119,13 +119,8 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
         """Check if queue has any requests."""
         return len(self) > 0
 
-    def __len__(self) -> int:
-        """Get number of requests in queue."""
-        return super().__len__()
-
-    def __iter__(self) -> Iterator[Request]:
-        """Iterate over the queue according to FCFS policy."""
-        return super().__iter__()
+    __len__ = deque.__len__
+    __iter__ = deque.__iter__
 
 
 class PriorityRequestQueue(RequestQueue):

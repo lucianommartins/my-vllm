@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import itertools
+import json
+import time
 import weakref
 from collections import defaultdict, deque
 from collections.abc import Sequence
+from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, Literal, cast, overload
 
@@ -24,7 +28,7 @@ from typing_extensions import override
 from vllm import envs
 from vllm.exceptions import ChatTemplateResolutionError, VLLMValidationError
 from vllm.inputs import EmbedsPrompt
-from vllm.inputs.engine import MultiModalInput
+from vllm.inputs.engine import MultiModalInput, TokensInput
 from vllm.logger import init_logger
 from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import (
@@ -45,17 +49,28 @@ from vllm.renderers.chat_utils import (
     parse_chat_messages,
     parse_chat_messages_async,
 )
+from vllm.renderers.chat_utils.chat_message import (
+    _CLAUDE_CODE_BILLING_HEADER,
+    _FAST_PLAIN_MSG_KEYS,
+    _try_fast_parse_plain_text_messages,
+)
 from vllm.renderers.chat_utils.content_parser import (
     PROMPT_EMBEDS_PLACEHOLDER_ID_PREFIX,
 )
-from vllm.tokenizers.hf import HfTokenizer, maybe_make_thread_pool
+from vllm.tokenizers.hf import (
+    HfTokenizer,
+    ThreadSafeHFTokenizerMixin,
+    maybe_make_thread_pool,
+)
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.async_utils import make_async
 from vllm.utils.func_utils import supports_kw
+from vllm.utils.torch_utils import set_default_torch_num_threads
 
-from .base import BaseRenderer
+from .base import BaseRenderer, _ValidatedTokenIds
 from .inputs.preprocess import parse_dec_only_prompt
+from .params import ChatParams, TokenizeParams
 
 if TYPE_CHECKING:
     from collections.abc import Set
@@ -75,7 +90,6 @@ if TYPE_CHECKING:
     )
 
     from .inputs import DictPrompt
-    from .params import ChatParams
 
 logger = init_logger(__name__)
 
@@ -800,22 +814,280 @@ def _get_hf_base_chat_template_params() -> frozenset[str]:
     )
 
 
+@lru_cache(maxsize=256)
+def _cached_supports_apply_chat_kw(tok_cls: type, kw: str) -> bool:
+    return supports_kw(tok_cls.apply_chat_template, kw, allow_var_kwargs=False)
+
+
+_UNEXPECTED_CHAT_TEMPLATE_VARS: Final = frozenset(("chat_template", "tokenize"))
+
+
+class _NoopGenerationExtension(jinja2.ext.Extension):
+    """Minimal passthrough for HF `{% generation %}` blocks when masks are off."""
+
+    tags = {"generation"}
+
+    def parse(self, parser: jinja2.parser.Parser) -> jinja2.nodes.Node:
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        call = self.call_method("_passthrough")
+        return jinja2.nodes.CallBlock(call, [], [], body).set_lineno(lineno)
+
+    @jinja2.pass_eval_context
+    def _passthrough(self, _eval_ctx: Any, caller: Any) -> str:
+        return caller()
+
+
+def _hf_tojson(
+    x: Any,
+    ensure_ascii: bool = False,
+    indent: int | None = None,
+    separators: tuple[str, str] | None = None,
+    sort_keys: bool = False,
+) -> str:
+    return json.dumps(
+        x,
+        ensure_ascii=ensure_ascii,
+        indent=indent,
+        separators=separators,
+        sort_keys=sort_keys,
+    )
+
+
+def _hf_raise_exception(message: str) -> Any:
+    raise jinja2.TemplateError(message)
+
+
+def _hf_strftime_now(fmt: str) -> str:
+    return datetime.now().strftime(fmt)
+
+
+_GEMMA4_CANONICAL_CHAT_TEMPLATE_SHA256: Final[str] = (
+    "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5"
+)
+_GEMMA4_FAST_CHAT_ROLES: Final[frozenset[str]] = frozenset(
+    ("system", "developer", "user", "assistant", "model")
+)
+_GEMMA4_FAST_ALLOWED_KWARGS: Final[frozenset[str]] = frozenset(
+    (
+        "add_generation_prompt",
+        "enable_thinking",
+        "continue_final_message",
+        "preserve_thinking",
+        "return_assistant_tokens_mask",
+        "return_dict",
+    )
+)
+_GEMMA4_FAST_SAFE_KEYS: Final[frozenset[str]] = (
+    _GEMMA4_FAST_ALLOWED_KWARGS
+    | frozenset(("tokenize", "chat_template", "tools", "documents"))
+)
+_CANONICAL_GEMMA4_TEMPLATES: dict[str, bool] = {}
+
+
+def _is_canonical_gemma4_template(chat_template: str) -> bool:
+    cached = _CANONICAL_GEMMA4_TEMPLATES.get(chat_template)
+    if cached is not None:
+        return cached
+    is_match = (
+        len(chat_template) == 18567
+        and hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
+        == _GEMMA4_CANONICAL_CHAT_TEMPLATE_SHA256
+    )
+    if len(_CANONICAL_GEMMA4_TEMPLATES) >= 32:
+        _CANONICAL_GEMMA4_TEMPLATES.clear()
+    _CANONICAL_GEMMA4_TEMPLATES[chat_template] = is_match
+    return is_match
+
+
+def _strip_gemma4_thinking(text: str) -> str:
+    if "<channel|>" not in text and "<|channel>" not in text:
+        return text.strip()
+    out_parts: list[str] = []
+    for part in text.split("<channel|>"):
+        idx = part.find("<|channel>")
+        out_parts.append(part[:idx] if idx != -1 else part)
+    return "".join(out_parts).strip()
+
+
+def _try_format_gemma4_chat_prompt(
+    chat_template: str,
+    bos_token: str | None,
+    conversation: list[ConversationMessage],
+    resolved_kwargs: dict[str, Any],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+) -> str | None:
+    """Fast pure-Python formatter equivalent to Gemma 4 canonical chat_template."""
+    if (
+        tools is not None
+        or not isinstance(bos_token, str)
+        or not isinstance(conversation, list)
+        or not conversation
+        or not resolved_kwargs.keys() <= _GEMMA4_FAST_ALLOWED_KWARGS
+        or resolved_kwargs.get("continue_final_message", False)
+        or resolved_kwargs.get("return_assistant_tokens_mask", False)
+        or not _is_canonical_gemma4_template(chat_template)
+    ):
+        return None
+
+    enable_thinking = bool(resolved_kwargs.get("enable_thinking", False))
+    add_generation_prompt = bool(resolved_kwargs.get("add_generation_prompt", False))
+
+    parts: list[str] = [bos_token]
+    n = len(conversation)
+    start_idx = 0
+    has_lead_sys = (
+        n > 0
+        and isinstance(conversation[0], dict)
+        and conversation[0].get("role") in ("system", "developer")
+    )
+    if enable_thinking or has_lead_sys:
+        parts.append("<|turn>system\n")
+        if enable_thinking:
+            parts.append("<|think|>\n")
+        if has_lead_sys:
+            msg0 = conversation[0]
+            if (
+                msg0.get("tool_calls")
+                or msg0.get("tool_responses")
+                or msg0.get("reasoning")
+                or msg0.get("reasoning_content")
+            ):
+                return None
+            c0 = msg0.get("content")
+            if isinstance(c0, str):
+                parts.append(c0.strip())
+            elif isinstance(c0, list):
+                for item in c0:
+                    if (
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("text"), str)
+                        or item.get("type", "text") != "text"
+                    ):
+                        return None
+                    parts.append(item["text"].strip() + " ")
+            elif c0 is not None:
+                return None
+            start_idx = 1
+        parts.append("<turn|>\n")
+
+    prev_non_tool_role: str | None = None
+    for idx in range(start_idx, n):
+        msg = conversation[idx]
+        if not isinstance(msg, dict):
+            return None
+        raw_role = msg.get("role")
+        if raw_role not in _GEMMA4_FAST_CHAT_ROLES:
+            return None
+        if (
+            msg.get("tool_calls")
+            or msg.get("tool_responses")
+            or msg.get("reasoning")
+            or msg.get("reasoning_content")
+        ):
+            return None
+        role = "model" if raw_role == "assistant" else raw_role
+        if not (role == "model" and prev_non_tool_role == "assistant"):
+            parts.append(f"<|turn>{role}\n")
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append(
+                _strip_gemma4_thinking(content) if role == "model" else content.strip()
+            )
+        elif isinstance(content, list):
+            for item in content:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("type") != "text"
+                    or not isinstance(item.get("text"), str)
+                ):
+                    return None
+                txt = item["text"]
+                parts.append(
+                    _strip_gemma4_thinking(txt) if role == "model" else txt.strip()
+                )
+        elif content is not None:
+            return None
+        next_msg = conversation[idx + 1] if idx + 1 < n else None
+        next_role = next_msg.get("role") if isinstance(next_msg, dict) else None
+        if not (role == "model" and next_role == "assistant"):
+            parts.append("<turn|>\n")
+        prev_non_tool_role = raw_role
+
+    if add_generation_prompt:
+        parts.append("<|turn>model\n")
+    return "".join(parts)
+
+
+_TRUSTED_JINJA_ENV: Final = jinja2.Environment(
+    trim_blocks=True,
+    lstrip_blocks=True,
+    extensions=[_NoopGenerationExtension, jinja2.ext.loopcontrols],
+)
+_TRUSTED_JINJA_ENV.filters["tojson"] = _hf_tojson
+_TRUSTED_JINJA_ENV.globals["raise_exception"] = _hf_raise_exception
+_TRUSTED_JINJA_ENV.globals["strftime_now"] = _hf_strftime_now
+
+
+@lru_cache(maxsize=64)
+def _compile_trusted_jinja_template(chat_template: str) -> jinja2.Template:
+    return _TRUSTED_JINJA_ENV.from_string(chat_template)
+
+
+@lru_cache(maxsize=256)
+def _cached_accepted_kw_tuple(
+    tok_cls: type,
+    chat_template: str,
+    keys: frozenset[str],
+) -> tuple[str, ...]:
+    fn_kw = {k for k in keys if _cached_supports_apply_chat_kw(tok_cls, k)}
+    template_vars = _cached_resolve_chat_template_kwargs(chat_template)
+    hf_base_params = _get_hf_base_chat_template_params()
+    accept_vars = (fn_kw | template_vars | hf_base_params) - _UNEXPECTED_CHAT_TEMPLATE_VARS
+    return tuple(k for k in keys if k in accept_vars)
+
+
+def _is_std_hf_apply_chat_template(tokenizer: HfTokenizer) -> bool:
+    if "apply_chat_template" in getattr(tokenizer, "__dict__", ()):
+        return False
+    if isinstance(tokenizer, ThreadSafeHFTokenizerMixin):
+        return bool(getattr(tokenizer, "_vllm_std_apply_chat_template", False))
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    return (
+        getattr(type(tokenizer), "apply_chat_template", None)
+        is PreTrainedTokenizerBase.apply_chat_template
+    )
+
+
 def resolve_chat_template_kwargs(
     tokenizer: HfTokenizer,
     chat_template: str,
     chat_template_kwargs: dict[str, Any],
     raise_on_unexpected: bool = True,
 ) -> dict[str, Any]:
+    if not chat_template_kwargs:
+        return {}
     # We exclude chat_template from kwargs here, because
     # chat template has been already resolved at this stage
-    unexpected_vars = {"chat_template", "tokenize"}
     if raise_on_unexpected and (
-        unexpected_in_kwargs := unexpected_vars & chat_template_kwargs.keys()
+        unexpected_in_kwargs := _UNEXPECTED_CHAT_TEMPLATE_VARS
+        & chat_template_kwargs.keys()
     ):
         raise ValueError(
             "Found unexpected chat template kwargs from request: "
             f"{unexpected_in_kwargs}"
         )
+
+    has_instance_override = "apply_chat_template" in getattr(
+        tokenizer, "__dict__", ()
+    )
+    if not has_instance_override:
+        kept = _cached_accepted_kw_tuple(
+            type(tokenizer), chat_template, frozenset(chat_template_kwargs)
+        )
+        return {k: chat_template_kwargs[k] for k in kept}
 
     fn_kw = {
         k
@@ -827,7 +1099,7 @@ def resolve_chat_template_kwargs(
     # Allow standard HF parameters even if tokenizer uses **kwargs to receive them
     hf_base_params = _get_hf_base_chat_template_params()
 
-    accept_vars = (fn_kw | template_vars | hf_base_params) - unexpected_vars
+    accept_vars = (fn_kw | template_vars | hf_base_params) - _UNEXPECTED_CHAT_TEMPLATE_VARS
     return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
 
 
@@ -873,34 +1145,50 @@ def safe_apply_chat_template(
     tools: list[dict[str, Any]] | None = None,
     chat_template: str | None = None,
     tokenize: bool = True,
+    _allow_fast_jinja: bool = False,
+    _resolved_chat_template: str | None = None,
     **kwargs,
 ) -> str | list[int]:
-    chat_template = resolve_chat_template(
-        tokenizer,
-        chat_template=chat_template,
-        tools=tools,
-        model_config=model_config,
-    )
+    if _resolved_chat_template is not None and chat_template is None and tools is None:
+        chat_template = _resolved_chat_template
+    else:
+        chat_template = resolve_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            tools=tools,
+            model_config=model_config,
+        )
     if chat_template is None:
         raise ChatTemplateResolutionError(
             "As of transformers v4.44, default chat template is no longer "
             "allowed, so you must provide a chat template if the tokenizer "
             "does not define one."
         )
-    if any(
-        msg["role"] == "developer" for msg in conversation
-    ) and not _detect_developer_role_support(chat_template):
+    is_gemma4_canonical = _is_canonical_gemma4_template(chat_template)
+    if (
+        not is_gemma4_canonical
+        and any(msg["role"] == "developer" for msg in conversation)
+        and not _detect_developer_role_support(chat_template)
+    ):
         conversation = _convert_developer_to_system(conversation)
         conversation = _consolidate_system_messages(conversation)
         logger.info_once(
             "Chat template does not support the 'developer' message role. "
             "Converting developer messages to 'system' role.",
         )
-    resolved_kwargs = resolve_chat_template_kwargs(
-        tokenizer=tokenizer,
-        chat_template=chat_template,
-        chat_template_kwargs=kwargs,
-    )
+    if (
+        is_gemma4_canonical
+        and (not kwargs or kwargs.keys() <= _GEMMA4_FAST_ALLOWED_KWARGS)
+        and "chat_template" not in kwargs
+        and "tokenize" not in kwargs
+    ):
+        resolved_kwargs = kwargs
+    else:
+        resolved_kwargs = resolve_chat_template_kwargs(
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=kwargs,
+        )
 
     # transformers v5 changed the default of `return_dict` to True, which
     # makes `apply_chat_template(tokenize=True)` return a `BatchEncoding`
@@ -909,6 +1197,62 @@ def safe_apply_chat_template(
     # consistently across v4 and v5.
     if tokenize and "return_dict" not in resolved_kwargs:
         resolved_kwargs["return_dict"] = False
+
+    fast_rendered: str | None = None
+    is_std_apply = _is_std_hf_apply_chat_template(tokenizer)
+    if is_gemma4_canonical and tools is None and is_std_apply:
+        fast_rendered = _try_format_gemma4_chat_prompt(
+            chat_template,
+            getattr(tokenizer, "bos_token", None),
+            conversation,
+            resolved_kwargs,
+            tools=tools,
+        )
+
+    if (
+        fast_rendered is None
+        and _allow_fast_jinja
+        and tools is None
+        and not resolved_kwargs.get("documents")
+        and not resolved_kwargs.get("continue_final_message", False)
+        and not resolved_kwargs.get("return_assistant_tokens_mask", False)
+        and isinstance(conversation, list)
+        and bool(conversation)
+        and all(isinstance(msg, dict) for msg in conversation)
+        and is_std_apply
+    ):
+        try:
+            compiled = _compile_trusted_jinja_template(chat_template)
+            render_kwargs: dict[str, Any] = {
+                "add_generation_prompt": False,
+                "continue_final_message": False,
+                **tokenizer.special_tokens_map,
+                **resolved_kwargs,
+                "messages": conversation,
+                "tools": None,
+                "documents": None,
+            }
+            fast_rendered = compiled.render(render_kwargs)
+        except Exception as e:
+            logger.warning("Chat template rejected the request: %s", e)
+            raise VLLMValidationError(_template_error_reason(e)) from e
+
+    if fast_rendered is not None:
+        if not tokenize:
+            return fast_rendered
+        if (
+            not resolved_kwargs.get("return_dict", False)
+            and not resolved_kwargs.get("padding")
+            and not resolved_kwargs.get("truncation")
+            and resolved_kwargs.get("max_length") is None
+            and resolved_kwargs.get("return_tensors") is None
+            and not resolved_kwargs.get("tokenizer_kwargs")
+            and (encode_ids_fn := getattr(tokenizer, "vllm_encode_ids", None))
+            is not None
+        ):
+            ids = encode_ids_fn(fast_rendered, add_special_tokens=False)
+            if ids is not None:
+                return ids
 
     try:
         plain = tokenizer.apply_chat_template(
@@ -1053,11 +1397,119 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         self._apply_chat_template_async = make_async(
             safe_apply_chat_template, executor=self._executor
         )
+        self._default_apply_chat_template_async = self._apply_chat_template_async
+        self._render_chat_single_async = make_async(
+            self._render_chat_single_sync, executor=self._executor
+        )
+        self._trusted_warmed_default_template: bool = False
+        self._trusted_warmed_templates: set[str] = set()
+        self._trusted_warmed_tokenizer: HfTokenizer | None = None
+        self._default_resolved_chat_template: str | None = None
+        self._default_chat_template_cached: bool = False
+        self._default_tmpl_is_gemma4: bool = False
+        self._default_content_format: ChatTemplateContentFormat | None = None
+        self._caps_tokenizer: Any = None
+        self._caps_is_std_apply: bool = False
+        self._caps_encode_ids_fn: Any = None
+        self._caps_max_token_id: int | None = None
+        self._caps_max_chars_per_token: int | None = None
+        self._caps_bos_token: str | None = None
+        self._gemma4_kw_tuple_ok: dict[tuple[str, ...], bool] = {}
 
         if self.tokenizer is not None:
             maybe_make_thread_pool(
                 self.tokenizer, config.model_config.renderer_num_workers + 1
             )
+            self._sync_tokenizer_caps(self.tokenizer)
+
+    def _sync_tokenizer_caps(self, tokenizer: HfTokenizer) -> None:
+        """Cache tokenizer fast-path capabilities for the active tokenizer."""
+        if tokenizer is self._caps_tokenizer:
+            return
+        self._caps_tokenizer = tokenizer
+        self._gemma4_kw_tuple_ok.clear()
+        self._caps_is_std_apply = _is_std_hf_apply_chat_template(tokenizer)
+        encode_fn = getattr(tokenizer, "vllm_encode_ids", None)
+        self._caps_encode_ids_fn = encode_fn
+        self._caps_max_token_id = (
+            getattr(tokenizer, "max_token_id", None) if encode_fn is not None else None
+        )
+        self._caps_max_chars_per_token = getattr(tokenizer, "max_chars_per_token", None)
+        bos = getattr(tokenizer, "bos_token", None)
+        self._caps_bos_token = bos if isinstance(bos, str) else None
+
+    @override
+    def warmup(self, chat_params: ChatParams) -> None:
+        super().warmup(chat_params)
+        if self.tokenizer is not None:
+            with set_default_torch_num_threads(1):
+                try:
+                    tok = self.get_tokenizer()
+                    self._sync_tokenizer_caps(tok)
+                    chat_tmpl = chat_params.chat_template
+                    resolved_tmpl = resolve_chat_template(
+                        tok,
+                        chat_template=chat_tmpl,
+                        tools=None,
+                        model_config=self.model_config,
+                    )
+                    if chat_tmpl is None:
+                        self._default_resolved_chat_template = resolved_tmpl
+                        self._default_chat_template_cached = True
+                        self._default_tmpl_is_gemma4 = bool(
+                            resolved_tmpl is not None
+                            and _is_canonical_gemma4_template(resolved_tmpl)
+                        )
+                    if resolved_tmpl is not None:
+                        t0 = time.perf_counter()
+                        _compile_trusted_jinja_template(resolved_tmpl)
+                        warmup_kwargs = chat_params.get_apply_chat_template_kwargs()
+                        warmup_kwargs["tokenize"] = False
+                        safe_apply_chat_template(
+                            self.model_config,
+                            tok,
+                            [{"role": "user", "content": "warmup"}],
+                            _allow_fast_jinja=True,
+                            _resolved_chat_template=(
+                                resolved_tmpl if chat_tmpl is None else None
+                            ),
+                            **warmup_kwargs,
+                        )
+                        if time.perf_counter() - t0 < 1.0:
+                            self._trusted_warmed_tokenizer = self.tokenizer
+                            if chat_tmpl is None:
+                                self._trusted_warmed_default_template = True
+                            else:
+                                self._trusted_warmed_templates.add(chat_tmpl)
+                except Exception:
+                    logger.debug("Trusted Jinja warmup skipped", exc_info=True)
+        max_len = self.model_config.max_model_len
+        if self.tokenizer is None or not isinstance(max_len, int):
+            return
+        # Pre-warm both the CoW chunked-encode cache and truncated CoW Rust
+        # tokenizer clones once during startup so live /v1/completions and
+        # long prompts avoid lazy JSON-parse / clone overhead.
+        with set_default_torch_num_threads(1):
+            try:
+                warmup_chunked = getattr(self.tokenizer, "warmup_chunked_cache", None)
+                if warmup_chunked is not None:
+                    warmup_chunked()
+                tok_params = self.default_cmpl_tok_params
+                self.tokenize_prompt({"prompt": "warmup"}, tok_params)
+                if (
+                    tok_params.max_total_tokens != max_len
+                    or tok_params.truncate_prompt_tokens is not None
+                ):
+                    self.tokenize_prompt(
+                        {"prompt": "warmup"},
+                        TokenizeParams(
+                            max_total_tokens=max_len,
+                            do_lower_case=tok_params.do_lower_case,
+                            add_special_tokens=tok_params.add_special_tokens,
+                        ),
+                    )
+            except Exception:
+                logger.debug("HfRenderer tokenizer warmup skipped", exc_info=True)
 
     def _replace_executor(self) -> None:
         """Replace the inner render pool after a stuck worker.
@@ -1342,6 +1794,437 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             prompt["multi_modal_uuids"] = mm_uuids
 
         return conversation, prompt
+
+    def _render_chat_single_sync(
+        self,
+        conversation: list[ConversationMessage],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams,
+        chat_template_kwargs: dict[str, Any],
+        prompt_extras: dict[str, Any] | None,
+        arrival_time: float,
+        skip_mm_cache: bool,
+        *,
+        _allow_fast_jinja: bool = False,
+        _resolved_chat_template: str | None = None,
+    ) -> EngineInput:
+        tokenizer = self.get_tokenizer()
+        use_text_then_encode = (
+            not tok_params.add_special_tokens
+            and _is_std_hf_apply_chat_template(tokenizer)
+            and not chat_template_kwargs.get("tokenize", False)
+            and not chat_template_kwargs.get("return_assistant_tokens_mask", False)
+            and not chat_template_kwargs.get("return_dict", False)
+            and not chat_template_kwargs.get("padding")
+            and not chat_template_kwargs.get("truncation")
+            and chat_template_kwargs.get("max_length") is None
+            and chat_template_kwargs.get("return_tensors") is None
+            and not chat_template_kwargs.get("tokenizer_kwargs")
+        )
+        apply_kwargs = (
+            chat_template_kwargs
+            if "tokenize" in chat_template_kwargs
+            else {**chat_template_kwargs, "tokenize": not use_text_then_encode}
+        )
+        prompt_raw = safe_apply_chat_template(
+            self.model_config,
+            tokenizer,
+            conversation,
+            _allow_fast_jinja=_allow_fast_jinja,
+            _resolved_chat_template=_resolved_chat_template,
+            **apply_kwargs,
+        )
+        dict_prompt = parse_dec_only_prompt(prompt_raw)
+        tok_prompt = self._tokenize_singleton_prompt(dict_prompt, tok_params)  # type: ignore[arg-type]
+        resolved_extras = dict(prompt_extras or {})
+        resolved_extras["media_io_kwargs"] = chat_params.media_io_kwargs or {}
+        self._apply_prompt_extras([tok_prompt], resolved_extras)
+        return self.process_for_engine(
+            tok_prompt,
+            arrival_time,
+            skip_mm_cache=skip_mm_cache,
+            tok_params=tok_params,
+        )
+
+    def _try_fast_render_gemma4_chat(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams,
+        prompt_extras: dict[str, Any] | None,
+        *,
+        _build_conversation: bool = True,
+    ) -> tuple[list[list[ConversationMessage]], list[TokensInput]] | None:
+        """Single-pass parse + canonical Gemma-4 format + direct Rust tokenize."""
+        if (
+            not self._default_chat_template_cached
+            or not self._default_tmpl_is_gemma4
+            or chat_params.chat_template is not None
+            or self.model_config.enable_prompt_embeds
+            or self.use_unified_vision_chunk
+            or self._apply_chat_template_async
+            is not self._default_apply_chat_template_async
+            or self._tokenize_prompt_async
+            is not getattr(self, "_default_tokenize_prompt_async", None)
+            or tok_params.needs_detokenization
+            or tok_params.do_lower_case
+            or tok_params.add_special_tokens
+            or tok_params.pad_prompt_tokens is not None
+            or tok_params.truncate_prompt_tokens is not None
+            or tok_params.truncation_side is not None
+        ):
+            return None
+
+        mm_cfg = self.model_config.multimodal_config
+        if mm_cfg is not None and mm_cfg.interleave_mm_strings:
+            return None
+
+        tokenizer = self.tokenizer
+        if tokenizer is None:
+            return None
+        self._sync_tokenizer_caps(tokenizer)
+        bos_token = self._caps_bos_token
+        encode_ids_fn = self._caps_encode_ids_fn
+        if (
+            not self._caps_is_std_apply
+            or encode_ids_fn is None
+            or bos_token is None
+            or "apply_chat_template" in getattr(tokenizer, "__dict__", ())
+        ):
+            return None
+
+        if tok_params.return_token_offsets and self._can_produce_offsets():
+            return None
+
+        kw = chat_params.chat_template_kwargs
+        if kw:
+            if (
+                kw.get("continue_final_message")
+                or kw.get("tokenize")
+                or kw.get("tools") is not None
+                or kw.get("documents") is not None
+                or kw.get("chat_template") is not None
+                or kw.get("return_assistant_tokens_mask")
+                or kw.get("return_dict")
+            ):
+                return None
+            kw_sig = tuple(kw)
+            kw_ok = self._gemma4_kw_tuple_ok.get(kw_sig)
+            if kw_ok is None:
+                if kw.keys() <= _GEMMA4_FAST_SAFE_KEYS:
+                    kw_ok = True
+                else:
+                    resolved_tmpl = self._default_resolved_chat_template
+                    filtered_keys = frozenset(
+                        k for k in kw_sig if k not in _UNEXPECTED_CHAT_TEMPLATE_VARS
+                    )
+                    kept = (
+                        _cached_accepted_kw_tuple(
+                            type(tokenizer), resolved_tmpl, filtered_keys
+                        )
+                        if resolved_tmpl is not None
+                        else kw_sig
+                    )
+                    kw_ok = all(k in _GEMMA4_FAST_SAFE_KEYS for k in kept)
+                if len(self._gemma4_kw_tuple_ok) >= 64:
+                    self._gemma4_kw_tuple_ok.clear()
+                self._gemma4_kw_tuple_ok[kw_sig] = kw_ok
+            if not kw_ok:
+                return None
+
+        given_fmt = chat_params.chat_template_content_format
+        if given_fmt == "auto":
+            if self._default_content_format is None:
+                self._default_content_format = resolve_chat_template_content_format(
+                    chat_template=None,
+                    tools=None,
+                    given_format="auto",
+                    tokenizer=tokenizer,
+                    model_config=self.model_config,
+                )
+            content_format = self._default_content_format
+        elif given_fmt in ("string", "openai"):
+            content_format = given_fmt
+        else:
+            return None
+
+        n_msgs = len(messages)
+        if n_msgs == 0:
+            return None
+        timeout = envs.VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT
+        if timeout > 0 and (
+            self.model_config.renderer_num_workers > 1 or n_msgs > 16
+        ):
+            return None
+
+        wrap_dicts = content_format == "openai"
+        enable_thinking = bool(kw.get("enable_thinking", False)) if kw else False
+        add_generation_prompt = (
+            bool(kw.get("add_generation_prompt", False)) if kw else False
+        )
+        parts: list[str] = [bos_token]
+        parts_append = parts.append
+        conversation: list[ConversationMessage] = []
+        conv_append = conversation.append if _build_conversation else None
+        total_chars = 0
+        prev_non_tool_role: str | None = None
+        need_close = False
+
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict) or not _FAST_PLAIN_MSG_KEYS.issuperset(msg):
+                return None
+            raw_role = msg["role"] if "role" in msg else None
+            if raw_role not in ("user", "assistant", "system"):
+                return None
+            content = msg["content"] if "content" in msg else None
+            if content is None:
+                if wrap_dicts:
+                    return None
+                conv_content: Any = "" if _build_conversation else None
+                text_piece: str | None = None
+            elif type(content) is str or isinstance(content, str):
+                if raw_role == "system" and content.startswith(
+                    _CLAUDE_CODE_BILLING_HEADER
+                ):
+                    return None
+                total_chars += len(content)
+                if _build_conversation:
+                    conv_content = (
+                        [{"type": "text", "text": content}] if wrap_dicts else content
+                    )
+                text_piece = content
+            else:
+                return None
+
+            if conv_append is not None:
+                item: dict[str, Any] = {"role": raw_role, "content": conv_content}
+                if "name" in msg and isinstance(msg["name"], str):
+                    item["name"] = msg["name"]
+                if "task" in msg and isinstance(msg["task"], str):
+                    item["task"] = msg["task"]
+                conv_append(item)  # type: ignore[arg-type]
+
+            if idx == 0:
+                if raw_role == "system":
+                    parts_append("<|turn>system\n")
+                    if enable_thinking:
+                        parts_append("<|think|>\n")
+                    if text_piece is not None:
+                        stripped = text_piece.strip()
+                        parts_append(stripped + " " if wrap_dicts else stripped)
+                    parts_append("<turn|>\n")
+                    continue
+                if enable_thinking:
+                    parts_append("<|turn>system\n<|think|>\n<turn|>\n")
+
+            if raw_role == "assistant":
+                if not (need_close and prev_non_tool_role == "assistant"):
+                    if need_close:
+                        parts_append("<turn|>\n<|turn>model\n")
+                    else:
+                        parts_append("<|turn>model\n")
+                if text_piece is not None:
+                    parts_append(_strip_gemma4_thinking(text_piece))
+            else:
+                if need_close:
+                    parts_append(f"<turn|>\n<|turn>{raw_role}\n")
+                else:
+                    parts_append(f"<|turn>{raw_role}\n")
+                if text_piece is not None:
+                    parts_append(text_piece.strip())
+            need_close = True
+            prev_non_tool_role = raw_role
+
+        if need_close:
+            parts_append("<turn|>\n")
+
+        if timeout > 0 and total_chars > 2048:
+            return None
+
+        if add_generation_prompt:
+            parts_append("<|turn>model\n")
+        rendered_text = "".join(parts)
+
+        max_input_tokens = tok_params.max_input_tokens
+        max_chars_per_tok = self._caps_max_chars_per_token
+        if (
+            max_input_tokens is not None
+            and max_chars_per_tok is not None
+            and len(rendered_text) > max_input_tokens * max_chars_per_tok
+        ):
+            max_input_chars = max_input_tokens * max_chars_per_tok
+            raise VLLMValidationError(
+                f"This model's maximum context length is "
+                f"{tok_params.max_total_tokens} tokens. However, your prompt "
+                f"contains {len(rendered_text)} characters (more than "
+                f"{max_input_chars} characters, which is the upper bound "
+                f"for {max_input_tokens} input tokens). "
+                f"Please reduce the length of the input prompt.",
+                parameter="input_text",
+                value=len(rendered_text),
+            )
+
+        max_length = max_input_tokens + 1 if max_input_tokens is not None else None
+        ids = encode_ids_fn(
+            rendered_text,
+            add_special_tokens=False,
+            max_length=max_length,
+        )
+        if ids is None:
+            return None
+        tok_params._token_len_check(tokenizer, ids)
+        max_tid = self._caps_max_token_id
+        ids_out: list[int] = (
+            _ValidatedTokenIds(ids, max_tid, tokenizer)
+            if max_tid is not None
+            else ids
+        )
+        eng_input: TokensInput = {
+            "type": "token",
+            "prompt_token_ids": ids_out,
+            "prompt": rendered_text,
+            "arrival_time": time.time(),
+        }
+        if prompt_extras and (cache_salt := prompt_extras.get("cache_salt")):
+            eng_input["cache_salt"] = cache_salt
+        return [conversation], [eng_input]
+
+    @override
+    async def render_chat_async(
+        self,
+        conversations: Sequence[list[ChatCompletionMessageParam]],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams | None = None,
+        *,
+        prompt_extras: dict[str, Any] | None = None,
+        skip_mm_cache: bool = False,
+    ):
+        if len(conversations) == 1:
+            eff_tok_params = (
+                self.default_chat_tok_params if tok_params is None else tok_params
+            )
+            fast_result = self._try_fast_render_gemma4_chat(
+                conversations[0], chat_params, eff_tok_params, prompt_extras
+            )
+            if fast_result is not None:
+                return fast_result
+        if (
+            len(conversations) == 1
+            and not self.model_config.enable_prompt_embeds
+            and not self.use_unified_vision_chunk
+            and self.tokenizer is not None
+            and self._apply_chat_template_async
+            is self._default_apply_chat_template_async
+            and self._tokenize_prompt_async
+            is getattr(self, "_default_tokenize_prompt_async", None)
+        ):
+            if tok_params is None:
+                tok_params = self.default_chat_tok_params
+            if not tok_params.needs_detokenization:
+                tokenizer = self.get_tokenizer()
+                tools_kw = chat_params.chat_template_kwargs.get("tools")
+                if (
+                    chat_params.chat_template is None
+                    and tools_kw is None
+                    and chat_params.chat_template_content_format == "auto"
+                    and self._default_content_format is not None
+                ):
+                    content_format = self._default_content_format
+                else:
+                    content_format = resolve_chat_template_content_format(
+                        chat_template=chat_params.chat_template,
+                        tools=tools_kw,
+                        given_format=chat_params.chat_template_content_format,
+                        tokenizer=tokenizer,
+                        model_config=self.model_config,
+                    )
+                    if (
+                        chat_params.chat_template is None
+                        and tools_kw is None
+                        and chat_params.chat_template_content_format == "auto"
+                    ):
+                        self._default_content_format = content_format
+                fast_conv = _try_fast_parse_plain_text_messages(
+                    conversations[0], self.model_config, content_format
+                )
+                if fast_conv is not None:
+                    arrival_time = time.time()
+                    chat_template_kwargs = chat_params.get_apply_chat_template_kwargs()
+                    resolved_tmpl = (
+                        self._default_resolved_chat_template
+                        if (
+                            chat_params.chat_template is None
+                            and self._default_chat_template_cached
+                            and not chat_template_kwargs.get("tools")
+                        )
+                        else None
+                    )
+                    is_trusted_warmed = (
+                        self._trusted_warmed_tokenizer is self.tokenizer
+                        and _is_std_hf_apply_chat_template(tokenizer)
+                        and (
+                            (
+                                chat_params.chat_template is None
+                                and self._trusted_warmed_default_template
+                            )
+                            or (
+                                chat_params.chat_template is not None
+                                and chat_params.chat_template
+                                in self._trusted_warmed_templates
+                            )
+                        )
+                    )
+                    can_inline = (
+                        envs.VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT <= 0
+                        or (
+                            is_trusted_warmed
+                            and self.model_config.renderer_num_workers <= 1
+                            and not chat_template_kwargs.get("tools")
+                            and len(fast_conv) <= 16
+                        )
+                    ) and (
+                        sum(
+                            len(m.get("content") or "")
+                            for m in fast_conv
+                            if isinstance(m.get("content"), str)
+                        )
+                        <= 2048
+                    )
+                    if can_inline:
+                        eng_input = self._render_chat_single_sync(
+                            fast_conv,
+                            chat_params,
+                            tok_params,
+                            chat_template_kwargs,
+                            prompt_extras,
+                            arrival_time,
+                            skip_mm_cache,
+                            _allow_fast_jinja=is_trusted_warmed,
+                            _resolved_chat_template=resolved_tmpl,
+                        )
+                    else:
+                        eng_input = await self._render_with_timeout(
+                            self._render_chat_single_async(
+                                fast_conv,
+                                chat_params,
+                                tok_params,
+                                chat_template_kwargs,
+                                prompt_extras,
+                                arrival_time,
+                                skip_mm_cache,
+                                _allow_fast_jinja=is_trusted_warmed,
+                                _resolved_chat_template=resolved_tmpl,
+                            )
+                        )
+                    return [fast_conv], [eng_input]
+
+        return await super().render_chat_async(
+            conversations,
+            chat_params,
+            tok_params=tok_params,
+            prompt_extras=prompt_extras,
+            skip_mm_cache=skip_mm_cache,
+        )
 
     @override
     def _process_tokens(

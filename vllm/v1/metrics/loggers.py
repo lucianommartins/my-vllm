@@ -4,9 +4,12 @@
 import logging
 import time
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from collections.abc import Callable
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client.values import MutexValue
 
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphLogging
@@ -33,11 +36,25 @@ from vllm.v1.metrics.stats import (
     MultiModalCacheStats,
     PromptTokenStats,
     SchedulerStats,
+    _get_compute_nans_in_logits,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
+
+
+def _fast_set_gauge(
+    fast_gv: dict[int, MutexValue], gauge: Gauge, value: float
+) -> None:
+    mv = fast_gv.get(id(gauge))
+    if mv is not None:
+        fval = float(value)
+        if mv._value != fval:
+            mv.set(fval)
+        return
+    gauge.set(value)
+
 
 # User-facing reason labels for waiting request breakdown
 WAITING_REASON_CAPACITY = "capacity"
@@ -45,6 +62,31 @@ WAITING_REASON_DEFERRED = "deferred"
 
 # User-facing reason labels for frontend admission rejections.
 ADMISSION_REASONS = ("max_num_queued_reqs", "max_num_queued_tokens")
+
+
+def _observe_histogram_batch(hist: Histogram, values: list[float]) -> None:
+    """Observe multiple float samples on a MutexValue Histogram in minimal locks."""
+    total = 0.0
+    bounds = hist._upper_bounds
+    b0 = bounds[0]
+    all_first = True
+    for val in values:
+        total += val
+        if not (val <= b0):
+            all_first = False
+    buckets = hist._buckets
+    hist._sum.inc(total)
+    if all_first:
+        buckets[0].inc(len(values))
+        return
+    counts: dict[int, int] = {}
+    for val in values:
+        for idx, bound in enumerate(bounds):
+            if val <= bound:
+                counts[idx] = counts.get(idx, 0) + 1
+                break
+    for idx, count in counts.items():
+        buckets[idx].inc(count)
 
 PerEngineStatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
 AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
@@ -322,7 +364,7 @@ class LoggingStatLogger(StatLoggerBase):
             log_parts.append("Prefix cache hit rate: %.1f%%")
             log_args.append(self.prefix_caching_metrics.hit_rate * 100)
 
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+        if _get_compute_nans_in_logits():
             log_parts.append("Corrupted: %d reqs")
             log_args.append(self.num_corrupted_reqs)
         if not self.connector_prefix_caching_metrics.empty:
@@ -789,11 +831,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             ),
             labelnames=labelnames + ["source"],
         )
+        self._counter_prompt_tokens_cached_by_source_parent = (
+            self.counter_prompt_tokens_cached_by_source
+        )
+        self._counter_prompt_tokens_cached_by_source: dict[str, dict[int, Counter]] = {}
         for source in CacheHitSource:
-            for labelvalues in per_engine_labelvalues.values():
-                self.counter_prompt_tokens_cached_by_source.labels(
+            source_map: dict[int, Counter] = {}
+            for idx, labelvalues in per_engine_labelvalues.items():
+                source_map[idx] = self.counter_prompt_tokens_cached_by_source.labels(
                     *labelvalues, source.value
                 )
+            self._counter_prompt_tokens_cached_by_source[source.value] = source_map
+        self._counter_prompt_tokens_cached_device = (
+            self._counter_prompt_tokens_cached_by_source[CacheHitSource.DEVICE.value]
+        )
 
         counter_generation_tokens = self._counter_cls(
             name="vllm:generation_tokens",
@@ -1111,6 +1162,66 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 ],
             )
 
+        def _is_fast_hist(hist: Histogram) -> bool:
+            return (
+                type(hist) is Histogram
+                and type(getattr(hist, "_sum", None)) is MutexValue
+                and bool(hist._is_observable())
+                and getattr(hist, "_buckets", None) is not None
+                and len(hist._buckets) == len(hist._upper_bounds)
+                and len(hist._buckets) > 0
+                and type(hist._buckets[0]) is MutexValue
+            )
+
+        self._hist_itl_fast: dict[int, Histogram] = {
+            idx: hist
+            for idx, hist in self.histogram_inter_token_latency.items()
+            if _is_fast_hist(hist)
+        }
+        self._hist_iter_fast: dict[
+            int, tuple[Histogram, MutexValue, list[float], list[MutexValue]]
+        ] = {
+            idx: (hist, hist._sum, hist._upper_bounds, hist._buckets)
+            for idx, hist in self.histogram_iteration_tokens.items()
+            if _is_fast_hist(hist)
+        }
+
+        def _is_fast_gauge(gauge: Gauge) -> bool:
+            return (
+                type(gauge) is Gauge
+                and type(getattr(gauge, "_value", None)) is MutexValue
+                and bool(gauge._is_observable())
+                and not gauge._is_most_recent
+            )
+
+        fast_gauges: dict[int, MutexValue] = {}
+        for gauge_map in (
+            self.gauge_scheduler_running,
+            self.gauge_scheduler_waiting,
+            self.gauge_kv_cache_usage,
+        ):
+            for gauge in gauge_map.values():
+                if _is_fast_gauge(gauge):
+                    fast_gauges[id(gauge)] = gauge._value
+        for reason_map in self.gauge_waiting_by_reason.values():
+            for gauge in reason_map.values():
+                if _is_fast_gauge(gauge):
+                    fast_gauges[id(gauge)] = gauge._value
+        for stage_map in self.gauge_kv_fetch_by_stage.values():
+            for gauge in stage_map.values():
+                if _is_fast_gauge(gauge):
+                    fast_gauges[id(gauge)] = gauge._value
+        self._fast_gauge_values: dict[int, MutexValue] = fast_gauges
+        self._fast_counter_gen_values: dict[int, tuple[Counter, MutexValue]] = {
+            idx: (counter, counter._value)
+            for idx, counter in self.counter_generation_tokens.items()
+            if (
+                type(counter) is Counter
+                and type(getattr(counter, "_value", None)) is MutexValue
+                and bool(counter._is_observable())
+            )
+        }
+
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
         metrics_info = config_obj.metrics_info()
         metrics_info["engine"] = ""
@@ -1144,47 +1255,87 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
     ):
         """Log to prometheus."""
         if scheduler_stats is not None:
-            self.gauge_scheduler_running[engine_idx].set(
-                scheduler_stats.num_running_reqs
+            fast_gv = self._fast_gauge_values
+            _fast_set_gauge(
+                fast_gv,
+                self.gauge_scheduler_running[engine_idx],
+                scheduler_stats.num_running_reqs,
             )
-            total_waiting = (
-                scheduler_stats.num_waiting_reqs
-                + scheduler_stats.num_skipped_waiting_reqs
+            num_waiting = scheduler_stats.num_waiting_reqs
+            num_deferred = scheduler_stats.num_skipped_waiting_reqs
+            _fast_set_gauge(
+                fast_gv,
+                self.gauge_scheduler_waiting[engine_idx],
+                num_waiting + num_deferred,
             )
-            self.gauge_scheduler_waiting[engine_idx].set(total_waiting)
-            self.gauge_waiting_by_reason[WAITING_REASON_CAPACITY][engine_idx].set(
-                scheduler_stats.num_waiting_reqs
+            _fast_set_gauge(
+                fast_gv,
+                self.gauge_waiting_by_reason[WAITING_REASON_CAPACITY][engine_idx],
+                num_waiting,
             )
-            self.gauge_waiting_by_reason[WAITING_REASON_DEFERRED][engine_idx].set(
-                scheduler_stats.num_skipped_waiting_reqs
+            _fast_set_gauge(
+                fast_gv,
+                self.gauge_waiting_by_reason[WAITING_REASON_DEFERRED][engine_idx],
+                num_deferred,
             )
-            for stage, gauges in self.gauge_kv_fetch_by_stage.items():
-                gauges[engine_idx].set(
-                    scheduler_stats.num_kv_fetch_reqs_by_stage.get(stage, 0)
+            if self.gauge_kv_fetch_by_stage:
+                fetch_by_stage = scheduler_stats.num_kv_fetch_reqs_by_stage
+                for stage, gauges in self.gauge_kv_fetch_by_stage.items():
+                    _fast_set_gauge(
+                        fast_gv,
+                        gauges[engine_idx],
+                        fetch_by_stage.get(stage, 0),
+                    )
+            _fast_set_gauge(
+                fast_gv,
+                self.gauge_kv_cache_usage[engine_idx],
+                scheduler_stats.kv_cache_usage,
+            )
+
+            prefix_cache_stats = scheduler_stats.prefix_cache_stats
+            if prefix_cache_stats.queries:
+                self.counter_prefix_cache_queries[engine_idx].inc(
+                    prefix_cache_stats.queries
                 )
-            self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
-
-            self.counter_prefix_cache_queries[engine_idx].inc(
-                scheduler_stats.prefix_cache_stats.queries
-            )
-            self.counter_prefix_cache_hits[engine_idx].inc(
-                scheduler_stats.prefix_cache_stats.hits
-            )
-
-            labelvalues = self.per_engine_labelvalues[engine_idx]
-            self.counter_prompt_tokens_cached_by_source.labels(
-                *labelvalues, CacheHitSource.DEVICE.value
-            ).inc(scheduler_stats.prefix_cache_stats.hits)
+            if prefix_cache_stats.hits:
+                self.counter_prefix_cache_hits[engine_idx].inc(prefix_cache_stats.hits)
+                if (
+                    self.counter_prompt_tokens_cached_by_source
+                    is self._counter_prompt_tokens_cached_by_source_parent
+                ):
+                    self._counter_prompt_tokens_cached_device[engine_idx].inc(
+                        prefix_cache_stats.hits
+                    )
+                else:
+                    labelvalues = self.per_engine_labelvalues[engine_idx]
+                    self.counter_prompt_tokens_cached_by_source.labels(
+                        *labelvalues, CacheHitSource.DEVICE.value
+                    ).inc(prefix_cache_stats.hits)
 
             connector_stats = scheduler_stats.connector_prefix_cache_stats
             if connector_stats is not None:
-                self.counter_connector_prefix_cache_queries[engine_idx].inc(
-                    connector_stats.queries
-                )
-                self.counter_connector_prefix_cache_hits[engine_idx].inc(
-                    connector_stats.hits
-                )
+                if connector_stats.queries:
+                    self.counter_connector_prefix_cache_queries[engine_idx].inc(
+                        connector_stats.queries
+                    )
+                if connector_stats.hits:
+                    self.counter_connector_prefix_cache_hits[engine_idx].inc(
+                        connector_stats.hits
+                    )
                 for tier, num_tokens in connector_stats.hits_by_source.items():
+                    if not num_tokens:
+                        continue
+                    if (
+                        self.counter_prompt_tokens_cached_by_source
+                        is self._counter_prompt_tokens_cached_by_source_parent
+                    ):
+                        tier_counters = (
+                            self._counter_prompt_tokens_cached_by_source.get(tier.value)
+                        )
+                        if tier_counters is not None and engine_idx in tier_counters:
+                            tier_counters[engine_idx].inc(num_tokens)
+                            continue
+                    labelvalues = self.per_engine_labelvalues[engine_idx]
                     self.counter_prompt_tokens_cached_by_source.labels(
                         *labelvalues, tier.value
                     ).inc(num_tokens)
@@ -1236,44 +1387,78 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.gauge_lora_info.labels(**lora_info_labels).set_to_current_time()
 
         if mm_cache_stats is not None:
-            self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)
-            self.counter_mm_cache_hits[engine_idx].inc(mm_cache_stats.hits)
+            if mm_cache_stats.queries:
+                self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)
+            if mm_cache_stats.hits:
+                self.counter_mm_cache_hits[engine_idx].inc(mm_cache_stats.hits)
 
         if iteration_stats is None:
             return
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+        if iteration_stats.num_corrupted_reqs and _get_compute_nans_in_logits():
             self.counter_corrupted_requests[engine_idx].inc(
                 iteration_stats.num_corrupted_reqs
             )
         if self.vllm_config.watermark_config is not None:
             counter_watermark = self.counter_watermark_requests
-            counter_watermark["watermarked"][engine_idx].inc(
-                iteration_stats.num_watermarked_reqs
+            if iteration_stats.num_watermarked_reqs:
+                counter_watermark["watermarked"][engine_idx].inc(
+                    iteration_stats.num_watermarked_reqs
+                )
+            if iteration_stats.num_watermark_skipped_reqs:
+                counter_watermark["skipped"][engine_idx].inc(
+                    iteration_stats.num_watermark_skipped_reqs
+                )
+            if iteration_stats.num_not_watermarked_reqs:
+                counter_watermark["not_watermarked"][engine_idx].inc(
+                    iteration_stats.num_not_watermarked_reqs
+                )
+        if iteration_stats.num_preempted_reqs:
+            self.counter_num_preempted_reqs[engine_idx].inc(
+                iteration_stats.num_preempted_reqs
             )
-            counter_watermark["skipped"][engine_idx].inc(
-                iteration_stats.num_watermark_skipped_reqs
-            )
-            counter_watermark["not_watermarked"][engine_idx].inc(
-                iteration_stats.num_not_watermarked_reqs
-            )
-        self.counter_num_preempted_reqs[engine_idx].inc(
-            iteration_stats.num_preempted_reqs
-        )
-        self.counter_prompt_tokens[engine_idx].inc(iteration_stats.num_prompt_tokens)
-        # Labeled prompt token counters by source
         pts = iteration_stats.prompt_token_stats
-        for source in PromptTokenStats.ALL_SOURCES:
-            self.counter_prompt_tokens_by_source[source][engine_idx].inc(
-                pts.get_by_source(source)
+        if pts.total:
+            self.counter_prompt_tokens[engine_idx].inc(pts.total)
+        # Labeled prompt token counters by source
+        if pts.computed:
+            self.counter_prompt_tokens_by_source["local_compute"][engine_idx].inc(
+                pts.computed
             )
-        self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
-        self.counter_generation_tokens[engine_idx].inc(
-            iteration_stats.num_generation_tokens
-        )
-        self.histogram_iteration_tokens[engine_idx].observe(
-            iteration_stats.prompt_token_stats.computed
-            + iteration_stats.num_generation_tokens
-        )
+        if pts.local_cache_hit:
+            self.counter_prompt_tokens_by_source["local_cache_hit"][engine_idx].inc(
+                pts.local_cache_hit
+            )
+        if pts.external_kv_transfer:
+            self.counter_prompt_tokens_by_source["external_kv_transfer"][
+                engine_idx
+            ].inc(pts.external_kv_transfer)
+        if pts.cached_tokens:
+            self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
+        num_gen_tokens = iteration_stats.num_generation_tokens
+        if num_gen_tokens:
+            gen_counter = self.counter_generation_tokens[engine_idx]
+            gen_entry = self._fast_counter_gen_values.get(engine_idx)
+            if (
+                gen_entry is not None
+                and gen_entry[0] is gen_counter
+                and num_gen_tokens > 0
+            ):
+                gen_entry[1].inc(num_gen_tokens)
+            else:
+                gen_counter.inc(num_gen_tokens)
+        iter_tokens = pts.computed + num_gen_tokens
+        iter_hist = self.histogram_iteration_tokens[engine_idx]
+        iter_entry = self._hist_iter_fast.get(engine_idx)
+        if (
+            iter_entry is not None
+            and iter_entry[0] is iter_hist
+            and iter_tokens == iter_tokens
+        ):
+            _, h_sum, h_bounds, h_buckets = iter_entry
+            h_sum.inc(iter_tokens)
+            h_buckets[bisect_left(h_bounds, iter_tokens)].inc(1)
+        else:
+            iter_hist.observe(iter_tokens)
 
         for max_gen_tokens in iteration_stats.max_num_generation_tokens_iter:
             self.histogram_max_num_generation_tokens_request[engine_idx].observe(
@@ -1283,8 +1468,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_n_request[engine_idx].observe(n_param)
         for ttft in iteration_stats.time_to_first_tokens_iter:
             self.histogram_time_to_first_token[engine_idx].observe(ttft)
-        for itl in iteration_stats.inter_token_latencies_iter:
-            self.histogram_inter_token_latency[engine_idx].observe(itl)
+        itls = iteration_stats.inter_token_latencies_iter
+        if itls:
+            itl_hist = self.histogram_inter_token_latency[engine_idx]
+            if self._hist_itl_fast.get(engine_idx) is itl_hist:
+                if len(itls) == 1:
+                    val = itls[0]
+                    if val <= itl_hist._upper_bounds[0]:
+                        itl_hist._sum.inc(val)
+                        itl_hist._buckets[0].inc(1)
+                    else:
+                        itl_hist.observe(val)
+                else:
+                    _observe_histogram_batch(itl_hist, itls)
+            else:
+                for itl in itls:
+                    itl_hist.observe(itl)
 
         for finished_request in iteration_stats.finished_requests:
             self.counter_request_success[finished_request.finish_reason][

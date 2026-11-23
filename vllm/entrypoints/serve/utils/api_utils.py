@@ -313,3 +313,18 @@ async def validate_json_request(raw_request: Request):
         raise RequestValidationError(
             errors=["Unsupported Media Type: Only 'application/json' is allowed"]
         )
+
+
+def create_model_json_response(
+    result: BaseModel,
+    *,
+    status_code: int = HTTPStatus.OK,
+    headers: Any = None,
+) -> Response:
+    """Serialize a Pydantic response model via Rust pydantic_core directly."""
+    return Response(
+        content=result.model_dump_json(),
+        status_code=status_code,
+        headers=headers,
+        media_type="application/json",
+    )

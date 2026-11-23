@@ -49,6 +49,9 @@ def step_eplb_after(*, is_dummy: bool = False) -> Callable:
     def decorator(fn: Callable) -> Callable:
         @wraps(fn)
         def wrapper(self: Any, *args, **kwargs) -> Any:
+            if self.eplb.state is None:
+                return fn(self, *args, **kwargs)
+
             if kwargs.get("skip_eplb", False):
                 # The router kernel records load before step() is reached.
                 with self.eplb.suppress():

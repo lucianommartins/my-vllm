@@ -15,6 +15,8 @@ from vllm.utils.torch_utils import (
     TORCH_DTYPE_TO_ARRAY_TYPECODE,
     get_accelerator_view_from_cpu_tensor,
 )
+from vllm.v1.worker.gpu._v1_cpu_fast_ops import get_copy_pylist_i32
+from vllm.v1.worker.gpu.triton_fast_launch import FastTritonLauncher
 
 logger = init_logger(__name__)
 
@@ -41,6 +43,7 @@ class UvaBuffer:
             raise RuntimeError("UVA is not available")
         self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
         self.np = self.cpu.numpy()
+        self.np_ptr: int = self.np.ctypes.data
         self._uva = get_accelerator_view_from_cpu_tensor(self.cpu)
 
     def uva(self, n: int | None = None) -> torch.Tensor:
@@ -59,6 +62,7 @@ class NonUvaBuffer:
         )
         self.cpu = torch.zeros(size, dtype=dtype, device="cpu")
         self.np = self.cpu.numpy()
+        self.np_ptr: int = self.np.ctypes.data
         self._uva = torch.zeros(size, dtype=dtype, device=current_platform.device_type)
 
     def uva(self, n: int | None = None) -> torch.Tensor:
@@ -90,6 +94,7 @@ class UvaBufferPool:
         self._uva_bufs = [self._buffer_cls(size, dtype) for _ in range(max_concurrency)]
         # Current buffer index
         self._curr = 0
+        self._copy_pylist_i32 = get_copy_pylist_i32() if dtype == torch.int32 else None
 
     def _next_buf(self, n: int) -> UvaBuffer | NonUvaBuffer:
         # Round robin to the next buffer.
@@ -105,13 +110,23 @@ class UvaBufferPool:
         n = len(x)
         buf = self._next_buf(n)
         # CPU-to-CPU copy
+        if (
+            n > 0
+            and (copy_fn := self._copy_pylist_i32) is not None
+            and type(x) is list
+            and copy_fn(x, buf.np_ptr)
+        ):
+            return buf.uva(n)
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
         dst[:n] = x
         return buf.uva(n)
 
     def copy_chunks_to_uva(self, chunks: Sequence[_Chunk], n: int) -> torch.Tensor:
         buf = self._next_buf(n)
-        np.concatenate(chunks, out=buf.np[:n], casting="unsafe")
+        if len(chunks) == 1:
+            buf.np[:n] = chunks[0]
+        else:
+            np.concatenate(chunks, out=buf.np[:n], casting="unsafe")
         return buf.uva(n)
 
     def copy_to_gpu(
@@ -188,6 +203,13 @@ class StagedWriteTensor:
         self._staged_write_max_len = 0
         self._staged_write_chunks: list[_Chunk] = []
         self._staged_write_len = 0
+        self._copy_pylist_i32 = (
+            get_copy_pylist_i32() if self._typecode == "i" else None
+        )
+        self._i32_scratch: np.ndarray | None = None
+        self._i32_scratch_ptr = 0
+        self._i32_scratch_used = 0
+        self._i32_scratch_chunk_start = -1
 
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
 
@@ -195,6 +217,16 @@ class StagedWriteTensor:
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_contents = new_buffer(1, dtype=dtype)
+
+    def _flush_i32_scratch(self) -> None:
+        if self._i32_scratch_chunk_start >= 0:
+            assert self._i32_scratch is not None
+            self._staged_write_chunks.append(
+                self._i32_scratch[
+                    self._i32_scratch_chunk_start : self._i32_scratch_used
+                ]
+            )
+            self._i32_scratch_chunk_start = -1
 
     def stage_write(
         self, index: int, start: int, x: Collection[int] | Collection[float]
@@ -210,24 +242,69 @@ class StagedWriteTensor:
         n = len(x)
         if not n:
             return
-        contents = self._staged_write_contents
-        if isinstance(x, list):
-            contents.fromlist(x)  # fromlist sizes the array once.
+        if type(x) is list:
+            if n >= 8 and (copy_fn := self._copy_pylist_i32) is not None:
+                scratch = self._i32_scratch
+                used = self._i32_scratch_used
+                needed = used + n
+                if scratch is None or needed > scratch.size:
+                    if self._i32_scratch_chunk_start >= 0:
+                        self._flush_i32_scratch()
+                    cur_cap = scratch.size if scratch is not None else 0
+                    new_cap = max(cur_cap * 2, n, 1024)
+                    scratch = np.empty(new_cap, dtype=np.int32)
+                    self._i32_scratch = scratch
+                    self._i32_scratch_ptr = scratch.ctypes.data
+                    self._i32_scratch_used = 0
+                    used = 0
+                    needed = n
+                if copy_fn(x, self._i32_scratch_ptr + (used << 2)):
+                    contents = self._staged_write_contents
+                    if contents:
+                        self._staged_write_chunks.append(contents)
+                        self._staged_write_contents = array.array(self._typecode)
+                    if self._i32_scratch_chunk_start < 0:
+                        self._i32_scratch_chunk_start = used
+                    self._i32_scratch_used = needed
+                    new_len = self._staged_write_len + n
+                    self._staged_write_len = new_len
+                    self._staged_write_indices.append(index)
+                    self._staged_write_starts.append(start)
+                    self._staged_write_cu_lens.append(new_len)
+                    if n > self._staged_write_max_len:
+                        self._staged_write_max_len = n
+                    return
+            if self._i32_scratch_chunk_start >= 0:
+                self._flush_i32_scratch()
+            self._staged_write_contents.fromlist(x)  # fromlist sizes the array once.
+        elif isinstance(x, list):
+            if self._i32_scratch_chunk_start >= 0:
+                self._flush_i32_scratch()
+            self._staged_write_contents.fromlist(x)
         elif isinstance(x, _BUFFER_TYPES):
+            contents = self._staged_write_contents
             if contents:
                 self._staged_write_chunks.append(contents)
                 self._staged_write_contents = array.array(self._typecode)
+            elif self._i32_scratch_chunk_start >= 0:
+                self._flush_i32_scratch()
             self._staged_write_chunks.append(x)
         else:
-            contents.extend(x)
-        self._staged_write_len += n
+            if self._i32_scratch_chunk_start >= 0:
+                self._flush_i32_scratch()
+            self._staged_write_contents.extend(x)
+        new_len = self._staged_write_len + n
+        self._staged_write_len = new_len
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(start)
-        self._staged_write_cu_lens.append(self._staged_write_len)
-        self._staged_write_max_len = max(self._staged_write_max_len, n)
+        self._staged_write_cu_lens.append(new_len)
+        if n > self._staged_write_max_len:
+            self._staged_write_max_len = n
 
     def stage_write_elem(self, index: int, x: int) -> None:
         assert index >= 0
+        if self._i32_scratch_chunk_start >= 0:
+            self._flush_i32_scratch()
         self._staged_write_contents.append(x)
         self._staged_write_len += 1
         self._staged_write_indices.append(index)
@@ -249,17 +326,35 @@ class StagedWriteTensor:
         )
 
         # Write diffs to the GPU buffer
-        _apply_write_kernel[(n, _num_write_chunks(self._staged_write_max_len))](
-            self.gpu,
-            self.gpu.stride(0),
-            indices_uva,
-            starts_uva,
-            write_contents,
-            cu_lens_uva,
-            None,
-            BLOCK_SIZE=_WRITE_BLOCK_SIZE,
-            MULTI_GROUP=False,
-        )
+        n_chunks = _num_write_chunks(self._staged_write_max_len)
+        if self.gpu.device.type == "cuda":
+            _APPLY_WRITE_LAUNCHER.launch_on_device(
+                n,
+                n_chunks,
+                1,
+                self.gpu.device,
+                self.gpu,
+                self.gpu.stride(0),
+                indices_uva,
+                starts_uva,
+                write_contents,
+                cu_lens_uva,
+                None,
+                _WRITE_BLOCK_SIZE,
+                False,
+            )
+        else:
+            _apply_write_kernel[(n, n_chunks)](
+                self.gpu,
+                self.gpu.stride(0),
+                indices_uva,
+                starts_uva,
+                write_contents,
+                cu_lens_uva,
+                None,
+                BLOCK_SIZE=_WRITE_BLOCK_SIZE,
+                MULTI_GROUP=False,
+            )
         # Clear the staged writes
         self.clear_staged_writes()
 
@@ -272,10 +367,23 @@ class StagedWriteTensor:
         self._staged_write_max_len = 0
         self._staged_write_chunks.clear()
         self._staged_write_len = 0
+        if self._i32_scratch_used:
+            self._i32_scratch_used = 0
+            self._i32_scratch_chunk_start = -1
 
     def _staged_chunks(self) -> list[_Chunk]:
+        if self._i32_scratch_chunk_start >= 0:
+            assert self._i32_scratch is not None
+            tail = self._i32_scratch[
+                self._i32_scratch_chunk_start : self._i32_scratch_used
+            ]
+            if not self._staged_write_chunks:
+                return [tail]
+            return [*self._staged_write_chunks, tail]
         if not self._staged_write_contents:
             return self._staged_write_chunks
+        if not self._staged_write_chunks:
+            return [self._staged_write_contents]
         return [*self._staged_write_chunks, self._staged_write_contents]
 
 
@@ -309,22 +417,56 @@ class FusedStagedWriter:
         cu_lens: list[int] = []
         max_len = 0
         content_base = 0
+        single_group_id = -1
+        single_tensor: StagedWriteTensor | None = None
 
         for group_id, t in enumerate(tensors):
             n = len(t._staged_write_indices)
             if n == 0:
                 continue
 
-            group_ids.extend([group_id] * n)
-            indices.extend(t._staged_write_indices)
-            starts.extend(t._staged_write_starts)
+            if single_group_id == -1:
+                single_group_id = group_id
+                single_tensor = t
+                if n == 1:
+                    group_ids.append(group_id)
+                else:
+                    group_ids.extend([group_id] * n)
+                content_base = t._staged_write_len
+                max_len = t._staged_write_max_len
+                continue
+
+            if single_tensor is not None:
+                indices.extend(single_tensor._staged_write_indices)
+                starts.extend(single_tensor._staged_write_starts)
+                contents.extend(single_tensor._staged_chunks())
+                cu_lens.extend(single_tensor._staged_write_cu_lens)
+                single_tensor = None
+
+            if n == 1:
+                group_ids.append(group_id)
+                indices.append(t._staged_write_indices[0])
+                starts.append(t._staged_write_starts[0])
+                cu_lens.append(content_base + t._staged_write_cu_lens[0])
+            else:
+                group_ids.extend([group_id] * n)
+                indices.extend(t._staged_write_indices)
+                starts.extend(t._staged_write_starts)
+                cu_lens.extend(
+                    content_base + cu_len for cu_len in t._staged_write_cu_lens
+                )
             contents.extend(t._staged_chunks())
-            cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
             content_base += t._staged_write_len
             max_len = max(max_len, t._staged_write_max_len)
 
-        if not group_ids:
+        if single_group_id == -1:
             return
+
+        if single_tensor is not None:
+            indices = single_tensor._staged_write_indices
+            starts = single_tensor._staged_write_starts
+            cu_lens = single_tensor._staged_write_cu_lens
+            contents = single_tensor._staged_chunks()
 
         group_ids_uva = self.group_ids.copy_to_uva(group_ids)
         indices_uva = self.indices.copy_to_uva(indices)
@@ -332,17 +474,35 @@ class FusedStagedWriter:
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
         contents_uva = self.contents.copy_chunks_to_uva(contents, content_base)
 
-        _apply_write_kernel[(len(group_ids), _num_write_chunks(max_len))](
-            output_ptrs,
-            output_strides,
-            indices_uva,
-            starts_uva,
-            contents_uva,
-            cu_lens_uva,
-            group_ids_uva,
-            BLOCK_SIZE=_WRITE_BLOCK_SIZE,
-            MULTI_GROUP=True,
-        )
+        n_chunks = _num_write_chunks(max_len)
+        if self.device.type == "cuda":
+            _APPLY_WRITE_LAUNCHER.launch_on_device(
+                len(group_ids),
+                n_chunks,
+                1,
+                self.device,
+                output_ptrs,
+                output_strides,
+                indices_uva,
+                starts_uva,
+                contents_uva,
+                cu_lens_uva,
+                group_ids_uva,
+                _WRITE_BLOCK_SIZE,
+                True,
+            )
+        else:
+            _apply_write_kernel[(len(group_ids), n_chunks)](
+                output_ptrs,
+                output_strides,
+                indices_uva,
+                starts_uva,
+                contents_uva,
+                cu_lens_uva,
+                group_ids_uva,
+                BLOCK_SIZE=_WRITE_BLOCK_SIZE,
+                MULTI_GROUP=True,
+            )
         for t in tensors:
             t.clear_staged_writes()
 
@@ -394,3 +554,9 @@ def _load_ptr(ptr_to_ptr, elem_dtype):
     ptr = tl.load(ptr_to_ptr)
     ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))
     return tl.multiple_of(ptr, 16)
+
+
+_APPLY_WRITE_LAUNCHER = FastTritonLauncher(
+    _apply_write_kernel,
+    constexpr_names=("BLOCK_SIZE", "MULTI_GROUP"),
+)

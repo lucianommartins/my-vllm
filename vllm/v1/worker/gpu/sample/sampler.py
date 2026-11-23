@@ -142,15 +142,32 @@ class Sampler:
         idx_mapping_np = input_batch.idx_mapping_np
         cu_num_logits_np = input_batch.cu_num_logits_np
         expanded_local_pos = input_batch.expanded_local_pos
-        pos = input_batch.positions[input_batch.logits_indices]
-        input_ids = input_batch.input_ids[input_batch.logits_indices]
-        seq_lens_upper_bound_np = input_batch.seq_lens_cpu_upper_bound.numpy()
+        num_reqs = input_batch.num_reqs
+        is_decode_single_logit = (
+            not input_batch.has_prefill
+            and input_batch.num_draft_tokens == 0
+            and input_batch.num_tokens == num_reqs
+            and cu_num_logits_np[-1] == num_reqs
+        )
+        if is_decode_single_logit:
+            pos = input_batch.positions[:num_reqs]
+            input_ids = input_batch.input_ids[:num_reqs]
+        else:
+            pos = input_batch.positions[input_batch.logits_indices]
+            input_ids = input_batch.input_ids[input_batch.logits_indices]
+        seq_lens_upper_bound_np = input_batch.seq_lens_cpu_upper_bound_np
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.compute_nans else None
 
-        logprobs_dims = self.get_logprobs_dims(idx_mapping_np)
+        if (
+            not self.sampling_states._has_any_logprobs
+            and not self.logprob_token_ids_state._has_any_token_ids
+        ):
+            logprobs_dims = None
+        else:
+            logprobs_dims = self.get_logprobs_dims(idx_mapping_np)
 
         sampled, processed_logits = self.sample(
             logits,
@@ -162,6 +179,9 @@ class Sampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
             return_logprobs=logprobs_dims is not None,
+            expanded_idx_mapping_i32=input_batch.expanded_idx_mapping_i32,
+            idx_mapping_bytes=input_batch.idx_mapping_bytes,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
         )
 
         if self.trace_replay_state is not None:
@@ -191,13 +211,25 @@ class Sampler:
         # 1 sampled token per request, except chunked-prefill requests
         # (seq_len < prefill_len) which aren't done prefilling and produce no
         # output token. num_rejected is always 0 here (one logit per request).
-        num_sampled, num_rejected = get_num_sampled_and_rejected(
-            input_batch.seq_lens.new_ones(input_batch.num_reqs),
-            input_batch.seq_lens,
-            input_batch.cu_num_logits,
-            input_batch.idx_mapping,
-            self.req_states.prefill_len.gpu,
-        )
+        if is_decode_single_logit:
+            device = input_batch.seq_lens.device
+            ones = getattr(self, "_decode_ones", None)
+            if ones is None or ones.device != device or ones.shape[0] < num_reqs:
+                cap = max(self.sampling_states.max_num_reqs, num_reqs)
+                ones = torch.ones(cap, dtype=torch.int32, device=device)
+                zeros = torch.zeros(cap, dtype=torch.int32, device=device)
+                self._decode_ones = ones
+                self._decode_zeros = zeros
+            num_sampled = self._decode_ones[:num_reqs]
+            num_rejected = self._decode_zeros[:num_reqs]
+        else:
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                input_batch.seq_lens.new_ones(input_batch.num_reqs),
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.req_states.prefill_len.gpu,
+            )
 
         sampling_mask_tensors = None
         if self.return_sampling_mask:
@@ -221,6 +253,7 @@ class Sampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
             sampling_mask_tensors=sampling_mask_tensors,
+            num_sampled_all_ones=is_decode_single_logit,
         )
         return sampler_output
 
@@ -242,23 +275,24 @@ class Sampler:
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
 
-        ctx = LogitsContext(
-            expanded_idx_mapping=expanded_idx_mapping,
-            idx_mapping=idx_mapping,
-            idx_mapping_np=idx_mapping_np,
-            expanded_local_pos=expanded_local_pos,
-            input_ids=input_ids,
-            pos=pos,
-            seq_lens_upper_bound_np=seq_lens_upper_bound_np,
-        )
+        if np.any(self.needs_pre_top_k_proc[idx_mapping_np]):
+            ctx = LogitsContext(
+                expanded_idx_mapping=expanded_idx_mapping,
+                idx_mapping=idx_mapping,
+                idx_mapping_np=idx_mapping_np,
+                expanded_local_pos=expanded_local_pos,
+                input_ids=input_ids,
+                pos=pos,
+                seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+            )
 
-        # Apply logits processors (native + any custom).
-        for processor in self.logits_processors:
-            logits = processor.apply(logits, ctx)
+            # Apply logits processors (native + any custom).
+            for processor in self.logits_processors:
+                logits = processor.apply(logits, ctx)
 
-        # Forcing runs last so no stage can overwrite the forced end marker
-        # or weaken it by scaling.
-        self.thinking_budget_state.apply(logits, ctx)
+            # Forcing runs last so no stage can overwrite the forced end marker
+            # or weaken it by scaling.
+            self.thinking_budget_state.apply(logits, ctx)
 
         # Apply temperature in place.
         self.sampling_states.apply_temperature(
@@ -285,8 +319,11 @@ class Sampler:
         pos: torch.Tensor,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
-        seq_lens_upper_bound_np: np.ndarray,
+        seq_lens_upper_bound_np: np.ndarray | None,
         return_logprobs: bool = False,
+        expanded_idx_mapping_i32: torch.Tensor | None = None,
+        idx_mapping_bytes: bytes | None = None,
+        seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             self._is_sm80_cuda
@@ -299,34 +336,70 @@ class Sampler:
             and not envs.VLLM_BATCH_INVARIANT
             and not (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
             and idx_mapping_np.size > 0
-            and not np.any(self.needs_pre_top_k_proc[idx_mapping_np])
-            and np.all(self.sampling_states.min_p.np[idx_mapping_np] == 0.0)
         ):
-            temp_np = self.sampling_states.temperature.np[idx_mapping_np]
-            if np.all(temp_np == 0.0):
-                from vllm._gemma4_sm80_ops import fast_greedy_argmax
+            cur_epoch = self.sampling_states.epoch
+            cached_epoch = getattr(self, "_sm80_plan_epoch", -1)
+            cached_idx_bytes = getattr(self, "_sm80_plan_idx_bytes", None)
+            idx_bytes = (
+                idx_mapping_bytes
+                if idx_mapping_bytes is not None
+                else idx_mapping_np.tobytes()
+            )
+            if cached_epoch == cur_epoch and cached_idx_bytes == idx_bytes:
+                mode, max_k, do_top_p = self._sm80_plan_val
+            else:
+                mode = 0
+                max_k = 0
+                do_top_p = False
+                if not np.any(self.needs_pre_top_k_proc[idx_mapping_np]) and np.all(
+                    self.sampling_states.min_p.np[idx_mapping_np] == 0.0
+                ):
+                    temp_np = self.sampling_states.temperature.np[idx_mapping_np]
+                    if np.all(temp_np == 0.0):
+                        mode = 1
+                    elif not np.any(temp_np == 0.0):
+                        max_k = int(np.max(self.sampling_states.top_k.np[idx_mapping_np]))
+                        if 1 <= max_k <= 256:
+                            mode = 2
+                            do_top_p = bool(
+                                np.any(self.sampling_states.top_p.np[idx_mapping_np] < 1.0)
+                            )
+                self._sm80_plan_epoch = cur_epoch
+                self._sm80_plan_idx_bytes = idx_bytes
+                self._sm80_plan_val = (mode, max_k, do_top_p)
 
-                return fast_greedy_argmax(logits), logits
-            if not np.any(temp_np == 0.0):
-                top_k_np = self.sampling_states.top_k.np[idx_mapping_np]
-                max_k = int(np.max(top_k_np))
-                if 1 <= max_k <= 256:
+            if mode == 1:
+                fn = getattr(self, "_sm80_fast_greedy", None)
+                if fn is None:
+                    from vllm._gemma4_sm80_ops import fast_greedy_argmax
+
+                    fn = fast_greedy_argmax
+                    self._sm80_fast_greedy = fn
+                return fn(logits), logits
+            if mode == 2:
+                fn = getattr(self, "_sm80_fast_topk_topp", None)
+                if fn is None:
                     from vllm._gemma4_sm80_ops import fast_topk_topp_gumbel_sample
 
-                    do_top_p = bool(
-                        np.any(self.sampling_states.top_p.np[idx_mapping_np] < 1.0)
-                    )
-                    sampled = fast_topk_topp_gumbel_sample(
-                        logits,
-                        expanded_idx_mapping,
-                        self.sampling_states.temperature.gpu,
-                        self.sampling_states.top_k.gpu,
-                        self.sampling_states.top_p.gpu if do_top_p else None,
-                        self.sampling_states.seeds.gpu,
-                        pos,
-                        max_k,
-                    )
-                    return sampled, logits
+                    fn = fast_topk_topp_gumbel_sample
+                    self._sm80_fast_topk_topp = fn
+                sampled = fn(
+                    logits,
+                    expanded_idx_mapping_i32
+                    if expanded_idx_mapping_i32 is not None
+                    else expanded_idx_mapping,
+                    self.sampling_states.temperature.gpu,
+                    self.sampling_states.top_k.gpu,
+                    self.sampling_states.top_p.gpu if do_top_p else None,
+                    self.sampling_states.seeds.gpu,
+                    pos,
+                    max_k,
+                )
+                return sampled, logits
+
+        if seq_lens_upper_bound_np is None:
+            assert seq_lens_cpu_upper_bound is not None
+            seq_lens_upper_bound_np = seq_lens_cpu_upper_bound.numpy()
 
         processed_logits = self.apply_sampling_params(
             logits,

@@ -27,6 +27,23 @@ logger = init_logger(__name__)
 
 
 @cache
+def _get_sm80_fused_softcap_fn() -> (
+    Callable[[torch.Tensor, float, float], None] | None
+):
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability((8, 0))
+    ):
+        return None
+    try:
+        from vllm._gemma4_sm80_ops import fused_softcap_inplace
+
+        return fused_softcap_inplace
+    except ImportError:
+        return None
+
+
+@cache
 def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | None:
     """FlashInfer's radix top-k, or None for torch.topk.
 
@@ -94,6 +111,9 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        self._sm80_fused_softcap = (
+            _get_sm80_fused_softcap_fn() if self.soft_cap is not None else None
+        )
 
     def forward(
         self,
@@ -104,28 +124,37 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor | None:
         if self.logits_as_input:
             logits = hidden_states
+        elif (
+            not skip_gather
+            and (self.head_dtype is None or self.head_dtype == hidden_states.dtype)
+            and lm_head.tp_size == 1
+        ):
+            logits = lm_head.quant_method.apply(
+                lm_head, hidden_states, bias=embedding_bias
+            )
+            if logits is not None and logits.shape[-1] != self.org_vocab_size:
+                logits = logits[..., : self.org_vocab_size]
         else:
             # Get the logits for the next tokens.
             logits = self._get_logits(
                 hidden_states, lm_head, embedding_bias, skip_gather
             )
         if logits is not None:
-            if self.soft_cap is not None:
+            soft_cap = self.soft_cap
+            if soft_cap is not None:
+                fused_softcap = self._sm80_fused_softcap
                 if (
-                    current_platform.is_cuda()
-                    and current_platform.is_device_capability((8, 0))
+                    fused_softcap is not None
                     and logits.is_cuda
                     and logits.is_contiguous()
                     and logits.dtype in (torch.bfloat16, torch.float32)
                     and not torch.is_grad_enabled()
                 ):
-                    from vllm._gemma4_sm80_ops import fused_softcap_inplace
-
-                    fused_softcap_inplace(logits, self.soft_cap, self.scale)
+                    fused_softcap(logits, soft_cap, self.scale)
                     return logits
-                logits = logits / self.soft_cap
+                logits = logits / soft_cap
                 logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
+                logits = logits * soft_cap
 
             if self.scale != 1.0:
                 logits *= self.scale

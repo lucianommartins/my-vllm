@@ -4,8 +4,14 @@
 
 from http import HTTPStatus
 
-from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, FastAPI, Request, Response
+
+from vllm.entrypoints.serve.instrumentator._fast_middleware import (
+    FastStreamingResponse,
+)
+from vllm.entrypoints.serve.utils.orjson_route import FastOrjsonAPIRoute
+from fastapi.responses import JSONResponse
+from vllm.entrypoints.serve.utils.api_utils import create_model_json_response
 
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
@@ -26,7 +32,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-router = APIRouter()
+router = APIRouter(route_class=FastOrjsonAPIRoute)
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 
@@ -57,22 +63,47 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if handler is None:
         raise NotImplementedError("The model does not support Completions API")
 
-    generator = await handler.create_completion(request, raw_request)
+    handler_cls = type(handler)
+    if (
+        getattr(handler_cls, "create_completion", None)
+        is OpenAIServingCompletion.create_completion
+    ):
+        use_raw_json = (
+            not request.stream
+            and getattr(handler_cls, "request_output_to_completion_response", None)
+            is OpenAIServingCompletion.request_output_to_completion_response
+        )
+        generator = await handler.create_completion(
+            request, raw_request, _yield_bytes=True, _raw_json=use_raw_json
+        )
+    else:
+        generator = await handler.create_completion(request, raw_request)
+
+    if type(generator) is bytes:
+        return Response(
+            content=generator,
+            status_code=HTTPStatus.OK,
+            headers=metrics_header(metrics_header_format),
+            media_type="application/json",
+        )
 
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
+        return create_model_json_response(
+            generator, status_code=generator.error.code
         )
     elif isinstance(generator, CompletionResponse):
-        return JSONResponse(
-            content=generator.model_dump(),
-            headers=metrics_header(metrics_header_format),
+        return create_model_json_response(
+            generator, headers=metrics_header(metrics_header_format)
         )
 
     args = getattr(raw_request.app.state, "args", None)
     keep_alive_interval = getattr(args, "sse_keep_alive_interval", 0)
-    return StreamingResponse(
-        content=with_sse_keep_alive(generator, float(keep_alive_interval)),
+    return FastStreamingResponse(
+        content=(
+            with_sse_keep_alive(generator, float(keep_alive_interval))
+            if keep_alive_interval
+            else generator
+        ),
         media_type="text/event-stream",
     )
 

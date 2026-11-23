@@ -1504,7 +1504,6 @@ class Worker(WorkerBase):
             )
         return self.profiler.annotate_context_manager(annotation)
 
-    @torch.inference_mode()
     @with_gpu_sync_check
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"

@@ -3,6 +3,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.triton_fast_launch import FastTritonLauncher
 
 
 @triton.jit
@@ -57,10 +58,40 @@ def greedy_argmax(logits: torch.Tensor) -> torch.Tensor:
     splits = triton.cdiv(vocab, block)
     values = torch.empty((rows, splits), dtype=torch.float32, device=logits.device)
     indices = torch.empty((rows, splits), dtype=torch.int32, device=logits.device)
-    _argmax_partial[(rows, splits)](
-        logits, values, indices, vocab, logits.stride(0), splits, block, num_warps=4
+    _ARGMAX_PARTIAL_LAUNCHER.launch_on_device(
+        rows,
+        splits,
+        1,
+        logits.device,
+        logits,
+        values,
+        indices,
+        vocab,
+        logits.stride(0),
+        splits,
+        block,
     )
-    _argmax_finish[(rows,)](
-        values, indices, out, splits, triton.next_power_of_2(splits), num_warps=1
+    _ARGMAX_FINISH_LAUNCHER.launch_on_device(
+        rows,
+        1,
+        1,
+        logits.device,
+        values,
+        indices,
+        out,
+        splits,
+        triton.next_power_of_2(splits),
     )
     return out
+
+
+_ARGMAX_PARTIAL_LAUNCHER = FastTritonLauncher(
+    _argmax_partial,
+    constexpr_names=("N", "SX", "SPLITS", "BLOCK"),
+    compile_kwargs={"num_warps": 4},
+)
+_ARGMAX_FINISH_LAUNCHER = FastTritonLauncher(
+    _argmax_finish,
+    constexpr_names=("SPLITS", "BLOCK"),
+    compile_kwargs={"num_warps": 1},
+)

@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import uuid
+import os
 
 import torch
 
-MASK_64_BITS = (1 << 64) - 1
+_urandom = os.urandom
 
 
 def random_uuid() -> str:
-    return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
+    """Return 16 lowercase hex characters from 64 cryptographic random bits."""
+    return _urandom(8).hex()
 
 
 def length_from_prompt_token_ids_or_embeds(

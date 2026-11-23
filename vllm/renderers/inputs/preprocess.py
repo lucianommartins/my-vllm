@@ -250,6 +250,16 @@ def extract_prompt_components(
     model_config: "ModelConfig",
     prompt: PromptType | EngineInput,
 ) -> PromptComponents:
+    if (
+        isinstance(prompt, dict)
+        and "type" in prompt
+        and not model_config.is_encoder_decoder
+    ):
+        return PromptComponents(
+            text=prompt.get("prompt"),
+            token_ids=prompt.get("prompt_token_ids"),
+            embeds=prompt.get("prompt_embeds"),
+        )
     target_prompt = extract_target_prompt(model_config, prompt)
 
     return PromptComponents(
@@ -263,6 +273,15 @@ def extract_prompt_len(
     model_config: "ModelConfig",
     prompt: PromptType | EngineInput,
 ):
+    if (
+        isinstance(prompt, dict)
+        and "type" in prompt
+        and not model_config.is_encoder_decoder
+    ):
+        return length_from_prompt_token_ids_or_embeds(
+            prompt.get("prompt_token_ids"),
+            prompt.get("prompt_embeds"),
+        )
     target_prompt = extract_target_prompt(model_config, prompt)
 
     return length_from_prompt_token_ids_or_embeds(

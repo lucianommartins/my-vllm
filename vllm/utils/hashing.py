@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+import struct
 from _hashlib import HASH, UnsupportedDigestmodError
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import cbor2
@@ -58,6 +59,70 @@ def sha256_cbor(input: Any) -> bytes:
     """
     input_bytes = cbor2.dumps(input, canonical=True)
     return hashlib.sha256(input_bytes).digest()
+
+
+_CBOR_UINT16_BYTES: tuple[bytes, ...] = tuple(
+    bytes((t,))
+    if t < 24
+    else bytes((0x18, t))
+    if t < 256
+    else struct.pack(">BH", 0x19, t)
+    for t in range(65536)
+)
+_CBOR_UINT32_PACK = struct.Struct(">BI").pack
+_CBOR_HDR_32_16 = b"\x83\x58\x20"
+
+
+def _encode_cbor_block_plain_bytes(
+    parent_hash: bytes,
+    token_ids: Sequence[int],
+) -> bytes | None:
+    """Encode ``(parent_hash, tuple(token_ids), None)`` in canonical CBOR.
+
+    Returns ``None`` if inputs fall outside the fast range so callers can fall
+    back to ``cbor2.dumps(..., canonical=True)``.
+    """
+    n_toks = len(token_ids)
+    if n_toks > 255:
+        return None
+    plen = len(parent_hash)
+    if plen == 32 and n_toks < 24:
+        parts: list[bytes] = [_CBOR_HDR_32_16, parent_hash, bytes((0x80 + n_toks,))]
+    else:
+        if plen < 24:
+            p_hdr = bytes((0x40 + plen,))
+        elif plen < 256:
+            p_hdr = bytes((0x58, plen))
+        else:
+            return None
+        t_hdr = bytes((0x80 + n_toks,)) if n_toks < 24 else bytes((0x98, n_toks))
+        parts = [b"\x83", p_hdr, parent_hash, t_hdr]
+
+    tbl = _CBOR_UINT16_BYTES
+    pack_u32 = _CBOR_UINT32_PACK
+    parts_append = parts.append
+    for tok in token_ids:
+        if type(tok) is not int:
+            return None
+        if 0 <= tok < 65536:
+            parts_append(tbl[tok])
+        elif 65536 <= tok <= 0xFFFFFFFF:
+            parts_append(pack_u32(0x1A, tok))
+        else:
+            return None
+    parts_append(b"\xf6")
+    return b"".join(parts)
+
+
+def sha256_cbor_block_plain(
+    parent_hash: bytes,
+    token_ids: Sequence[int],
+) -> bytes | None:
+    """Fast canonical CBOR + SHA-256 digest for plain ``extra_keys=None`` blocks."""
+    encoded = _encode_cbor_block_plain_bytes(parent_hash, token_ids)
+    if encoded is None:
+        return None
+    return hashlib.sha256(encoded).digest()
 
 
 def _xxhash_digest(input_bytes: bytes) -> bytes:

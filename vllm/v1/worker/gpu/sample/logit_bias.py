@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -53,6 +53,31 @@ class LogitBiasState(LogitsProcessor):
 
         # Using any of the above.
         self.use_logit_bias = np.zeros(max_num_reqs, dtype=bool)
+        self._uva_dirty = 0
+        self._staged_dirty = 0
+        self._uva_buffers = (
+            self.num_allowed_token_ids,
+            self.num_logit_bias,
+            self.min_lens,
+            self.num_stop_token_ids,
+            self.restore_when_all_masked,
+        )
+        self._staged_buffers = (
+            self.allowed_token_ids,
+            self.logit_bias_token_ids,
+            self.logit_bias,
+            self.stop_token_ids,
+        )
+
+    def _set_uva(self, idx: int, req_idx: int, value: int) -> None:
+        buf = self._uva_buffers[idx]
+        if buf.np[req_idx] != value:
+            buf.np[req_idx] = value
+            self._uva_dirty |= 1 << idx
+
+    def _stage(self, idx: int, req_idx: int, values: Any) -> None:
+        self._staged_buffers[idx].stage_write(req_idx, 0, values)
+        self._staged_dirty |= 1 << idx
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
         prompt_len = int(self.prompt_len_np[req_idx])
@@ -68,11 +93,11 @@ class LogitBiasState(LogitsProcessor):
                     f"Too many allowed token IDs: {num_allowed_token_ids}. "
                     f"The max size is {MAX_NUM_ALLOWED_TOKEN_IDS}."
                 )
-            self.num_allowed_token_ids.np[req_idx] = num_allowed_token_ids
-            self.allowed_token_ids.stage_write(req_idx, 0, allowed_token_ids)
+            self._set_uva(0, req_idx, num_allowed_token_ids)
+            self._stage(0, req_idx, allowed_token_ids)
             use_logit_bias = True
         else:
-            self.num_allowed_token_ids.np[req_idx] = 0
+            self._set_uva(0, req_idx, 0)
 
         # Logit bias.
         logit_bias = sampling_params.logit_bias
@@ -83,17 +108,15 @@ class LogitBiasState(LogitsProcessor):
                     f"Too many logit bias tokens: {num_logit_bias}. "
                     f"The max size is {MAX_NUM_LOGIT_BIAS_TOKENS}."
                 )
-            self.num_logit_bias.np[req_idx] = num_logit_bias
-            self.logit_bias_token_ids.stage_write(req_idx, 0, logit_bias.keys())
-            self.logit_bias.stage_write(req_idx, 0, logit_bias.values())
+            self._set_uva(1, req_idx, num_logit_bias)
+            self._stage(1, req_idx, logit_bias.keys())
+            self._stage(2, req_idx, logit_bias.values())
             use_logit_bias = True
         else:
-            self.num_logit_bias.np[req_idx] = 0
+            self._set_uva(1, req_idx, 0)
 
         # Min tokens.
         min_tokens = sampling_params.min_tokens
-        min_len = prompt_len + min_tokens
-        self.min_lens.np[req_idx] = min_len
         stop_token_ids = sampling_params.all_stop_token_ids
         if min_tokens > 0 and stop_token_ids:
             num_stop_token_ids = len(stop_token_ids)
@@ -102,31 +125,31 @@ class LogitBiasState(LogitsProcessor):
                     f"Too many stop tokens: {num_stop_token_ids}. "
                     f"The max size is {MAX_NUM_STOP_TOKEN_IDS}."
                 )
-            self.num_stop_token_ids.np[req_idx] = num_stop_token_ids
-            self.stop_token_ids.stage_write(req_idx, 0, stop_token_ids)
-            self.restore_when_all_masked.np[req_idx] = int(
-                sampling_params.structured_outputs is not None
-            )
+            self._set_uva(2, req_idx, prompt_len + min_tokens)
+            self._set_uva(3, req_idx, num_stop_token_ids)
+            self._stage(3, req_idx, stop_token_ids)
+            self._set_uva(4, req_idx, int(sampling_params.structured_outputs is not None))
             use_logit_bias = True
         else:
-            self.num_stop_token_ids.np[req_idx] = 0
-            self.restore_when_all_masked.np[req_idx] = 0
+            self._set_uva(3, req_idx, 0)
+            self._set_uva(4, req_idx, 0)
 
         self.use_logit_bias[req_idx] = use_logit_bias
         return use_logit_bias
 
     def apply_staged_writes(self) -> None:
-        self.num_allowed_token_ids.copy_to_uva()
-        self.allowed_token_ids.apply_write()
-
-        self.num_logit_bias.copy_to_uva()
-        self.logit_bias_token_ids.apply_write()
-        self.logit_bias.apply_write()
-
-        self.min_lens.copy_to_uva()
-        self.num_stop_token_ids.copy_to_uva()
-        self.restore_when_all_masked.copy_to_uva()
-        self.stop_token_ids.apply_write()
+        uva_mask = self._uva_dirty
+        if uva_mask:
+            for idx, buf in enumerate(self._uva_buffers):
+                if uva_mask & (1 << idx):
+                    buf.copy_to_uva()
+            self._uva_dirty = 0
+        staged_mask = self._staged_dirty
+        if staged_mask:
+            for idx, buf in enumerate(self._staged_buffers):
+                if staged_mask & (1 << idx):
+                    buf.apply_write()
+            self._staged_dirty = 0
 
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
         if not np.any(self.use_logit_bias[ctx.idx_mapping_np]):

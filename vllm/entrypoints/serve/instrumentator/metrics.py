@@ -61,7 +61,11 @@ def attach_router(app: FastAPI):
     # with header "Content-Type: text/plain; version=0.0.4; charset=utf-8"
     # instead of the default "application/json" which is incorrect.
     # See https://github.com/trallnag/prometheus-fastapi-instrumentator/issues/163#issue-1296092364
-    Instrumentator(
+    from vllm.entrypoints.serve.instrumentator._fast_middleware import (
+        FastInstrumentator,
+    )
+
+    FastInstrumentator(
         excluded_handlers=[
             "/metrics",
             "/health",

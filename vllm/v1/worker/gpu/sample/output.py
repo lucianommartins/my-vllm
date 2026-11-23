@@ -21,6 +21,7 @@ class SamplerOutput:
     num_sampled: torch.Tensor
     num_rejected: torch.Tensor
     sampling_mask_tensors: SamplingMaskTensors | None = None
+    num_sampled_all_ones: bool = False
 
 
 @triton.jit

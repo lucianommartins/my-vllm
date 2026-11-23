@@ -3,7 +3,7 @@
 import uuid
 from collections.abc import Awaitable
 
-from starlette.datastructures import Headers, MutableHeaders
+from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
@@ -20,17 +20,31 @@ class XRequestIdMiddleware:
         if scope["type"] not in ("http", "websocket"):
             return self.app(scope, receive, send)
 
-        # Extract the request headers.
-        request_headers = Headers(scope=scope)
+        request_id_bytes: bytes | None = None
+        headers = scope.get("headers")
+        if headers:
+            for k, v in headers:
+                if k == b"x-request-id" or (
+                    len(k) == 12 and k.lower() == b"x-request-id"
+                ):
+                    request_id_bytes = v
+                    break
 
-        async def send_with_request_id(message: Message) -> None:
-            """Custom send function to mutate the response headers
-            and append X-Request-Id to it.
-            """
+        def send_with_request_id(message: Message) -> Awaitable[None]:
+            """Custom send function to mutate response start headers in-place."""
             if message["type"] == "http.response.start":
-                response_headers = MutableHeaders(raw=message["headers"])
-                request_id = request_headers.get("X-Request-Id", uuid.uuid4().hex)
-                response_headers.append("X-Request-Id", request_id)
-            await send(message)
+                rid = (
+                    request_id_bytes
+                    if request_id_bytes is not None
+                    else uuid.uuid4().hex.encode("latin-1")
+                )
+                resp_headers = message.get("headers")
+                if isinstance(resp_headers, list):
+                    resp_headers.append((b"x-request-id", rid))
+                else:
+                    MutableHeaders(raw=resp_headers).append(
+                        "X-Request-Id", rid.decode("latin-1")
+                    )
+            return send(message)
 
         return self.app(scope, receive, send_with_request_id)
