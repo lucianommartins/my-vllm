@@ -875,8 +875,9 @@ def _is_sm80() -> bool:
     global _IS_SM80_CACHED
     val = _IS_SM80_CACHED
     if val is None:
-        val = current_platform.is_cuda() and current_platform.is_device_capability(
-            (8, 0)
+        val = current_platform.is_cuda() and (
+            current_platform.is_device_capability((8, 0))
+            or current_platform.is_device_capability((9, 0))
         )
         _IS_SM80_CACHED = val
     return val
@@ -1053,6 +1054,9 @@ def unified_attention_sm80_fast(
     cu_seqlens_q_prefill: torch.Tensor | None = None,
 ) -> bool:
     """Fast-path dispatcher for SM80 bfloat16 GQA=8 causal attention."""
+    if k.size(2) == 1 and q.size(1) == 16 and q.size(2) == 512:
+        k = k.expand(-1, -1, 2, -1)
+        v = v.expand(-1, -1, 2, -1)
     rc = _get_sm80_ext_fast().dispatch_sm80_fast_attn(
         out,
         q,
@@ -1070,6 +1074,7 @@ def unified_attention_sm80_fast(
         softmax_segm_expsum,
         num_decode_reqs,
         cu_seqlens_q_prefill,
+        0.0,
     )
     if rc == 1:
         return True

@@ -509,8 +509,9 @@ def get_ext(allow_compile: bool = True) -> Any | None:
 
     from torch.utils.cpp_extension import load_inline
 
+    _ext_name = _EXT_NAME + ("_sm90a" if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9) else "")
     _CACHED_EXT = load_inline(
-        name=_EXT_NAME,
+        name=_ext_name,
         cpp_sources=_CPP_SRC,
         cuda_sources=_CUDA_SRC,
         functions=[
@@ -519,7 +520,7 @@ def get_ext(allow_compile: bool = True) -> Any | None:
             "async_copy_sampled_and_record",
         ],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "-arch=sm_80"],
+        extra_cuda_cflags=["-O3", "-arch=sm_90a" if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9) else "-arch=sm_80"],
         build_directory=build_dir,
         verbose=False,
     )

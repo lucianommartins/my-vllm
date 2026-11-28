@@ -32,7 +32,7 @@ def _get_sm80_fused_softcap_fn() -> (
 ):
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability((8, 0))
+        and current_platform.has_device_capability((8, 0))
     ):
         return None
     try:

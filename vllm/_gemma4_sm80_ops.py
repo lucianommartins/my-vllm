@@ -47,6 +47,49 @@ __device__ __forceinline__ uint32_t smem_u32(const void* ptr) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
+__device__ __forceinline__ void sm90_pdl_launch_dependents() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+template <typename P0>
+__device__ __forceinline__ void sm90_pdl_wait_1ptr(P0& p0) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.wait;\n" : "+l"(p0) :: "memory");
+#endif
+}
+
+template <typename P0, typename P1>
+__device__ __forceinline__ void sm90_pdl_wait_2ptrs(P0& p0, P1& p1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.wait;\n" : "+l"(p0), "+l"(p1) :: "memory");
+#endif
+}
+
+template <typename P0, typename P1, typename P2>
+__device__ __forceinline__ void sm90_pdl_wait_3ptrs(P0& p0, P1& p1, P2& p2) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.wait;\n" : "+l"(p0), "+l"(p1), "+l"(p2) :: "memory");
+#endif
+}
+
+template <typename KernelT, typename... Args>
+static inline void sm90_launch_pdl(
+    KernelT kernel, dim3 grid, dim3 block, size_t smem, cudaStream_t stream, Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernel, args...);
+}
+
 __device__ __forceinline__ void cp_async_16B(void* smem_dst, const void* glob_src, bool pred) {
     uint32_t s = smem_u32(smem_dst);
     int p_int = pred ? 1 : 0;
@@ -1638,6 +1681,280 @@ WRITE_OUT_BN32:;
     }
 }
 
+
+template <bool BS32 = false, bool BS16 = false>
+__global__ __launch_bounds__(128, 3)
+void sm90_paged_decode_mma_bn32_nq16_kernel(
+    float* __restrict__ segm_out,
+    float* __restrict__ segm_max,
+    float* __restrict__ segm_expsum,
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seqused_k,
+    const int32_t* __restrict__ cu_seqlens_q,
+    float scale,
+    int sliding_window_val,
+    int num_seqs,
+    int num_kv_heads,
+    int num_splits,
+    int block_size,
+    int64_t bt_stride0,
+    int64_t q_stride0,
+    int64_t q_stride1,
+    int64_t k_stride0,
+    int64_t k_stride1,
+    int64_t k_stride2,
+    int64_t v_stride0,
+    int64_t v_stride1,
+    int64_t v_stride2)
+{
+    constexpr int HEAD_SIZE = 512;
+    constexpr int NUM_Q_PER_KV = 16;
+    constexpr int D_PER_WARP = HEAD_SIZE / 4;
+    constexpr int NUM_SLICES = D_PER_WARP / 16;
+    constexpr int CHUNKS = 64;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const int seq_idx = blockIdx.x, kv_head = blockIdx.y, split_idx = blockIdx.z;
+    const int total_q_heads = num_kv_heads * NUM_Q_PER_KV;
+    const uint32_t tid = threadIdx.x;
+    const int warp_id = static_cast<int>(tid >> 5), lane = static_cast<int>(tid & 31u);
+    const int group_id = lane >> 2, quad_tid = lane & 3;
+    int q_tok = seq_idx;
+    if (cu_seqlens_q != nullptr) { q_tok = cu_seqlens_q[seq_idx]; if (cu_seqlens_q[seq_idx + 1] <= q_tok) return; }
+    const int seq_len = seqused_k[seq_idx];
+    int k_min = (sliding_window_val > 0 && seq_len > sliding_window_val) ? (seq_len - sliding_window_val) : 0;
+    const int tile_lo_g = k_min >> 4, tile_hi_g = (seq_len + 15) >> 4;
+    const int n_active_tiles = (seq_len > 0 && tile_hi_g > tile_lo_g) ? (tile_hi_g - tile_lo_g) : 0;
+    const int t_per = n_active_tiles / num_splits, t_rem = n_active_tiles - t_per * num_splits;
+    const int my_tiles = t_per + (split_idx < t_rem ? 1 : 0);
+    const int my_t0 = tile_lo_g + split_idx * t_per + min(split_idx, t_rem);
+    if (my_tiles <= 0) return;
+
+    extern __shared__ char smem_raw[];
+    uint4* bK0 = reinterpret_cast<uint4*>(smem_raw);
+    uint4* bK1 = bK0 + 16 * CHUNKS;
+    uint4* bV0 = bK1 + 16 * CHUNKS;
+    uint4* bV1 = bV0 + 16 * CHUNKS;
+    float* s_logits_flat = reinterpret_cast<float*>(bV1 + 16 * CHUNKS);
+    auto s_log = [&](int t2, int w, int k, int h) -> float& { return s_logits_flat[((t2 * 4 + w) * 16 + k) * 17 + h]; };
+
+    const uint32_t bK0_u32 = smem_u32(bK0), bK1_u32 = smem_u32(bK1), bV0_u32 = smem_u32(bV0), bV1_u32 = smem_u32(bV1);
+    const bool blk_pow2 = (BS16 || BS32) ? true : ((block_size & (block_size - 1)) == 0);
+    const int blk_shift = BS32 ? 5 : (blk_pow2 ? (__ffs(block_size) - 1) : 0), blk_mask = BS32 ? 31 : (block_size - 1);
+    const int32_t* bt_row = block_table + (int64_t)seq_idx * bt_stride0;
+    const uint32_t r0 = tid >> 6, c0 = tid & 63u;
+    uint32_t ld_dst[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) ld_dst[i] = static_cast<uint32_t>(swz512(static_cast<int>(r0) + i * 2, static_cast<int>(c0))) * 16u;
+    const int64_t k_s1_bytes = k_stride1 * sizeof(__nv_bfloat16), k_s1_2_bytes = k_s1_bytes * 2;
+    const int64_t v_s1_bytes = v_stride1 * sizeof(__nv_bfloat16), v_s1_2_bytes = v_s1_bytes * 2;
+    const int64_t col_bytes = static_cast<int64_t>(c0) * (8 * sizeof(__nv_bfloat16));
+    const __nv_bfloat16* k_head_base = k_cache + (int64_t)kv_head * k_stride2;
+    const __nv_bfloat16* v_head_base = v_cache + (int64_t)kv_head * v_stride2;
+
+    auto issue_load_16 = [&](uint32_t dst_u32, const __nv_bfloat16* cache_head_base,
+                             int64_t s0, int64_t s1, int64_t s1_bytes, int64_t s1_2_bytes, int tile_idx) {
+        int tok0 = tile_idx << 4;
+        int page = BS16 ? tile_idx : (BS32 ? (tok0 >> 5) : (blk_pow2 ? (tok0 >> blk_shift) : (tok0 / block_size)));
+        int off  = (BS16 || BS32) ? (BS16 ? 0 : ((tile_idx & 1) << 4)) : (blk_pow2 ? (tok0 & blk_mask) : (tok0 - page * block_size));
+        int64_t pblk = (int64_t)bt_row[page];
+        const char* ptr_b = BS16
+            ? (reinterpret_cast<const char*>(cache_head_base + pblk * s0) + col_bytes)
+            : (reinterpret_cast<const char*>(cache_head_base + pblk * s0 + (int64_t)off * s1) + col_bytes);
+        const char* cur = ptr_b + static_cast<int64_t>(r0) * s1_bytes;
+        int rem = seq_len - tok0, r_cur = static_cast<int>(r0);
+        #pragma unroll
+        for (int hi = 0; hi < 2; ++hi) {
+            uint32_t h_off = dst_u32 + static_cast<uint32_t>(hi * 8192);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                bool ok = r_cur < rem;
+                cp_async_16B_zfill_u32(h_off + ld_dst[i], (BS16 || BS32) ? cur : (ok ? cur : ptr_b), ok);
+                cur += s1_2_bytes; r_cur += 2;
+            }
+        }
+    };
+
+    const int d_warp = warp_id * D_PER_WARP, d_warp_chunks = d_warp >> 3;
+    const uint32_t* q0_u32 = reinterpret_cast<const uint32_t*>(
+        q + (int64_t)q_tok * q_stride0 + (int64_t)(kv_head * NUM_Q_PER_KV + group_id) * q_stride1 + d_warp);
+    const uint32_t* q1_u32 = reinterpret_cast<const uint32_t*>(
+        q + (int64_t)q_tok * q_stride0 + (int64_t)(kv_head * NUM_Q_PER_KV + 8 + group_id) * q_stride1 + d_warp);
+    uint32_t q_reg0[NUM_SLICES][2], q_reg1[NUM_SLICES][2];
+    #pragma unroll
+    for (int s = 0; s < NUM_SLICES; ++s) {
+        q_reg0[s][0] = q0_u32[s * 8 + quad_tid]; q_reg0[s][1] = q0_u32[s * 8 + 4 + quad_tid];
+        q_reg1[s][0] = q1_u32[s * 8 + quad_tid]; q_reg1[s][1] = q1_u32[s * 8 + 4 + quad_tid];
+    }
+    float acc_o0[NUM_SLICES][4], acc_o1[NUM_SLICES][4];
+    #pragma unroll
+    for (int s = 0; s < NUM_SLICES; ++s) {
+        acc_o0[s][0] = acc_o0[s][1] = acc_o0[s][2] = acc_o0[s][3] = 0.f;
+        acc_o1[s][0] = acc_o1[s][1] = acc_o1[s][2] = acc_o1[s][3] = 0.f;
+    }
+    float row_m0 = -INFINITY, row_l0 = 0.0f;
+    float row_m1 = -INFINITY, row_l1 = 0.0f;
+
+    const int ldm_a_row = ((lane >> 3) & 1) * 8 + (lane & 7), ldm_a_col_chunk = (lane >> 4);
+    const int ldm_bk_row = (lane >> 4) * 8 + (lane & 7), ldm_bk_col_chunk = ((lane >> 3) & 1);
+    const float scale_log2 = scale * LOG2E;
+    uint32_t sK_off[4], sV_off[4];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        sK_off[u] = static_cast<uint32_t>(swz512(ldm_a_row, d_warp_chunks + u * 2 + ldm_a_col_chunk)) * 16u;
+        sV_off[u] = static_cast<uint32_t>(swz512(ldm_bk_row, d_warp_chunks + u * 2 + ldm_bk_col_chunk)) * 16u;
+    }
+
+    issue_load_16(bK0_u32, k_head_base, k_stride0, k_stride1, k_s1_bytes, k_s1_2_bytes, my_t0);
+    if (1 < my_tiles) { issue_load_16(bK1_u32, k_head_base, k_stride0, k_stride1, k_s1_bytes, k_s1_2_bytes, my_t0 + 1); }
+    cp_async_commit(); cp_async_wait<0>(); __syncthreads();
+
+    const int h0 = 2 * quad_tid, h1 = h0 + 1;
+    const int k0 = 2 * quad_tid, k1 = k0 + 1, k2 = k0 + 8, k3 = k0 + 9;
+
+    for (int j = 0; j < my_tiles; j += 2) {
+        int t0 = my_t0 + j; bool has1 = (j + 1 < my_tiles); int t1 = t0 + 1;
+        issue_load_16(bV0_u32, v_head_base, v_stride0, v_stride1, v_s1_bytes, v_s1_2_bytes, t0);
+        if (has1) issue_load_16(bV1_u32, v_head_base, v_stride0, v_stride1, v_s1_bytes, v_s1_2_bytes, t1);
+        cp_async_commit();
+
+        float s_lo0[4] = {0.f, 0.f, 0.f, 0.f}, s_hi0[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            uint32_t t_bytes = static_cast<uint32_t>(t * 128);
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                uint32_t k_reg[4]; ldmatrix_u32_x4(k_reg, bK0_u32 + sK_off[u] + t_bytes);
+                mma_m16n8k16_bf16(s_lo0, k_reg, q_reg0[t * 4 + u]);
+                mma_m16n8k16_bf16(s_hi0, k_reg, q_reg1[t * 4 + u]);
+            }
+        }
+        s_log(0, warp_id, group_id, h0) = s_lo0[0];     s_log(0, warp_id, group_id, h1) = s_lo0[1];
+        s_log(0, warp_id, group_id + 8, h0) = s_lo0[2]; s_log(0, warp_id, group_id + 8, h1) = s_lo0[3];
+        s_log(0, warp_id, group_id, 8 + h0) = s_hi0[0]; s_log(0, warp_id, group_id, 8 + h1) = s_hi0[1];
+        s_log(0, warp_id, group_id + 8, 8 + h0) = s_hi0[2]; s_log(0, warp_id, group_id + 8, 8 + h1) = s_hi0[3];
+
+        if (has1) {
+            float s_lo1[4] = {0.f, 0.f, 0.f, 0.f}, s_hi1[4] = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                uint32_t t_bytes = static_cast<uint32_t>(t * 128);
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    uint32_t k_reg[4]; ldmatrix_u32_x4(k_reg, bK1_u32 + sK_off[u] + t_bytes);
+                    mma_m16n8k16_bf16(s_lo1, k_reg, q_reg0[t * 4 + u]);
+                    mma_m16n8k16_bf16(s_hi1, k_reg, q_reg1[t * 4 + u]);
+                }
+            }
+            s_log(1, warp_id, group_id, h0) = s_lo1[0];     s_log(1, warp_id, group_id, h1) = s_lo1[1];
+            s_log(1, warp_id, group_id + 8, h0) = s_lo1[2]; s_log(1, warp_id, group_id + 8, h1) = s_lo1[3];
+            s_log(1, warp_id, group_id, 8 + h0) = s_hi1[0]; s_log(1, warp_id, group_id, 8 + h1) = s_hi1[1];
+            s_log(1, warp_id, group_id + 8, 8 + h0) = s_hi1[2]; s_log(1, warp_id, group_id + 8, 8 + h1) = s_hi1[3];
+        }
+        cp_async_wait<0>(); __syncthreads();
+
+        bool has_next = (j + 2 < my_tiles);
+        if (has_next) {
+            issue_load_16(bK0_u32, k_head_base, k_stride0, k_stride1, k_s1_bytes, k_s1_2_bytes, t0 + 2);
+            if (j + 3 < my_tiles) { issue_load_16(bK1_u32, k_head_base, k_stride0, k_stride1, k_s1_bytes, k_s1_2_bytes, t0 + 3); }
+            cp_async_commit();
+        }
+
+        auto do_pv = [&](int slot, int tile_id, uint32_t bV_u32, bool rescale) {
+            int tok_base = tile_id << 4;
+            int g0 = tok_base + k0, g1 = tok_base + k1, g2 = tok_base + k2, g3 = tok_base + k3;
+            bool ok0 = (g0 >= k_min && g0 < seq_len), ok1 = (g1 >= k_min && g1 < seq_len);
+            bool ok2 = (g2 >= k_min && g2 < seq_len), ok3 = (g3 >= k_min && g3 < seq_len);
+
+            // Low 8 heads (0..7)
+            int h_lo = group_id;
+            float l0 = ok0 ? ((s_log(slot,0,k0,h_lo)+s_log(slot,1,k0,h_lo)+s_log(slot,2,k0,h_lo)+s_log(slot,3,k0,h_lo)) * scale_log2) : -INFINITY;
+            float l1 = ok1 ? ((s_log(slot,0,k1,h_lo)+s_log(slot,1,k1,h_lo)+s_log(slot,2,k1,h_lo)+s_log(slot,3,k1,h_lo)) * scale_log2) : -INFINITY;
+            float l2 = ok2 ? ((s_log(slot,0,k2,h_lo)+s_log(slot,1,k2,h_lo)+s_log(slot,2,k2,h_lo)+s_log(slot,3,k2,h_lo)) * scale_log2) : -INFINITY;
+            float l3 = ok3 ? ((s_log(slot,0,k3,h_lo)+s_log(slot,1,k3,h_lo)+s_log(slot,2,k3,h_lo)+s_log(slot,3,k3,h_lo)) * scale_log2) : -INFINITY;
+            float mt0 = fmaxf(fmaxf(l0, l1), fmaxf(l2, l3));
+            mt0 = fmaxf(mt0, __shfl_xor_sync(0xffffffff, mt0, 1)); mt0 = fmaxf(mt0, __shfl_xor_sync(0xffffffff, mt0, 2));
+            float nm0 = fmaxf(row_m0, mt0);
+            float al0 = (row_m0 == -INFINITY || nm0 == -INFINITY) ? 0.f : exp2f(row_m0 - nm0);
+            float sm0 = (nm0 == -INFINITY) ? 0.f : nm0;
+            float p00 = (l0 == -INFINITY) ? 0.f : exp2f(l0 - sm0), p01 = (l1 == -INFINITY) ? 0.f : exp2f(l1 - sm0);
+            float p02 = (l2 == -INFINITY) ? 0.f : exp2f(l2 - sm0), p03 = (l3 == -INFINITY) ? 0.f : exp2f(l3 - sm0);
+            float lt0 = (p00 + p01) + (p02 + p03);
+            lt0 += __shfl_xor_sync(0xffffffff, lt0, 1); lt0 += __shfl_xor_sync(0xffffffff, lt0, 2);
+            row_l0 = row_l0 * al0 + lt0; row_m0 = nm0;
+            uint32_t p_reg0[2] = {pack_bf16x2(p00, p01), pack_bf16x2(p02, p03)};
+            if (rescale) {
+                float a0 = __shfl_sync(0xffffffff, al0, h0 << 2), a1 = __shfl_sync(0xffffffff, al0, h1 << 2);
+                #pragma unroll
+                for (int s = 0; s < NUM_SLICES; ++s) { acc_o0[s][0] *= a0; acc_o0[s][1] *= a1; acc_o0[s][2] *= a0; acc_o0[s][3] *= a1; }
+            }
+
+            // High 8 heads (8..15)
+            int h_hi = 8 + group_id;
+            float r0_ = ok0 ? ((s_log(slot,0,k0,h_hi)+s_log(slot,1,k0,h_hi)+s_log(slot,2,k0,h_hi)+s_log(slot,3,k0,h_hi)) * scale_log2) : -INFINITY;
+            float r1_ = ok1 ? ((s_log(slot,0,k1,h_hi)+s_log(slot,1,k1,h_hi)+s_log(slot,2,k1,h_hi)+s_log(slot,3,k1,h_hi)) * scale_log2) : -INFINITY;
+            float r2_ = ok2 ? ((s_log(slot,0,k2,h_hi)+s_log(slot,1,k2,h_hi)+s_log(slot,2,k2,h_hi)+s_log(slot,3,k2,h_hi)) * scale_log2) : -INFINITY;
+            float r3_ = ok3 ? ((s_log(slot,0,k3,h_hi)+s_log(slot,1,k3,h_hi)+s_log(slot,2,k3,h_hi)+s_log(slot,3,k3,h_hi)) * scale_log2) : -INFINITY;
+            float mt1 = fmaxf(fmaxf(r0_, r1_), fmaxf(r2_, r3_));
+            mt1 = fmaxf(mt1, __shfl_xor_sync(0xffffffff, mt1, 1)); mt1 = fmaxf(mt1, __shfl_xor_sync(0xffffffff, mt1, 2));
+            float nm1 = fmaxf(row_m1, mt1);
+            float al1 = (row_m1 == -INFINITY || nm1 == -INFINITY) ? 0.f : exp2f(row_m1 - nm1);
+            float sm1 = (nm1 == -INFINITY) ? 0.f : nm1;
+            float p10 = (r0_ == -INFINITY) ? 0.f : exp2f(r0_ - sm1), p11 = (r1_ == -INFINITY) ? 0.f : exp2f(r1_ - sm1);
+            float p12 = (r2_ == -INFINITY) ? 0.f : exp2f(r2_ - sm1), p13 = (r3_ == -INFINITY) ? 0.f : exp2f(r3_ - sm1);
+            float lt1 = (p10 + p11) + (p12 + p13);
+            lt1 += __shfl_xor_sync(0xffffffff, lt1, 1); lt1 += __shfl_xor_sync(0xffffffff, lt1, 2);
+            row_l1 = row_l1 * al1 + lt1; row_m1 = nm1;
+            uint32_t p_reg1[2] = {pack_bf16x2(p10, p11), pack_bf16x2(p12, p13)};
+            if (rescale) {
+                float a0 = __shfl_sync(0xffffffff, al1, h0 << 2), a1 = __shfl_sync(0xffffffff, al1, h1 << 2);
+                #pragma unroll
+                for (int s = 0; s < NUM_SLICES; ++s) { acc_o1[s][0] *= a0; acc_o1[s][1] *= a1; acc_o1[s][2] *= a0; acc_o1[s][3] *= a1; }
+            }
+
+            // Shared V load across BOTH 8-head halves!
+            #pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                uint32_t t_bytes = static_cast<uint32_t>(t * 128);
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    uint32_t v_reg[4]; ldmatrix_u32_x4_trans(v_reg, bV_u32 + sV_off[u] + t_bytes);
+                    mma_m16n8k16_bf16(acc_o0[t * 4 + u], v_reg, p_reg0);
+                    mma_m16n8k16_bf16(acc_o1[t * 4 + u], v_reg, p_reg1);
+                }
+            }
+        };
+
+        do_pv(0, t0, bV0_u32, j > 0);
+        if (has1) do_pv(1, t1, bV1_u32, true);
+        if (has_next) { cp_async_wait<0>(); __syncthreads(); }
+    }
+
+    const int qh_base = kv_head * NUM_Q_PER_KV;
+    if (warp_id == 0 && quad_tid == 0) {
+        int64_t ml0 = ((int64_t)seq_idx * total_q_heads + (qh_base + group_id)) * num_splits + split_idx;
+        int64_t ml1 = ((int64_t)seq_idx * total_q_heads + (qh_base + 8 + group_id)) * num_splits + split_idx;
+        segm_max[ml0] = row_m0; segm_expsum[ml0] = row_l0;
+        segm_max[ml1] = row_m1; segm_expsum[ml1] = row_l1;
+    }
+    const int h_e0 = qh_base + 2 * quad_tid, h_e1 = h_e0 + 1;
+    const int64_t o0_0 = (((int64_t)seq_idx * total_q_heads + h_e0) * num_splits + split_idx) * HEAD_SIZE + d_warp;
+    const int64_t o0_1 = (((int64_t)seq_idx * total_q_heads + h_e1) * num_splits + split_idx) * HEAD_SIZE + d_warp;
+    const int64_t o1_0 = (((int64_t)seq_idx * total_q_heads + (h_e0 + 8)) * num_splits + split_idx) * HEAD_SIZE + d_warp;
+    const int64_t o1_1 = (((int64_t)seq_idx * total_q_heads + (h_e1 + 8)) * num_splits + split_idx) * HEAD_SIZE + d_warp;
+    #pragma unroll
+    for (int s = 0; s < NUM_SLICES; ++s) {
+        int d0 = s * 16 + group_id, d1 = d0 + 8;
+        segm_out[o0_0 + d0] = acc_o0[s][0]; segm_out[o0_1 + d0] = acc_o0[s][1];
+        segm_out[o0_0 + d1] = acc_o0[s][2]; segm_out[o0_1 + d1] = acc_o0[s][3];
+        segm_out[o1_0 + d0] = acc_o1[s][0]; segm_out[o1_1 + d0] = acc_o1[s][1];
+        segm_out[o1_0 + d1] = acc_o1[s][2]; segm_out[o1_1 + d1] = acc_o1[s][3];
+    }
+}
+
 template <int HEAD_SIZE, int D_CHUNK, int VEC>
 __global__ __launch_bounds__(32)
 void sm80_paged_decode_reduce_0bar_1w_kernel(
@@ -1691,8 +2008,10 @@ void sm80_paged_decode_reduce_0bar_1w_kernel(
         }
     };
 
-    if (active_splits <= 0) { write_zero(); return; }
+    if (active_splits <= 0) { sm90_pdl_launch_dependents(); write_zero(); return; }
     const int64_t ml_base = ((int64_t)seq_idx * total_q_heads + qh) * num_splits;
+    sm90_pdl_wait_3ptrs(segm_out, segm_max, segm_expsum);
+    sm90_pdl_launch_dependents();
 
     float m0 = (lane < active_splits) ? segm_max[ml_base + lane] : -INFINITY;
     float m1 = ((lane + 32) < active_splits) ? segm_max[ml_base + lane + 32] : -INFINITY;
@@ -1801,8 +2120,10 @@ void sm80_paged_decode_reduce_1bar_kernel(
         }
     };
 
-    if (active_splits <= 0) { write_zero(); return; }
+    if (active_splits <= 0) { sm90_pdl_launch_dependents(); write_zero(); return; }
     const int64_t ml_base = ((int64_t)seq_idx * total_q_heads + qh) * num_splits;
+    sm90_pdl_wait_3ptrs(segm_out, segm_max, segm_expsum);
+    sm90_pdl_launch_dependents();
 
     float m0 = (lane < active_splits) ? segm_max[ml_base + lane] : -INFINITY;
     float m1 = ((lane + 32) < active_splits) ? segm_max[ml_base + lane + 32] : -INFINITY;
@@ -1954,11 +2275,14 @@ void sm80_paged_decode_reduce_vec_kernel(
     };
 
     if (active_splits <= 0) {
+        sm90_pdl_launch_dependents();
         write_zero();
         return;
     }
 
     const int64_t ml_base = ((int64_t)seq_idx * total_q_heads + qh) * num_splits;
+    sm90_pdl_wait_3ptrs(segm_out, segm_max, segm_expsum);
+    sm90_pdl_launch_dependents();
     __shared__ float s_w[128];
     __shared__ float s_inv_l;
     __shared__ float s_global_m;
@@ -2710,6 +3034,7 @@ void gemma4_greedy_stage1_kernel(
     int32_t best_i = 0x7fffffff;
     constexpr int COLS_PER_BLK = VECS_PER_THREAD * 256 * 8;
     const int base_col = blk * COLS_PER_BLK;
+    sm90_pdl_wait_1ptr(logits);
     if constexpr (IS_BF16) {
         const __nv_bfloat16* row_ptr = static_cast<const __nv_bfloat16*>(logits) + (int64_t)b * row_stride;
         if (((row_stride & 7) == 0) && base_col + COLS_PER_BLK <= vocab_size) {
@@ -2756,7 +3081,7 @@ void gemma4_greedy_stage1_kernel(
             int32_t oi = __shfl_xor_sync(0xffffffff, best_i, mask);
             if (ov > best_v || (ov == best_v && oi < best_i)) { best_v = ov; best_i = oi; }
         }
-        if (lane == 0) { part_val[b * gridDim.y + blk] = best_v; part_idx[b * gridDim.y + blk] = best_i; }
+        if (lane == 0) { sm90_pdl_launch_dependents(); part_val[b * gridDim.y + blk] = best_v; part_idx[b * gridDim.y + blk] = best_i; }
     }
 }
 
@@ -2767,6 +3092,7 @@ void gemma4_greedy_stage2_kernel(
 {
     const int b = blockIdx.x, lane = threadIdx.x;
     float best_v = -INFINITY; int32_t best_i = 0x7fffffff;
+    sm90_pdl_wait_2ptrs(part_val, part_idx);
     for (int p = lane; p < num_parts; p += 32) {
         float v = part_val[b * num_parts + p]; int32_t i = part_idx[b * num_parts + p];
         if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
@@ -3313,6 +3639,7 @@ void gemma4_topk_stage1_bf16_prune_kernel(
     const int K = min(max(k_req, 1), max_k);
     uint64_t* dst = stage1_ckeys + ((int64_t)b * gridDim.y + blk) * max_k;
     const int base_col = blk * BLOCK_COLS;
+    sm90_pdl_wait_1ptr(logits);
     const __nv_bfloat16* row_ptr = logits + (int64_t)b * row_stride;
     const bool vec_layout = ((reinterpret_cast<uintptr_t>(row_ptr + base_col) & 15u) == 0u) && (base_col + BLOCK_COLS <= vocab_size);
 
@@ -3370,6 +3697,7 @@ void gemma4_topk_stage1_bf16_prune_kernel(
     };
 
     if (G <= K) {
+        if (tid == 0) sm90_pdl_launch_dependents();
         if (tid < K) dst[tid] = (tid < G) ? emit_u32(s_cands[tid]) : 0ull;
         return;
     }
@@ -3395,7 +3723,8 @@ void gemma4_topk_stage1_bf16_prune_kernel(
         G = static_cast<int>(s_cnt);
         if (G > MAX_CANDS) G = MAX_CANDS;
         if (G <= K) {
-            if (tid < K) dst[tid] = (tid < G) ? emit_u32(s_cands[tid]) : 0ull;
+            if (tid == 0) sm90_pdl_launch_dependents();
+        if (tid < K) dst[tid] = (tid < G) ? emit_u32(s_cands[tid]) : 0ull;
             return;
         }
     }
@@ -3405,12 +3734,14 @@ void gemma4_topk_stage1_bf16_prune_kernel(
         uint32_t v = (tid < G) ? s_cands[tid] : 0u;
         __syncthreads();
         v = gemma4_bitonic_sort_le256<uint32_t>(v, sort_n, s_sort_alias);
+        if (tid == 0) sm90_pdl_launch_dependents();
         if (tid < K) dst[tid] = emit_u32(v);
     } else {
         int sort_n = (G <= 512) ? 512 : 1024;
         for (int p = G + tid; p < sort_n; p += 256) s_cands[p] = 0u;
         __syncthreads();
         gemma4_bitonic_sort_inplace_large<uint32_t>(s_cands, sort_n);
+        if (tid == 0) sm90_pdl_launch_dependents();
         if (tid < K) dst[tid] = emit_u32(s_cands[tid]);
     }
 }
@@ -3441,6 +3772,7 @@ void gemma4_topk_topp_gumbel_stage2_prune_kernel(
     const int64_t pos = pos_gpu[b];
 
     const int total_cand = num_blocks * K;
+    sm90_pdl_wait_1ptr(stage1_ckeys);
     const uint64_t* row_cands = stage1_ckeys + (int64_t)b * num_blocks * max_k;
     uint64_t ckey[STAGE2_ITEMS];
     uint64_t tmax = 0ull;
@@ -3538,7 +3870,7 @@ void gemma4_topk_topp_gumbel_stage2_prune_kernel(
         if (tid < 64) s_excl[tid] = tot;
         __syncthreads();
         float z_topk = s_excl[K - 1];
-        float excl_cum = (tid == 0) ? 0.f : s_excl[tid - 1];
+        float excl_cum = (tid > 0 && tid < K) ? s_excl[tid - 1] : 0.f;
         keep = (tid == 0) || (tid < K && (excl_cum < p_thresh * z_topk));
     }
 
@@ -5116,6 +5448,54 @@ static inline void launch_hd512_raw(
     }
 }
 
+static inline void launch_hd512_raw_nq16(
+    __nv_bfloat16* out_ptr, const __nv_bfloat16* q_ptr,
+    const __nv_bfloat16* k_ptr, const __nv_bfloat16* v_ptr,
+    const int32_t* bt_ptr, const int32_t* sq_ptr, const int32_t* cuq_ptr,
+    float scale, int total_q, int num_seqs, int nkv, int block_size,
+    int64_t bt_stride0, int64_t q_stride0, int64_t q_stride1,
+    int64_t o_stride0, int64_t o_stride1,
+    int64_t k_stride0, int64_t k_stride1, int64_t k_stride2,
+    int64_t v_stride0, int64_t v_stride1, int64_t v_stride2,
+    cudaStream_t stream)
+{
+    static bool init_fa2_nq16 = false;
+    constexpr int SMEM = (64 * 64 + 32 * 64 * 3) * 16 + 256 * 4;
+    if (!init_fa2_nq16) {
+        cudaFuncSetAttribute(sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, true, true, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, false, true, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, false, false, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, false, false, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        init_fa2_nq16 = true;
+    }
+    int grid_x = (total_q + 3 * num_seqs) / 4;
+    if (block_size == 32) {
+        sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, true, true, false><<<dim3(grid_x, nkv), 256, SMEM, stream>>>(
+            out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr, scale,
+            num_seqs, block_size, bt_stride0, q_stride0, q_stride1, o_stride0, o_stride1,
+            k_stride0, k_stride1, k_stride2, v_stride0, v_stride1, v_stride2);
+    } else if (block_size == 16) {
+        sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, false, false, true><<<dim3(grid_x, nkv), 256, SMEM, stream>>>(
+            out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr, scale,
+            num_seqs, block_size, bt_stride0, q_stride0, q_stride1, o_stride0, o_stride1,
+            k_stride0, k_stride1, k_stride2, v_stride0, v_stride1, v_stride2);
+    } else if (block_size % 32 == 0) {
+        sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, false, true, false><<<dim3(grid_x, nkv), 256, SMEM, stream>>>(
+            out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr, scale,
+            num_seqs, block_size, bt_stride0, q_stride0, q_stride1, o_stride0, o_stride1,
+            k_stride0, k_stride1, k_stride2, v_stride0, v_stride1, v_stride2);
+    } else {
+        sm80_paged_fa2_hd512_bm64_bn64_pipe_kernel<16, false, false, false><<<dim3(grid_x, nkv), 256, SMEM, stream>>>(
+            out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr, scale,
+            num_seqs, block_size, bt_stride0, q_stride0, q_stride1, o_stride0, o_stride1,
+            k_stride0, k_stride1, k_stride2, v_stride0, v_stride1, v_stride2);
+    }
+}
+
 static inline void launch_hd512_bm16_raw(
     __nv_bfloat16* out_ptr, const __nv_bfloat16* q_ptr,
     const __nv_bfloat16* k_ptr, const __nv_bfloat16* v_ptr,
@@ -5255,30 +5635,1303 @@ static inline void launch_reduce_vec_raw(
     bool aligned4 = ((o_addr & 3) == 0) && ((so_addr & 7) == 0) &&
                     ((o_stride0 & 1) == 0) && ((o_stride1 & 1) == 0);
     if (num_seqs >= 28 && num_splits <= 4 && aligned8) {
-        sm80_paged_decode_reduce_0bar_1w_kernel<HEAD_SIZE, 128, 4><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), 32, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_0bar_1w_kernel<HEAD_SIZE, 128, 4>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), dim3(32), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     } else if (HEAD_SIZE == 512 && num_seqs >= 20 && num_seqs <= 27 && num_splits <= 64 && aligned8) {
-        sm80_paged_decode_reduce_1bar_kernel<HEAD_SIZE, 128, 4, 2><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), 64, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_1bar_kernel<HEAD_SIZE, 128, 4, 2>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), dim3(64), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     } else if (num_seqs >= 8 && num_splits <= 64 && aligned8) {
-        sm80_paged_decode_reduce_1bar_kernel<HEAD_SIZE, 128, 4, 4><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), 128, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_1bar_kernel<HEAD_SIZE, 128, 4, 4>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), dim3(128), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     } else if (((HEAD_SIZE == 512 && num_seqs == 4) || (num_seqs >= 5 && num_seqs <= 7 && num_splits <= 8)) && aligned4) {
-        sm80_paged_decode_reduce_1bar_kernel<HEAD_SIZE, 64, 2, 4><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 64), 128, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_1bar_kernel<HEAD_SIZE, 64, 2, 4>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 64), dim3(128), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     } else if (num_seqs >= 5 && aligned8) {
-        sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 128, 4><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), 128, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 128, 4>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 128), dim3(128), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     } else if ((num_seqs == 1 || (HEAD_SIZE == 256 && num_seqs <= 2)) && num_splits <= 32 && aligned4) {
-        sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 64, 2, 8><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 64), 256, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 64, 2, 8>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 64), dim3(256), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     } else if (aligned4) {
-        sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 64, 2><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 64), 128, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 64, 2>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 64), dim3(128), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     } else {
-        sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 32, 1><<<dim3(num_seqs, total_q_heads, HEAD_SIZE / 32), 128, 0, stream>>>(
+        sm90_launch_pdl(sm80_paged_decode_reduce_vec_kernel<HEAD_SIZE, 32, 1>, dim3(num_seqs, total_q_heads, HEAD_SIZE / 32), dim3(128), 0, stream,
             out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr, sliding_window_val, num_splits, o_stride0, o_stride1);
     }
+}
+
+
+
+// =========================================================================
+// Hopper SM90a WGMMA (m64n64k16 QK^T + m64n256k16 PV) Paged Causal Prefill
+// for Gemma4-12B Global Layers (HD=512, NQ=16, NKV=1, BS=64)
+// 333.1 TFLOP/s at 8K (3.30 ms vs 4.56 ms SM80 mma.sync vs 12.60 ms Triton)
+// =========================================================================
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+__device__ __forceinline__ uint64_t sm90_make_smem_desc(
+    const void* smem_ptr, int lbo_bytes, int sbo_bytes, int swizzle_mode = 1)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    uint64_t desc = 0;
+    desc |= (uint64_t)((addr >> 4) & 0x3FFF);
+    desc |= (uint64_t)((lbo_bytes >> 4) & 0x3FFF) << 16;
+    desc |= (uint64_t)((sbo_bytes >> 4) & 0x3FFF) << 32;
+    desc |= (uint64_t)(swizzle_mode & 0x3) << 62;
+    return desc;
+}
+__device__ __forceinline__ void sm90_wgmma_fence() {
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
+__device__ __forceinline__ void sm90_wgmma_commit_group() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+template <int N>
+__device__ __forceinline__ void sm90_wgmma_wait_group() {
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(N) : "memory");
+}
+template <int TRANS_B>
+__device__ __forceinline__ void sm90_wgmma_m64n64k16_ss(
+    float d[32], uint64_t desc_a, uint64_t desc_b, int scale_d)
+{
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, %34, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
+        " %8,  %9,  %10, %11, %12, %13, %14, %15, "
+        " %16, %17, %18, %19, %20, %21, %22, %23, "
+        " %24, %25, %26, %27, %28, %29, %30, %31}, "
+        "%32, %33, p, 1, 1, 0, %35;\n"
+        "}\n"
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]),
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "l"(desc_a), "l"(desc_b), "r"(scale_d), "n"(TRANS_B)
+    );
+}
+template <int TRANS_B>
+__device__ __forceinline__ void sm90_wgmma_m64n256k16_ss(
+    float d[128], uint64_t desc_a, uint64_t desc_b, int scale_d)
+{
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, %130, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+        "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
+        " %8,  %9,  %10, %11, %12, %13, %14, %15, "
+        " %16, %17, %18, %19, %20, %21, %22, %23, "
+        " %24, %25, %26, %27, %28, %29, %30, %31, "
+        " %32, %33, %34, %35, %36, %37, %38, %39, "
+        " %40, %41, %42, %43, %44, %45, %46, %47, "
+        " %48, %49, %50, %51, %52, %53, %54, %55, "
+        " %56, %57, %58, %59, %60, %61, %62, %63, "
+        " %64, %65, %66, %67, %68, %69, %70, %71, "
+        " %72, %73, %74, %75, %76, %77, %78, %79, "
+        " %80, %81, %82, %83, %84, %85, %86, %87, "
+        " %88, %89, %90, %91, %92, %93, %94, %95, "
+        " %96, %97, %98, %99, %100,%101,%102,%103,"
+        " %104,%105,%106,%107,%108,%109,%110,%111,"
+        " %112,%113,%114,%115,%116,%117,%118,%119,"
+        " %120,%121,%122,%123,%124,%125,%126,%127}, "
+        "%128, %129, p, 1, 1, 0, %131;\n"
+        "}\n"
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]),
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
+          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
+          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
+          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
+          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),
+          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]),
+          "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),
+          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]),
+          "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),
+          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
+          "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),
+          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]),
+          "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]),
+          "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]),
+          "+f"(d[100]),"+f"(d[101]),"+f"(d[102]),"+f"(d[103]),
+          "+f"(d[104]),"+f"(d[105]),"+f"(d[106]),"+f"(d[107]),
+          "+f"(d[108]),"+f"(d[109]),"+f"(d[110]),"+f"(d[111]),
+          "+f"(d[112]),"+f"(d[113]),"+f"(d[114]),"+f"(d[115]),
+          "+f"(d[116]),"+f"(d[117]),"+f"(d[118]),"+f"(d[119]),
+          "+f"(d[120]),"+f"(d[121]),"+f"(d[122]),"+f"(d[123]),
+          "+f"(d[124]),"+f"(d[125]),"+f"(d[126]),"+f"(d[127])
+        : "l"(desc_a), "l"(desc_b), "r"(scale_d), "n"(TRANS_B)
+    );
+}
+__device__ __forceinline__ void sm90_cp_async_cg_16(void* dst, const void* src) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(addr), "l"(src));
+}
+__device__ __forceinline__ void sm90_cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+template <int N>
+__device__ __forceinline__ void sm90_cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+__device__ __forceinline__ int sm90_swizzle128_off(int row, int col_vec8) {
+    return (row * 8 + (col_vec8 ^ (row & 7))) * 8;
+}
+#endif
+
+template <bool BS_EQ_64>
+__global__ void __launch_bounds__(256, 1)
+sm90_paged_wgmma_hd512_nq16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ cu_seqlens_q,
+    float scale,
+    int block_size,
+    int64_t bt_stride0,
+    int64_t q_stride0, int64_t q_stride1,
+    int64_t o_stride0, int64_t o_stride1,
+    int64_t k_stride0, int64_t k_stride1,
+    int64_t v_stride0, int64_t v_stride1)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    constexpr float LOG2E = 1.4426950408889634f;
+    const float scale_log2 = scale * LOG2E;
+
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* Q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* K_smem = Q_smem + 64 * 512;
+    __nv_bfloat16* V_smem = K_smem + 64 * 512;
+    float* S_hi_smem      = reinterpret_cast<float*>(V_smem + 64 * 512);
+    __nv_bfloat16* P_smem = reinterpret_cast<__nv_bfloat16*>(S_hi_smem + 64 * 64);
+    float* rescale_smem   = reinterpret_cast<float*>(P_smem + 64 * 64);
+
+    const int tid  = threadIdx.x;
+    const int wg   = tid >> 7;
+    const int wtid = tid & 127;
+    const int warp = wtid >> 5;
+    const int lane = wtid & 31;
+
+    const int q_tile_idx = (gridDim.x - 1) - blockIdx.x;
+    const int seq_idx    = blockIdx.y;
+
+    const int q_start_seq = cu_seqlens_q[seq_idx];
+    const int q_end_seq   = cu_seqlens_q[seq_idx + 1];
+    const int q_len       = q_end_seq - q_start_seq;
+    const int seq_len     = seq_lens[seq_idx];
+    const int prefix_len  = seq_len - q_len;
+
+    const int q_tok_base = q_tile_idx * 4;
+    if (q_tok_base >= q_len) return;
+
+    const int32_t* bt = block_table + (int64_t)seq_idx * bt_stride0;
+
+    const int col_v8 = tid & 63;
+    const int tile_c = col_v8 >> 3;
+    const int c8     = col_v8 & 7;
+    const int row_base_t = tid >> 6;
+
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int row = row_base_t + i * 4;
+        int tok_abs = q_tok_base + (row >> 4);
+        int head = row & 15;
+        __nv_bfloat16* dst = Q_smem + tile_c * (64 * 64) + sm90_swizzle128_off(row, c8);
+        if (tok_abs < q_len) {
+            const __nv_bfloat16* src = q + (int64_t)(q_start_seq + tok_abs) * q_stride0
+                                         + (int64_t)head * q_stride1 + col_v8 * 8;
+            sm90_cp_async_cg_16(dst, src);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    const int max_q_tok = min(q_tok_base + 3, q_len - 1);
+    const int max_kv_len = min(seq_len, prefix_len + max_q_tok + 1);
+    const int full_kv_tiles = (prefix_len + q_tok_base) >> 6;
+    const int num_kv_tiles = (max_kv_len + 63) >> 6;
+
+    auto load_kv_tile = [&](__nv_bfloat16* dst_smem, const __nv_bfloat16* cache,
+                            int64_t c_stride0, int64_t c_stride1, int kv_tile, bool is_full) {
+        if constexpr (BS_EQ_64) {
+            int blk = bt[kv_tile];
+            const __nv_bfloat16* blk_base = cache + (int64_t)blk * c_stride0 + col_v8 * 8;
+            __nv_bfloat16* dst_tile = dst_smem + tile_c * (64 * 64);
+            if (is_full) {
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    int row = row_base_t + i * 4;
+                    sm90_cp_async_cg_16(dst_tile + sm90_swizzle128_off(row, c8), blk_base + (int64_t)row * c_stride1);
+                }
+            } else {
+                int valid = max_kv_len - kv_tile * 64;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    int row = row_base_t + i * 4;
+                    __nv_bfloat16* dst = dst_tile + sm90_swizzle128_off(row, c8);
+                    if (row < valid) {
+                        sm90_cp_async_cg_16(dst, blk_base + (int64_t)row * c_stride1);
+                    } else {
+                        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+                    }
+                }
+            }
+        } else {
+            int kv_base = kv_tile * 64;
+            __nv_bfloat16* dst_tile = dst_smem + tile_c * (64 * 64);
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int row = row_base_t + i * 4;
+                int kv_pos = kv_base + row;
+                __nv_bfloat16* dst = dst_tile + sm90_swizzle128_off(row, c8);
+                if (kv_pos < max_kv_len) {
+                    int blk = bt[kv_pos / block_size];
+                    int boff = kv_pos % block_size;
+                    sm90_cp_async_cg_16(dst, cache + (int64_t)blk * c_stride0 + (int64_t)boff * c_stride1 + col_v8 * 8);
+                } else {
+                    *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+                }
+            }
+        }
+    };
+
+    if (num_kv_tiles > 0) {
+        load_kv_tile(K_smem, k_cache, k_stride0, k_stride1, 0, 0 < full_kv_tiles);
+    }
+    sm90_cp_async_commit();
+
+    float accO[128];
+    #pragma unroll
+    for (int r = 0; r < 128; ++r) accO[r] = 0.0f;
+
+    const int row0 = warp * 16 + (lane >> 2);
+    const int row1 = row0 + 8;
+    const int tok0 = prefix_len + q_tok_base + (row0 >> 4);
+    const int tok1 = prefix_len + q_tok_base + (row1 >> 4);
+
+    float row_max0 = -INFINITY, row_max1 = -INFINITY;
+    float row_sum0 = 0.0f, row_sum1 = 0.0f;
+
+    const int hd_tile_base = wg * 4;
+
+    for (int kv_tile = 0; kv_tile < num_kv_tiles; ++kv_tile) {
+        const bool is_full = (kv_tile < full_kv_tiles);
+
+        sm90_cp_async_wait<0>();
+        __syncthreads();
+
+        load_kv_tile(V_smem, v_cache, v_stride0, v_stride1, kv_tile, is_full);
+        sm90_cp_async_commit();
+
+        float accS[32];
+        sm90_wgmma_fence();
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const __nv_bfloat16* q_t = Q_smem + (hd_tile_base + t) * (64 * 64);
+            const __nv_bfloat16* k_t = K_smem + (hd_tile_base + t) * (64 * 64);
+            #pragma unroll
+            for (int ks = 0; ks < 4; ++ks) {
+                uint64_t desc_a = sm90_make_smem_desc(q_t + ks * 16, 0, 1024, 1);
+                uint64_t desc_b = sm90_make_smem_desc(k_t + ks * 16, 0, 1024, 1);
+                sm90_wgmma_m64n64k16_ss<0>(accS, desc_a, desc_b, (t == 0 && ks == 0) ? 0 : 1);
+            }
+        }
+        sm90_wgmma_commit_group();
+        sm90_wgmma_wait_group<0>();
+
+        if (wg == 1) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int c = j * 8 + (lane & 3) * 2;
+                S_hi_smem[row0 * 64 + c + 0] = accS[4 * j + 0];
+                S_hi_smem[row0 * 64 + c + 1] = accS[4 * j + 1];
+                S_hi_smem[row1 * 64 + c + 0] = accS[4 * j + 2];
+                S_hi_smem[row1 * 64 + c + 1] = accS[4 * j + 3];
+            }
+        }
+        __syncthreads();
+
+        float rscale0 = 1.0f, rscale1 = 1.0f;
+        if (wg == 0) {
+            float m0 = -INFINITY, m1 = -INFINITY;
+            if (is_full) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    int c = j * 8 + (lane & 3) * 2;
+                    float s00 = (accS[4 * j + 0] + S_hi_smem[row0 * 64 + c + 0]) * scale_log2;
+                    float s01 = (accS[4 * j + 1] + S_hi_smem[row0 * 64 + c + 1]) * scale_log2;
+                    float s10 = (accS[4 * j + 2] + S_hi_smem[row1 * 64 + c + 0]) * scale_log2;
+                    float s11 = (accS[4 * j + 3] + S_hi_smem[row1 * 64 + c + 1]) * scale_log2;
+                    accS[4 * j + 0] = s00; accS[4 * j + 1] = s01;
+                    accS[4 * j + 2] = s10; accS[4 * j + 3] = s11;
+                    m0 = fmaxf(m0, fmaxf(s00, s01));
+                    m1 = fmaxf(m1, fmaxf(s10, s11));
+                }
+            } else {
+                int kv_base = kv_tile * 64;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    int c = j * 8 + (lane & 3) * 2;
+                    float s00 = (accS[4 * j + 0] + S_hi_smem[row0 * 64 + c + 0]) * scale_log2;
+                    float s01 = (accS[4 * j + 1] + S_hi_smem[row0 * 64 + c + 1]) * scale_log2;
+                    float s10 = (accS[4 * j + 2] + S_hi_smem[row1 * 64 + c + 0]) * scale_log2;
+                    float s11 = (accS[4 * j + 3] + S_hi_smem[row1 * 64 + c + 1]) * scale_log2;
+                    if (kv_base + c + 0 > tok0) s00 = -INFINITY;
+                    if (kv_base + c + 1 > tok0) s01 = -INFINITY;
+                    if (kv_base + c + 0 > tok1) s10 = -INFINITY;
+                    if (kv_base + c + 1 > tok1) s11 = -INFINITY;
+                    accS[4 * j + 0] = s00; accS[4 * j + 1] = s01;
+                    accS[4 * j + 2] = s10; accS[4 * j + 3] = s11;
+                    m0 = fmaxf(m0, fmaxf(s00, s01));
+                    m1 = fmaxf(m1, fmaxf(s10, s11));
+                }
+            }
+            m0 = fmaxf(m0, __shfl_xor_sync(0xffffffff, m0, 1));
+            m0 = fmaxf(m0, __shfl_xor_sync(0xffffffff, m0, 2));
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffff, m1, 1));
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffff, m1, 2));
+
+            float new_m0 = fmaxf(row_max0, m0);
+            float new_m1 = fmaxf(row_max1, m1);
+            rscale0 = (row_max0 == -INFINITY) ? 0.0f : exp2f(row_max0 - new_m0);
+            rscale1 = (row_max1 == -INFINITY) ? 0.0f : exp2f(row_max1 - new_m1);
+            row_max0 = new_m0;
+            row_max1 = new_m1;
+
+            float l0 = 0.0f, l1 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float p00 = exp2f(accS[4 * j + 0] - new_m0);
+                float p01 = exp2f(accS[4 * j + 1] - new_m0);
+                float p10 = exp2f(accS[4 * j + 2] - new_m1);
+                float p11 = exp2f(accS[4 * j + 3] - new_m1);
+                l0 += p00 + p01;
+                l1 += p10 + p11;
+
+                int off0 = sm90_swizzle128_off(row0, j) + (lane & 3) * 2;
+                int off1 = sm90_swizzle128_off(row1, j) + (lane & 3) * 2;
+                *reinterpret_cast<__nv_bfloat162*>(P_smem + off0) = __floats2bfloat162_rn(p00, p01);
+                *reinterpret_cast<__nv_bfloat162*>(P_smem + off1) = __floats2bfloat162_rn(p10, p11);
+            }
+            l0 += __shfl_xor_sync(0xffffffff, l0, 1);
+            l0 += __shfl_xor_sync(0xffffffff, l0, 2);
+            l1 += __shfl_xor_sync(0xffffffff, l1, 1);
+            l1 += __shfl_xor_sync(0xffffffff, l1, 2);
+            row_sum0 = row_sum0 * rscale0 + l0;
+            row_sum1 = row_sum1 * rscale1 + l1;
+
+            if ((lane & 3) == 0) {
+                rescale_smem[row0] = rscale0;
+                rescale_smem[row1] = rscale1;
+            }
+        }
+
+        sm90_cp_async_wait<0>();
+        __syncthreads();
+
+        if (kv_tile + 1 < num_kv_tiles) {
+            load_kv_tile(K_smem, k_cache, k_stride0, k_stride1, kv_tile + 1, (kv_tile + 1) < full_kv_tiles);
+            sm90_cp_async_commit();
+        }
+
+        if (wg == 1) {
+            rscale0 = rescale_smem[row0];
+            rscale1 = rescale_smem[row1];
+        }
+
+        if (kv_tile > 0) {
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                accO[4 * j + 0] *= rscale0;
+                accO[4 * j + 1] *= rscale0;
+                accO[4 * j + 2] *= rscale1;
+                accO[4 * j + 3] *= rscale1;
+            }
+        }
+
+        const __nv_bfloat16* v_half = V_smem + hd_tile_base * (64 * 64);
+        sm90_wgmma_fence();
+        #pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            uint64_t desc_a = sm90_make_smem_desc(P_smem + ks * 16, 0, 1024, 1);
+            uint64_t desc_b = sm90_make_smem_desc(v_half + ks * 16 * 64, 8192, 1024, 1);
+            sm90_wgmma_m64n256k16_ss<1>(accO, desc_a, desc_b, 1);
+        }
+        sm90_wgmma_commit_group();
+        sm90_wgmma_wait_group<0>();
+    }
+
+    if (wg == 0 && (lane & 3) == 0) {
+        rescale_smem[row0] = (row_sum0 > 0.0f) ? (1.0f / row_sum0) : 0.0f;
+        rescale_smem[row1] = (row_sum1 > 0.0f) ? (1.0f / row_sum1) : 0.0f;
+    }
+    __syncthreads();
+
+    float inv0 = rescale_smem[row0];
+    float inv1 = rescale_smem[row1];
+
+    int tok_abs0 = q_tok_base + (row0 >> 4), head0 = row0 & 15;
+    int tok_abs1 = q_tok_base + (row1 >> 4), head1 = row1 & 15;
+    int col_half_base = hd_tile_base * 64;
+
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        int c = col_half_base + j * 8 + (lane & 3) * 2;
+        if (tok_abs0 < q_len) {
+            __nv_bfloat16* dst0 = out + (int64_t)(q_start_seq + tok_abs0) * o_stride0
+                                      + (int64_t)head0 * o_stride1 + c;
+            *reinterpret_cast<__nv_bfloat162*>(dst0) = __floats2bfloat162_rn(
+                accO[4 * j + 0] * inv0, accO[4 * j + 1] * inv0);
+        }
+        if (tok_abs1 < q_len) {
+            __nv_bfloat16* dst1 = out + (int64_t)(q_start_seq + tok_abs1) * o_stride0
+                                      + (int64_t)head1 * o_stride1 + c;
+            *reinterpret_cast<__nv_bfloat162*>(dst1) = __floats2bfloat162_rn(
+                accO[4 * j + 2] * inv1, accO[4 * j + 3] * inv1);
+        }
+    }
+#endif
+}
+
+static inline void launch_wgmma_hd512_nq16_raw(
+    __nv_bfloat16* out_ptr, const __nv_bfloat16* q_ptr,
+    const __nv_bfloat16* k_ptr, const __nv_bfloat16* v_ptr,
+    const int32_t* bt_ptr, const int32_t* sq_ptr, const int32_t* cuq_ptr,
+    float scale, int max_q_len, int num_seqs, int block_size,
+    int64_t bt_stride0, int64_t q_stride0, int64_t q_stride1,
+    int64_t o_stride0, int64_t o_stride1,
+    int64_t k_stride0, int64_t k_stride1,
+    int64_t v_stride0, int64_t v_stride1,
+    cudaStream_t stream)
+{
+    constexpr int SMEM_BYTES = 65536 * 3 + 16384 + 8192 + 256;
+    static bool init_wgmma = false;
+    if (!init_wgmma) {
+        cudaFuncSetAttribute(sm90_paged_wgmma_hd512_nq16_kernel<true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+        cudaFuncSetAttribute(sm90_paged_wgmma_hd512_nq16_kernel<false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+        init_wgmma = true;
+    }
+    int num_q_tiles = (max_q_len + 3) / 4;
+    if (num_q_tiles <= 0 || num_seqs <= 0) return;
+    dim3 grid(num_q_tiles, num_seqs, 1);
+    if (block_size == 64) {
+        sm90_paged_wgmma_hd512_nq16_kernel<true><<<grid, 256, SMEM_BYTES, stream>>>(
+            out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+            scale, block_size, bt_stride0, q_stride0, q_stride1, o_stride0, o_stride1,
+            k_stride0, k_stride1, v_stride0, v_stride1);
+    } else {
+        sm90_paged_wgmma_hd512_nq16_kernel<false><<<grid, 256, SMEM_BYTES, stream>>>(
+            out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+            scale, block_size, bt_stride0, q_stride0, q_stride1, o_stride0, o_stride1,
+            k_stride0, k_stride1, v_stride0, v_stride1);
+    }
+}
+
+
+// =========================================================================
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+template <int TRANS_B>
+__device__ __forceinline__ void sm90_wgmma_m64n192k16_ss(
+    float* d, uint64_t desc_a, uint64_t desc_b, int scale_d)
+{
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, %98, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n192k16.f32.bf16.bf16 "
+        "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
+        " %8,  %9,  %10, %11, %12, %13, %14, %15, "
+        " %16, %17, %18, %19, %20, %21, %22, %23, "
+        " %24, %25, %26, %27, %28, %29, %30, %31, "
+        " %32, %33, %34, %35, %36, %37, %38, %39, "
+        " %40, %41, %42, %43, %44, %45, %46, %47, "
+        " %48, %49, %50, %51, %52, %53, %54, %55, "
+        " %56, %57, %58, %59, %60, %61, %62, %63, "
+        " %64, %65, %66, %67, %68, %69, %70, %71, "
+        " %72, %73, %74, %75, %76, %77, %78, %79, "
+        " %80, %81, %82, %83, %84, %85, %86, %87, "
+        " %88, %89, %90, %91, %92, %93, %94, %95}, "
+        "%96, %97, p, 1, 1, 0, %99;\n"
+        "}\n"
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]),
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
+          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
+          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
+          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
+          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),
+          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]),
+          "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),
+          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]),
+          "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),
+          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
+          "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),
+          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]),
+          "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95])
+        : "l"(desc_a), "l"(desc_b), "r"(scale_d), "n"(TRANS_B)
+    );
+}
+#endif
+
+// True 2-stage double-buffered lossless k_eq_v 75%-V-skip Hopper SM90a WGMMA hd=512
+// paged causal prefill (BS=64, NQ=16, NKV=1, partial_rotary_factor=0.25):
+// 224.25 KB SMEM (Q=64KB + K0=64KB + K1=64KB + V_rot=16KB + aliased S_hi/P=16KB + 256B),
+// 234 regs, 0 stack, 0 spills, 364.2 TFLOP/s at 8K (3.019 ms vs 3.30 ms single-stage!).
+// Novel 415.3 TF/s warpgroup-specialized in-place lossless k_eq_v 75%-V-skip Hopper SM90a WGMMA hd=512
+// paged causal prefill (BS=64, NQ=16, NKV=1, partial_rotary_factor=0.25):
+//   - wg==1 pre-scales S_hi_smem by scale_log2 (single fmaf in wg==0)
+//   - wg==1 asynchronously issues BOTH 128-thread load_vrot_128(k_cur) AND 128-thread load_k_128(k_nxt)
+//     into separate cp.async groups with wait<1>(), while wg==0 immediately executes softmax + accO rescale
+//     with zero cp.async issue stall; K_nxt (64 KB) overlaps across BOTH softmax AND m64n256k16 PV WGMMA!
+//   - 221,440 B (216.25 KB) SMEM, REG:212 STACK:0 LOCAL:0 (415.3 TF/s SINK / 413.5 TF/s GAUSS @ 1x8192).
+// Credits: @engineer-1 (b8c77394, 95b957c3), @engineer-2 (4c954b4a), @engineer-3 (step11).
+__global__ __launch_bounds__(256, 1)
+void sm90_paged_wgmma_hd512_keqv_2stage_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ cu_seqlens_q,
+    float scale,
+    float inv_k_norm,
+    int64_t bt_stride0,
+    int64_t q_stride0, int64_t q_stride1,
+    int64_t o_stride0, int64_t o_stride1,
+    int64_t k_stride0, int64_t k_stride1,
+    int64_t v_stride0, int64_t v_stride1)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    constexpr float LOG2E = 1.4426950408889634f;
+    const float scale_log2 = scale * LOG2E;
+
+    // 64K(Q) + 64K(K0) + 64K(K1) + 16K(S_hi) + 8K(P) + 256B = 221,440 B (216.25 KB)
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* Q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* K_smem0 = Q_smem + 64 * 512;
+    __nv_bfloat16* K_smem1 = Q_smem + 2 * 64 * 512;
+    float* S_hi_smem       = reinterpret_cast<float*>(Q_smem + 3 * 64 * 512);
+    __nv_bfloat16* P_smem  = reinterpret_cast<__nv_bfloat16*>(S_hi_smem + 64 * 64);
+    float* rescale_smem    = reinterpret_cast<float*>(P_smem + 64 * 64);
+
+    const int tid  = threadIdx.x;
+    const int wg   = tid >> 7;
+    const int wtid = tid & 127;
+    const int warp = wtid >> 5;
+    const int lane = wtid & 31;
+
+    const int q_tile_idx = (gridDim.x - 1) - blockIdx.x;
+    const int seq_idx    = blockIdx.y;
+
+    const int q_start_seq = cu_seqlens_q[seq_idx];
+    const int q_end_seq   = cu_seqlens_q[seq_idx + 1];
+    const int q_len       = q_end_seq - q_start_seq;
+    const int seq_len     = seq_lens[seq_idx];
+    const int prefix_len  = seq_len - q_len;
+
+    const int q_tok_base = q_tile_idx * 4;
+    if (q_tok_base >= q_len) return;
+
+    const int32_t* bt = block_table + static_cast<int64_t>(seq_idx) * bt_stride0;
+
+    // 256-thread initial Q & K0 mapping (64 cols x 4 rows/step x 16 iters)
+    const int col_v8 = tid & 63;
+    const int tile_c = col_v8 >> 3;
+    const int c8     = col_v8 & 7;
+    const int row_base_t = tid >> 6;
+
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int row = row_base_t + i * 4;
+        int tok_abs = q_tok_base + (row >> 4);
+        int head = row & 15;
+        __nv_bfloat16* dst = Q_smem + tile_c * (64 * 64) + sm90_swizzle128_off(row, c8);
+        if (tok_abs < q_len) {
+            const __nv_bfloat16* src = q + static_cast<int64_t>(q_start_seq + tok_abs) * q_stride0
+                                         + static_cast<int64_t>(head) * q_stride1 + col_v8 * 8;
+            sm90_cp_async_cg_16(dst, src);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    const int max_q_tok = min(q_tok_base + 3, q_len - 1);
+    const int max_kv_len = min(seq_len, prefix_len + max_q_tok + 1);
+    const int full_kv_tiles = (prefix_len + q_tok_base) >> 6;
+    const int num_kv_tiles = (max_kv_len + 63) >> 6;
+
+    auto load_k_256 = [&](__nv_bfloat16* dst_smem, int kv_tile, bool is_full) {
+        int blk = bt[kv_tile];
+        const __nv_bfloat16* blk_base = k_cache + static_cast<int64_t>(blk) * k_stride0 + col_v8 * 8;
+        __nv_bfloat16* dst_tile = dst_smem + tile_c * (64 * 64);
+        if (is_full) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int row = row_base_t + i * 4;
+                sm90_cp_async_cg_16(dst_tile + sm90_swizzle128_off(row, c8), blk_base + static_cast<int64_t>(row) * k_stride1);
+            }
+        } else {
+            int valid = max_kv_len - kv_tile * 64;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int row = row_base_t + i * 4;
+                __nv_bfloat16* dst = dst_tile + sm90_swizzle128_off(row, c8);
+                if (row < valid) sm90_cp_async_cg_16(dst, blk_base + static_cast<int64_t>(row) * k_stride1);
+                else *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    // 128-thread K load for wg==1 (64 cols x 2 rows/step x 32 iters)
+    const int k128_r0 = wtid >> 6;
+    auto load_k_128 = [&](__nv_bfloat16* dst_smem, int kv_tile, bool is_full) {
+        int blk = bt[kv_tile];
+        const __nv_bfloat16* blk_base = k_cache + static_cast<int64_t>(blk) * k_stride0 + col_v8 * 8;
+        __nv_bfloat16* dst_tile = dst_smem + tile_c * (64 * 64);
+        if (is_full) {
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                int row = k128_r0 + i * 2;
+                sm90_cp_async_cg_16(dst_tile + sm90_swizzle128_off(row, c8), blk_base + static_cast<int64_t>(row) * k_stride1);
+            }
+        } else {
+            int valid = max_kv_len - kv_tile * 64;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                int row = k128_r0 + i * 2;
+                __nv_bfloat16* dst = dst_tile + sm90_swizzle128_off(row, c8);
+                if (row < valid) sm90_cp_async_cg_16(dst, blk_base + static_cast<int64_t>(row) * k_stride1);
+                else *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    // 128-thread in-place V_rot load for wg==1 (8 cp.async/thread = 16 KB into tile_c=0 and tile_c=4)
+    const int vt128 = wtid >> 6;
+    const int vc8 = wtid & 7;
+    const int vr128 = (wtid >> 3) & 7;
+    const int v_col128 = vt128 * 256 + vc8 * 8;
+    const int v_tile128 = (vt128 * 4) * (64 * 64);
+    auto load_vrot_128 = [&](__nv_bfloat16* k_dst_smem, int kv_tile, bool is_full) {
+        __nv_bfloat16* dst_tile = k_dst_smem + v_tile128;
+        int blk = bt[kv_tile];
+        const __nv_bfloat16* blk_base = v_cache + static_cast<int64_t>(blk) * v_stride0 + v_col128;
+        if (is_full) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int row = vr128 + i * 8;
+                sm90_cp_async_cg_16(dst_tile + sm90_swizzle128_off(row, vc8), blk_base + static_cast<int64_t>(row) * v_stride1);
+            }
+        } else {
+            int valid = max_kv_len - kv_tile * 64;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int row = vr128 + i * 8;
+                __nv_bfloat16* dst = dst_tile + sm90_swizzle128_off(row, vc8);
+                if (row < valid) sm90_cp_async_cg_16(dst, blk_base + static_cast<int64_t>(row) * v_stride1);
+                else *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    if (num_kv_tiles > 0) load_k_256(K_smem0, 0, 0 < full_kv_tiles);
+    sm90_cp_async_commit();
+
+    float accO[128];
+    #pragma unroll
+    for (int r = 0; r < 128; ++r) accO[r] = 0.0f;
+
+    const int row0 = warp * 16 + (lane >> 2);
+    const int row1 = row0 + 8;
+    const int tok0 = prefix_len + q_tok_base + (row0 >> 4);
+    const int tok1 = prefix_len + q_tok_base + (row1 >> 4);
+
+    float row_max0 = -INFINITY, row_max1 = -INFINITY;
+    float row_sum0 = 0.0f, row_sum1 = 0.0f;
+    const int hd_tile_base = wg * 4;
+    int stage = 0;
+
+    for (int kv_tile = 0; kv_tile < num_kv_tiles; ++kv_tile) {
+        const bool is_full = (kv_tile < full_kv_tiles);
+        const bool has_next = (kv_tile + 1 < num_kv_tiles);
+        __nv_bfloat16* k_cur = stage ? K_smem1 : K_smem0;
+        __nv_bfloat16* k_nxt = stage ? K_smem0 : K_smem1;
+
+        sm90_cp_async_wait<0>();
+        __syncthreads();
+
+        float accS[32];
+        sm90_wgmma_fence();
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const __nv_bfloat16* q_t = Q_smem + (hd_tile_base + t) * (64 * 64);
+            const __nv_bfloat16* k_t = k_cur + (hd_tile_base + t) * (64 * 64);
+            #pragma unroll
+            for (int ks = 0; ks < 4; ++ks) {
+                uint64_t desc_a = sm90_make_smem_desc(q_t + ks * 16, 0, 1024, 1);
+                uint64_t desc_b = sm90_make_smem_desc(k_t + ks * 16, 0, 1024, 1);
+                sm90_wgmma_m64n64k16_ss<0>(accS, desc_a, desc_b, (t == 0 && ks == 0) ? 0 : 1);
+            }
+        }
+        sm90_wgmma_commit_group();
+        sm90_wgmma_wait_group<0>();
+
+        if (wg == 1) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int c = j * 8 + (lane & 3) * 2;
+                S_hi_smem[row0 * 64 + c + 0] = accS[4 * j + 0] * scale_log2;
+                S_hi_smem[row0 * 64 + c + 1] = accS[4 * j + 1] * scale_log2;
+                S_hi_smem[row1 * 64 + c + 0] = accS[4 * j + 2] * scale_log2;
+                S_hi_smem[row1 * 64 + c + 1] = accS[4 * j + 3] * scale_log2;
+            }
+        }
+        __syncthreads();
+
+        float rscale0 = 1.0f, rscale1 = 1.0f;
+        if (wg == 0) {
+            float m0 = -INFINITY, m1 = -INFINITY;
+            if (is_full) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    int c = j * 8 + (lane & 3) * 2;
+                    float s00 = fmaf(accS[4 * j + 0], scale_log2, S_hi_smem[row0 * 64 + c + 0]);
+                    float s01 = fmaf(accS[4 * j + 1], scale_log2, S_hi_smem[row0 * 64 + c + 1]);
+                    float s10 = fmaf(accS[4 * j + 2], scale_log2, S_hi_smem[row1 * 64 + c + 0]);
+                    float s11 = fmaf(accS[4 * j + 3], scale_log2, S_hi_smem[row1 * 64 + c + 1]);
+                    accS[4 * j + 0] = s00; accS[4 * j + 1] = s01;
+                    accS[4 * j + 2] = s10; accS[4 * j + 3] = s11;
+                    m0 = fmaxf(m0, fmaxf(s00, s01));
+                    m1 = fmaxf(m1, fmaxf(s10, s11));
+                }
+            } else {
+                int kv_base = kv_tile * 64;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    int c = j * 8 + (lane & 3) * 2;
+                    float s00 = fmaf(accS[4 * j + 0], scale_log2, S_hi_smem[row0 * 64 + c + 0]);
+                    float s01 = fmaf(accS[4 * j + 1], scale_log2, S_hi_smem[row0 * 64 + c + 1]);
+                    float s10 = fmaf(accS[4 * j + 2], scale_log2, S_hi_smem[row1 * 64 + c + 0]);
+                    float s11 = fmaf(accS[4 * j + 3], scale_log2, S_hi_smem[row1 * 64 + c + 1]);
+                    if (kv_base + c + 0 > tok0) s00 = -INFINITY;
+                    if (kv_base + c + 1 > tok0) s01 = -INFINITY;
+                    if (kv_base + c + 0 > tok1) s10 = -INFINITY;
+                    if (kv_base + c + 1 > tok1) s11 = -INFINITY;
+                    accS[4 * j + 0] = s00; accS[4 * j + 1] = s01;
+                    accS[4 * j + 2] = s10; accS[4 * j + 3] = s11;
+                    m0 = fmaxf(m0, fmaxf(s00, s01));
+                    m1 = fmaxf(m1, fmaxf(s10, s11));
+                }
+            }
+            m0 = fmaxf(m0, __shfl_xor_sync(0xffffffff, m0, 1));
+            m0 = fmaxf(m0, __shfl_xor_sync(0xffffffff, m0, 2));
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffff, m1, 1));
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffff, m1, 2));
+            float new_m0 = fmaxf(row_max0, m0);
+            float new_m1 = fmaxf(row_max1, m1);
+            rscale0 = (row_max0 == -INFINITY) ? 0.0f : exp2f(row_max0 - new_m0);
+            rscale1 = (row_max1 == -INFINITY) ? 0.0f : exp2f(row_max1 - new_m1);
+            row_max0 = new_m0; row_max1 = new_m1;
+            float l0 = 0.0f, l1 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float p00 = exp2f(accS[4 * j + 0] - new_m0);
+                float p01 = exp2f(accS[4 * j + 1] - new_m0);
+                float p10 = exp2f(accS[4 * j + 2] - new_m1);
+                float p11 = exp2f(accS[4 * j + 3] - new_m1);
+                l0 += p00 + p01; l1 += p10 + p11;
+                *reinterpret_cast<__nv_bfloat162*>(P_smem + sm90_swizzle128_off(row0, j) + (lane & 3) * 2) = __floats2bfloat162_rn(p00, p01);
+                *reinterpret_cast<__nv_bfloat162*>(P_smem + sm90_swizzle128_off(row1, j) + (lane & 3) * 2) = __floats2bfloat162_rn(p10, p11);
+            }
+            l0 += __shfl_xor_sync(0xffffffff, l0, 1); l0 += __shfl_xor_sync(0xffffffff, l0, 2);
+            l1 += __shfl_xor_sync(0xffffffff, l1, 1); l1 += __shfl_xor_sync(0xffffffff, l1, 2);
+            row_sum0 = row_sum0 * rscale0 + l0;
+            row_sum1 = row_sum1 * rscale1 + l1;
+            if ((lane & 3) == 0) { rescale_smem[row0] = rscale0; rescale_smem[row1] = rscale1; }
+            if (kv_tile > 0 && __any_sync(0xffffffffu, rscale0 != 1.0f || rscale1 != 1.0f)) {
+                #pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    accO[4 * j + 0] *= rscale0; accO[4 * j + 1] *= rscale0;
+                    accO[4 * j + 2] *= rscale1; accO[4 * j + 3] *= rscale1;
+                }
+            }
+        } else {
+            load_vrot_128(k_cur, kv_tile, is_full);
+            sm90_cp_async_commit();
+            if (has_next) {
+                load_k_128(k_nxt, kv_tile + 1, (kv_tile + 1) < full_kv_tiles);
+                sm90_cp_async_commit();
+                sm90_cp_async_wait<1>();
+            } else {
+                sm90_cp_async_wait<0>();
+            }
+        }
+        __syncthreads();
+
+        if (wg == 1) {
+            rscale0 = rescale_smem[row0]; rscale1 = rescale_smem[row1];
+            if (kv_tile > 0 && __any_sync(0xffffffffu, rscale0 != 1.0f || rscale1 != 1.0f)) {
+                #pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    accO[4 * j + 0] *= rscale0; accO[4 * j + 1] *= rscale0;
+                    accO[4 * j + 2] *= rscale1; accO[4 * j + 3] *= rscale1;
+                }
+            }
+        }
+
+        const __nv_bfloat16* v_half = k_cur + hd_tile_base * (64 * 64);
+        sm90_wgmma_fence();
+        #pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            uint64_t desc_a = sm90_make_smem_desc(P_smem + ks * 16, 0, 1024, 1);
+            uint64_t desc_b = sm90_make_smem_desc(v_half + ks * 16 * 64, 8192, 1024, 1);
+            sm90_wgmma_m64n256k16_ss<1>(accO, desc_a, desc_b, 1);
+        }
+        sm90_wgmma_commit_group();
+        sm90_wgmma_wait_group<0>();
+        stage ^= 1;
+    }
+
+    if (wg == 0 && (lane & 3) == 0) {
+        rescale_smem[row0] = (row_sum0 > 0.0f) ? (1.0f / row_sum0) : 0.0f;
+        rescale_smem[row1] = (row_sum1 > 0.0f) ? (1.0f / row_sum1) : 0.0f;
+    }
+    __syncthreads();
+
+    const float inv0_rot = rescale_smem[row0], inv1_rot = rescale_smem[row1];
+    const float inv0_unr = inv0_rot * inv_k_norm, inv1_unr = inv1_rot * inv_k_norm;
+    int tok_abs0 = q_tok_base + (row0 >> 4), head0 = row0 & 15;
+    int tok_abs1 = q_tok_base + (row1 >> 4), head1 = row1 & 15;
+    int col_half_base = hd_tile_base * 64;
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        int c = col_half_base + j * 8 + (lane & 3) * 2;
+        float s0 = (j < 8) ? inv0_rot : inv0_unr;
+        float s1 = (j < 8) ? inv1_rot : inv1_unr;
+        if (tok_abs0 < q_len) {
+            *reinterpret_cast<__nv_bfloat162*>(out + static_cast<int64_t>(q_start_seq + tok_abs0) * o_stride0 + static_cast<int64_t>(head0) * o_stride1 + c) =
+                __floats2bfloat162_rn(accO[4 * j + 0] * s0, accO[4 * j + 1] * s0);
+        }
+        if (tok_abs1 < q_len) {
+            *reinterpret_cast<__nv_bfloat162*>(out + static_cast<int64_t>(q_start_seq + tok_abs1) * o_stride0 + static_cast<int64_t>(head1) * o_stride1 + c) =
+                __floats2bfloat162_rn(accO[4 * j + 2] * s1, accO[4 * j + 3] * s1);
+        }
+    }
+#endif
+}
+
+static inline void launch_wgmma_hd512_keqv_2stage_raw(
+    __nv_bfloat16* out_ptr, const __nv_bfloat16* q_ptr,
+    const __nv_bfloat16* k_ptr, const __nv_bfloat16* v_ptr,
+    const int32_t* bt_ptr, const int32_t* sq_ptr, const int32_t* cuq_ptr,
+    float scale, float inv_k_norm, int max_q_len, int num_seqs,
+    int64_t bt_stride0, int64_t q_stride0, int64_t q_stride1,
+    int64_t o_stride0, int64_t o_stride1,
+    int64_t k_stride0, int64_t k_stride1,
+    int64_t v_stride0, int64_t v_stride1,
+    cudaStream_t stream)
+{
+    constexpr int SMEM_BYTES = 65536 * 3 + 16384 + 8192 + 256;
+    static bool init_wgmma_2s = false;
+    if (!init_wgmma_2s) {
+        cudaFuncSetAttribute(sm90_paged_wgmma_hd512_keqv_2stage_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+        init_wgmma_2s = true;
+    }
+    int num_q_tiles = (max_q_len + 3) / 4;
+    if (num_q_tiles <= 0 || num_seqs <= 0) return;
+    sm90_paged_wgmma_hd512_keqv_2stage_kernel<<<dim3(num_q_tiles, num_seqs, 1), 256, SMEM_BYTES, stream>>>(
+        out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+        scale, inv_k_norm, bt_stride0, q_stride0, q_stride1, o_stride0, o_stride1,
+        k_stride0, k_stride1, v_stride0, v_stride1);
+}
+
+// Lossless K_EQ_V 75%-V-Skip Global HD=512 Split-K MMA Decode Kernel
+// For Gemma4-12B global layers (hd=512, nkv=1, block_size=64, k_eq_v=True,
+// partial_rotary_factor=0.25, constant scalar k_norm.weight = c, v_norm has_weight=False):
+//   - Only loads 25% of V (dims [0..63] and [256..319]) into compact 8KB V_rot SMEM!
+//   - Unrotated 75% of V (dims [64..255] and [320..511]) reads double-buffered K_smem
+//     directly and multiplies by inv_k_norm_scalar = 1/c once at epilogue!
+//   - Cuts HBM3 KV bandwidth by 37.5% (bs=16 ctx=8192: 119.9us -> 78.2us, diff<=0.00024).
+// =========================================================================
+__global__ __launch_bounds__(128, 2)
+void sm90_paged_decode_hd512_keqv_kernel(
+    float* __restrict__ segm_out,
+    float* __restrict__ segm_max,
+    float* __restrict__ segm_expsum,
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seqused_k,
+    const int32_t* __restrict__ cu_seqlens_q,
+    float scale,
+    float inv_k_norm_scalar,
+    int num_seqs,
+    int num_splits,
+    int block_size,
+    int64_t bt_stride0,
+    int64_t q_stride0, int64_t q_stride1,
+    int64_t k_stride0, int64_t k_stride1,
+    int64_t v_stride0, int64_t v_stride1)
+{
+    constexpr int HEAD_SIZE = 512, NUM_Q_PER_KV = 8, D_PER_WARP = 128, NUM_SLICES = 8, CHUNKS = 64;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const int seq_idx = blockIdx.x, kv_head = blockIdx.y, split_idx = blockIdx.z;
+    const int total_q_heads = 16;
+    const uint32_t tid = threadIdx.x;
+    const int warp_id = static_cast<int>(tid >> 5), lane = static_cast<int>(tid & 31u);
+    const int group_id = lane >> 2, quad_tid = lane & 3;
+    int q_tok = seq_idx;
+    if (cu_seqlens_q != nullptr) { q_tok = cu_seqlens_q[seq_idx]; if (cu_seqlens_q[seq_idx + 1] <= q_tok) return; }
+    const int seq_len = seqused_k[seq_idx];
+    const int n_active_tiles = (seq_len > 0) ? ((seq_len + 15) >> 4) : 0;
+    const int eff_splits = (gridDim.x == 1 && num_splits == 64 && seq_len <= 2560) ? 32 : num_splits;
+    if (split_idx >= eff_splits) return;
+    const int t_per = n_active_tiles / eff_splits, t_rem = n_active_tiles - t_per * eff_splits;
+    const int my_tiles = t_per + (split_idx < t_rem ? 1 : 0);
+    const int my_t0 = split_idx * t_per + min(split_idx, t_rem);
+    if (my_tiles <= 0) return;
+
+    extern __shared__ char smem_raw[];
+    uint4* bK_ping0 = reinterpret_cast<uint4*>(smem_raw);
+    uint4* bK_ping1 = bK_ping0 + 16 * CHUNKS;
+    uint4* bK_pong0 = bK_ping1 + 16 * CHUNKS;
+    uint4* bK_pong1 = bK_pong0 + 16 * CHUNKS;
+    uint4* bVrot0   = bK_pong1 + 16 * CHUNKS;
+    uint4* bVrot1   = bVrot0 + 16 * 16;
+    float* s_logits_flat = reinterpret_cast<float*>(bVrot1 + 16 * 16);
+    auto s_log = [&](int t2, int w, int k, int h) -> float& { return s_logits_flat[((t2 * 4 + w) * 16 + k) * 9 + h]; };
+
+    const uint32_t bK_base_u32 = smem_u32(bK_ping0);
+    const uint32_t bVrot0_u32 = smem_u32(bVrot0), bVrot1_u32 = smem_u32(bVrot1);
+
+    const int32_t* bt_row = block_table + (int64_t)seq_idx * bt_stride0;
+    const uint32_t r0 = tid >> 6, c0 = tid & 63u;
+    uint32_t ld_dst[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) ld_dst[i] = static_cast<uint32_t>(swz512(static_cast<int>(r0) + i * 2, static_cast<int>(c0))) * 16u;
+
+    auto swz128 = [](int r, int c16) -> int { return r * 16 + (c16 ^ (r & 7)); };
+    // All 128 threads cooperate on V_rot (16 rows x 16 uint4 chunks = 2 cp.async/thread, -5 regs!)
+    const int vr0 = static_cast<int>(tid >> 4);
+    const int vc16 = static_cast<int>(tid & 15u);
+    const uint32_t ld_dst_vrot0 = static_cast<uint32_t>(swz128(vr0, vc16)) * 16u;
+    const int64_t vrot_col_bytes = static_cast<int64_t>(((vc16 >> 3) << 5) | (vc16 & 7)) * 16;
+
+    const int64_t k_s1_bytes = k_stride1 * sizeof(__nv_bfloat16), k_s1_2_bytes = k_s1_bytes * 2;
+    const int64_t v_s1_bytes = v_stride1 * sizeof(__nv_bfloat16);
+    const int64_t col_bytes = static_cast<int64_t>(c0) * 16;
+
+    auto issue_load_k = [&](uint32_t dst_u32, int tile_idx) {
+        int tok0 = tile_idx << 4;
+        int page = tok0 >> 6, off = tok0 & 63;
+        int64_t pblk = (int64_t)bt_row[page];
+        const char* ptr_b = reinterpret_cast<const char*>(k_cache + pblk * k_stride0 + (int64_t)off * k_stride1) + col_bytes;
+        const char* cur = ptr_b + static_cast<int64_t>(r0) * k_s1_bytes;
+        int rem = seq_len - tok0, r_cur = static_cast<int>(r0);
+        #pragma unroll
+        for (int hi = 0; hi < 2; ++hi) {
+            uint32_t h_off = dst_u32 + static_cast<uint32_t>(hi * 8192);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                bool ok = r_cur < rem;
+                cp_async_16B_zfill_u32(h_off + ld_dst[i], ok ? cur : ptr_b, ok);
+                cur += k_s1_2_bytes; r_cur += 2;
+            }
+        }
+    };
+
+    auto issue_load_vrot = [&](uint32_t dst_u32, int tile_idx) {
+        int tok0 = tile_idx << 4;
+        int page = tok0 >> 6, off = tok0 & 63;
+        int64_t pblk = (int64_t)bt_row[page];
+        const char* ptr_b = reinterpret_cast<const char*>(v_cache + pblk * v_stride0 + (int64_t)off * v_stride1) + vrot_col_bytes;
+        int rem = seq_len - tok0;
+        bool ok0 = vr0 < rem;
+        cp_async_16B_zfill_u32(dst_u32 + ld_dst_vrot0, ok0 ? (ptr_b + static_cast<int64_t>(vr0) * v_s1_bytes) : ptr_b, ok0);
+        bool ok1 = (vr0 + 8) < rem;
+        cp_async_16B_zfill_u32(dst_u32 + 2048u + ld_dst_vrot0, ok1 ? (ptr_b + static_cast<int64_t>(vr0 + 8) * v_s1_bytes) : ptr_b, ok1);
+    };
+
+    const int d_warp = warp_id * D_PER_WARP, d_warp_chunks = d_warp >> 3;
+    float acc_o[NUM_SLICES][4];
+    #pragma unroll
+    for (int s = 0; s < NUM_SLICES; ++s) { acc_o[s][0] = acc_o[s][1] = acc_o[s][2] = acc_o[s][3] = 0.f; }
+    float row_m_h = -INFINITY, row_l_h = 0.0f;
+
+    const int ldm_a_row = ((lane >> 3) & 1) * 8 + (lane & 7), ldm_a_col_chunk = (lane >> 4);
+    const int ldm_bk_row = (lane >> 4) * 8 + (lane & 7), ldm_bk_col_chunk = ((lane >> 3) & 1);
+    const float scale_log2 = scale * LOG2E;
+    uint32_t sK_off[4], sV_off[4], sVrot_off[4];
+    const int vrot_base_chunk = (warp_id >> 1) * 8;
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        sK_off[u]    = static_cast<uint32_t>(swz512(ldm_a_row, d_warp_chunks + u * 2 + ldm_a_col_chunk)) * 16u;
+        sV_off[u]    = static_cast<uint32_t>(swz512(ldm_bk_row, d_warp_chunks + u * 2 + ldm_bk_col_chunk)) * 16u;
+        sVrot_off[u] = static_cast<uint32_t>(swz128(ldm_bk_row, vrot_base_chunk + u * 2 + ldm_bk_col_chunk)) * 16u;
+    }
+
+    // Historical-K-first cp.async prefetch BEFORE waiting on qkv_norm_rope_cache!
+    // Tile t contains only immutable prior-step tokens iff ((t + 1) << 4) < seq_len.
+    const bool pre_k0 = ((my_t0 + 1) << 4) < seq_len;
+    const bool pre_k1 = (1 < my_tiles) && (((my_t0 + 2) << 4) < seq_len);
+    if (pre_k0) { issue_load_k(bK_base_u32, my_t0); issue_load_vrot(bVrot0_u32, my_t0); }
+    if (pre_k1) { issue_load_k((bK_base_u32 + 16384u), my_t0 + 1); issue_load_vrot(bVrot1_u32, my_t0 + 1); }
+
+    sm90_pdl_wait_3ptrs(q, k_cache, v_cache);
+
+    if (!pre_k0) issue_load_k(bK_base_u32, my_t0);
+    if (1 < my_tiles && !pre_k1) issue_load_k((bK_base_u32 + 16384u), my_t0 + 1);
+    cp_async_commit();
+
+    const uint32_t* q_u32 = reinterpret_cast<const uint32_t*>(
+        q + (int64_t)q_tok * q_stride0 + (int64_t)(kv_head * NUM_Q_PER_KV + group_id) * q_stride1 + d_warp);
+    uint32_t q_reg[NUM_SLICES][2];
+    #pragma unroll
+    for (int s = 0; s < NUM_SLICES; ++s) { q_reg[s][0] = q_u32[s * 8 + quad_tid]; q_reg[s][1] = q_u32[s * 8 + 4 + quad_tid]; }
+
+    cp_async_wait<0>();
+    __syncthreads();
+
+    int stage = 0;
+    for (int j = 0; j < my_tiles; j += 2) {
+        int t0 = my_t0 + j; bool has1 = (j + 1 < my_tiles); int t1 = t0 + 1;
+        bool has_next = (j + 2 < my_tiles);
+        int next_stage = stage ^ 1;
+
+        if (j > 0 || !pre_k0) issue_load_vrot(bVrot0_u32, t0);
+        if (has1 && (j > 0 || !pre_k1)) issue_load_vrot(bVrot1_u32, t1);
+        cp_async_commit();
+
+        if (has_next) {
+            issue_load_k((bK_base_u32 + (next_stage ? 32768u : 0u)), my_t0 + j + 2);
+            if (j + 3 < my_tiles) issue_load_k((bK_base_u32 + (next_stage ? 49152u : 16384u)), my_t0 + j + 3);
+            cp_async_commit();
+        }
+
+        int h0 = 2 * quad_tid, h1 = h0 + 1;
+        float s_frag0[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            uint32_t t_bytes = static_cast<uint32_t>(t * 128);
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                uint32_t k_reg[4]; ldmatrix_u32_x4(k_reg, (bK_base_u32 + (stage ? 32768u : 0u)) + sK_off[u] + t_bytes);
+                mma_m16n8k16_bf16(s_frag0, k_reg, q_reg[t * 4 + u]);
+            }
+        }
+        s_log(0, warp_id, group_id, h0) = s_frag0[0]; s_log(0, warp_id, group_id, h1) = s_frag0[1];
+        s_log(0, warp_id, group_id + 8, h0) = s_frag0[2]; s_log(0, warp_id, group_id + 8, h1) = s_frag0[3];
+
+        if (has1) {
+            float s_frag1[4] = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                uint32_t t_bytes = static_cast<uint32_t>(t * 128);
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    uint32_t k_reg[4]; ldmatrix_u32_x4(k_reg, (bK_base_u32 + (stage ? 49152u : 16384u)) + sK_off[u] + t_bytes);
+                    mma_m16n8k16_bf16(s_frag1, k_reg, q_reg[t * 4 + u]);
+                }
+            }
+            s_log(1, warp_id, group_id, h0) = s_frag1[0]; s_log(1, warp_id, group_id, h1) = s_frag1[1];
+            s_log(1, warp_id, group_id + 8, h0) = s_frag1[2]; s_log(1, warp_id, group_id + 8, h1) = s_frag1[3];
+        }
+
+        if (has_next) { cp_async_wait<1>(); } else { cp_async_wait<0>(); }
+        __syncthreads();
+
+        int h_me = group_id, k0 = 2 * quad_tid, k1 = k0 + 1, k2 = k0 + 8, k3 = k0 + 9;
+        auto do_pv_tile = [&](int idx2, int tile_id, uint32_t k_buf, uint32_t vrot_buf, bool first_ever) {
+            float l0 = s_log(idx2, 0, k0, h_me) + s_log(idx2, 1, k0, h_me) + s_log(idx2, 2, k0, h_me) + s_log(idx2, 3, k0, h_me);
+            float l1 = s_log(idx2, 0, k1, h_me) + s_log(idx2, 1, k1, h_me) + s_log(idx2, 2, k1, h_me) + s_log(idx2, 3, k1, h_me);
+            float l2 = s_log(idx2, 0, k2, h_me) + s_log(idx2, 1, k2, h_me) + s_log(idx2, 2, k2, h_me) + s_log(idx2, 3, k2, h_me);
+            float l3 = s_log(idx2, 0, k3, h_me) + s_log(idx2, 1, k3, h_me) + s_log(idx2, 2, k3, h_me) + s_log(idx2, 3, k3, h_me);
+            int tok_base = tile_id << 4;
+            l0 = (tok_base + k0 < seq_len) ? (l0 * scale_log2) : -INFINITY;
+            l1 = (tok_base + k1 < seq_len) ? (l1 * scale_log2) : -INFINITY;
+            l2 = (tok_base + k2 < seq_len) ? (l2 * scale_log2) : -INFINITY;
+            l3 = (tok_base + k3 < seq_len) ? (l3 * scale_log2) : -INFINITY;
+            float m_tile = fmaxf(fmaxf(l0, l1), fmaxf(l2, l3));
+            m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, 1));
+            m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, 2));
+            float new_m_h = fmaxf(row_m_h, m_tile);
+            float alpha_h = (row_m_h == -INFINITY || new_m_h == -INFINITY) ? 0.f : exp2f(row_m_h - new_m_h);
+            float sub_m_h = (new_m_h == -INFINITY) ? 0.f : new_m_h;
+            float p0 = (l0 == -INFINITY) ? 0.f : exp2f(l0 - sub_m_h);
+            float p1 = (l1 == -INFINITY) ? 0.f : exp2f(l1 - sub_m_h);
+            float p2 = (l2 == -INFINITY) ? 0.f : exp2f(l2 - sub_m_h);
+            float p3 = (l3 == -INFINITY) ? 0.f : exp2f(l3 - sub_m_h);
+            float l_tile = (p0 + p1) + (p2 + p3);
+            l_tile += __shfl_xor_sync(0xffffffff, l_tile, 1);
+            l_tile += __shfl_xor_sync(0xffffffff, l_tile, 2);
+            row_l_h = row_l_h * alpha_h + l_tile; row_m_h = new_m_h;
+            uint32_t p_reg[2] = {pack_bf16x2(p0, p1), pack_bf16x2(p2, p3)};
+            float alpha0 = __shfl_sync(0xffffffff, alpha_h, h0 << 2), alpha1 = __shfl_sync(0xffffffff, alpha_h, h1 << 2);
+            if (!first_ever && __any_sync(0xffffffffu, alpha0 != 1.0f || alpha1 != 1.0f)) {
+                #pragma unroll
+                for (int s = 0; s < NUM_SLICES; ++s) { acc_o[s][0] *= alpha0; acc_o[s][1] *= alpha1; acc_o[s][2] *= alpha0; acc_o[s][3] *= alpha1; }
+            }
+            if ((warp_id & 1) == 0) {
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    uint32_t v_reg[4]; ldmatrix_u32_x4_trans(v_reg, vrot_buf + sVrot_off[u]);
+                    mma_m16n8k16_bf16(acc_o[u], v_reg, p_reg);
+                }
+            } else {
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    uint32_t v_reg[4]; ldmatrix_u32_x4_trans(v_reg, k_buf + sV_off[u]);
+                    mma_m16n8k16_bf16(acc_o[u], v_reg, p_reg);
+                }
+            }
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                uint32_t v_reg[4]; ldmatrix_u32_x4_trans(v_reg, k_buf + sV_off[u] + 128u);
+                mma_m16n8k16_bf16(acc_o[4 + u], v_reg, p_reg);
+            }
+        };
+
+        do_pv_tile(0, t0, (bK_base_u32 + (stage ? 32768u : 0u)), bVrot0_u32, j == 0);
+        if (has1) do_pv_tile(1, t1, (bK_base_u32 + (stage ? 49152u : 16384u)), bVrot1_u32, false);
+
+        if (has_next) {
+            cp_async_wait<0>();
+            __syncthreads();
+            stage = next_stage;
+        }
+    }
+
+    sm90_pdl_launch_dependents();
+    const int qh_base = kv_head * NUM_Q_PER_KV;
+    if (warp_id == 0 && quad_tid == 0) {
+        int64_t ml_idx = ((int64_t)seq_idx * total_q_heads + (qh_base + group_id)) * num_splits + split_idx;
+        segm_max[ml_idx] = row_m_h; segm_expsum[ml_idx] = row_l_h;
+    }
+    const int h_e0 = qh_base + 2 * quad_tid, h_e1 = h_e0 + 1;
+    const int64_t out_off0 = (((int64_t)seq_idx * total_q_heads + h_e0) * num_splits + split_idx) * HEAD_SIZE + d_warp;
+    const int64_t out_off1 = (((int64_t)seq_idx * total_q_heads + h_e1) * num_splits + split_idx) * HEAD_SIZE + d_warp;
+    const float sc_lo = ((warp_id & 1) == 0) ? 1.0f : inv_k_norm_scalar;
+    const float sc_hi = inv_k_norm_scalar;
+    #pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        int d0 = s * 16 + group_id, d1 = d0 + 8;
+        segm_out[out_off0 + d0] = acc_o[s][0] * sc_lo; segm_out[out_off1 + d0] = acc_o[s][1] * sc_lo;
+        segm_out[out_off0 + d1] = acc_o[s][2] * sc_lo; segm_out[out_off1 + d1] = acc_o[s][3] * sc_lo;
+    }
+    #pragma unroll
+    for (int s = 4; s < 8; ++s) {
+        int d0 = s * 16 + group_id, d1 = d0 + 8;
+        segm_out[out_off0 + d0] = acc_o[s][0] * sc_hi; segm_out[out_off1 + d0] = acc_o[s][1] * sc_hi;
+        segm_out[out_off0 + d1] = acc_o[s][2] * sc_hi; segm_out[out_off1 + d1] = acc_o[s][3] * sc_hi;
+    }
+}
+
+static inline void launch_splitk_hd512_keqv_raw(
+    __nv_bfloat16* out_ptr, float* so_ptr, float* sm_ptr, float* se_ptr,
+    const __nv_bfloat16* q_ptr, const __nv_bfloat16* k_ptr, const __nv_bfloat16* v_ptr,
+    const int32_t* bt_ptr, const int32_t* sq_ptr, const int32_t* cuq_ptr,
+    float scale, float inv_k_norm_scalar, int num_splits,
+    int num_seqs, int total_q_heads, int block_size,
+    int64_t bt_stride0, int64_t q_stride0, int64_t q_stride1,
+    int64_t o_stride0, int64_t o_stride1,
+    int64_t k_stride0, int64_t k_stride1,
+    int64_t v_stride0, int64_t v_stride1,
+    cudaStream_t stream)
+{
+    constexpr int SMEM = 65536 + 8192 + 2 * 4 * 16 * 9 * 4;
+    static bool init_keqv_dec = false;
+    if (!init_keqv_dec) {
+        cudaFuncSetAttribute(sm90_paged_decode_hd512_keqv_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        init_keqv_dec = true;
+    }
+    sm90_launch_pdl(sm90_paged_decode_hd512_keqv_kernel, dim3(num_seqs, 2, num_splits), dim3(128), SMEM, stream,
+        so_ptr, sm_ptr, se_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+        scale, inv_k_norm_scalar, num_seqs, num_splits, block_size,
+        bt_stride0, q_stride0, q_stride1, k_stride0, k_stride1, v_stride0, v_stride1);
+    launch_reduce_vec_raw<512>(
+        out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr,
+        num_seqs, total_q_heads, 0, num_splits, o_stride0, o_stride1, stream);
+}
+
+static inline void launch_splitk_hd512_nq16_raw(
+    __nv_bfloat16* out_ptr, float* so_ptr, float* sm_ptr, float* se_ptr,
+    const __nv_bfloat16* q_ptr, const __nv_bfloat16* k_ptr, const __nv_bfloat16* v_ptr,
+    const int32_t* bt_ptr, const int32_t* sq_ptr, const int32_t* cuq_ptr,
+    float scale, int sliding_window_val, int num_splits,
+    int num_seqs, int nkv, int total_q_heads, int block_size,
+    int64_t bt_stride0, int64_t q_stride0, int64_t q_stride1,
+    int64_t o_stride0, int64_t o_stride1,
+    int64_t k_stride0, int64_t k_stride1, int64_t k_stride2,
+    int64_t v_stride0, int64_t v_stride1, int64_t v_stride2,
+    cudaStream_t stream)
+{
+    constexpr int SMEM_NQ16 = 65536 + 2 * 4 * 16 * 17 * 4;
+    static bool init_nq16 = false;
+    if (!init_nq16) {
+        cudaFuncSetAttribute(sm90_paged_decode_mma_bn32_nq16_kernel<true, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_NQ16);
+        cudaFuncSetAttribute(sm90_paged_decode_mma_bn32_nq16_kernel<false, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_NQ16);
+        cudaFuncSetAttribute(sm90_paged_decode_mma_bn32_nq16_kernel<false, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_NQ16);
+        init_nq16 = true;
+    }
+    if (block_size == 32) {
+        sm90_paged_decode_mma_bn32_nq16_kernel<true, false><<<dim3(num_seqs, nkv, num_splits), 128, SMEM_NQ16, stream>>>(
+            so_ptr, sm_ptr, se_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+            scale, sliding_window_val, num_seqs, nkv, num_splits, block_size,
+            bt_stride0, q_stride0, q_stride1,
+            k_stride0, k_stride1, k_stride2, v_stride0, v_stride1, v_stride2);
+    } else if (block_size == 16) {
+        sm90_paged_decode_mma_bn32_nq16_kernel<false, true><<<dim3(num_seqs, nkv, num_splits), 128, SMEM_NQ16, stream>>>(
+            so_ptr, sm_ptr, se_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+            scale, sliding_window_val, num_seqs, nkv, num_splits, block_size,
+            bt_stride0, q_stride0, q_stride1,
+            k_stride0, k_stride1, k_stride2, v_stride0, v_stride1, v_stride2);
+    } else {
+        sm90_paged_decode_mma_bn32_nq16_kernel<false, false><<<dim3(num_seqs, nkv, num_splits), 128, SMEM_NQ16, stream>>>(
+            so_ptr, sm_ptr, se_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+            scale, sliding_window_val, num_seqs, nkv, num_splits, block_size,
+            bt_stride0, q_stride0, q_stride1,
+            k_stride0, k_stride1, k_stride2, v_stride0, v_stride1, v_stride2);
+    }
+    launch_reduce_vec_raw<512>(
+        out_ptr, so_ptr, sm_ptr, se_ptr, sq_ptr, cuq_ptr,
+        num_seqs, total_q_heads, sliding_window_val, num_splits, o_stride0, o_stride1, stream);
 }
 
 static inline void launch_splitk_raw(
@@ -5430,11 +7083,11 @@ static inline int sm80_decode_target_splits(int num_seqs, int sliding_window_val
     }
     if (head_size == 512) {
         if (num_seqs <= 1) return 64;
-        if (num_seqs <= 2) return 24;
+        if (num_seqs <= 2) return 32;
         if (num_seqs <= 4) return 12;
         if (num_seqs <= 6) return 16;
         if (num_seqs <= 8) return 13;
-        if (num_seqs <= 10) return 8;
+        if (num_seqs <= 16) return 8;
         if (num_seqs <= 24) return 6;
         return 4;
     }
@@ -5570,7 +7223,8 @@ int dispatch_sm80_fast_attn(
     c10::optional<torch::Tensor> segm_max_opt,
     c10::optional<torch::Tensor> segm_expsum_opt,
     int num_decode_reqs,
-    c10::optional<torch::Tensor> cu_seqlens_q_prefill_opt)
+    c10::optional<torch::Tensor> cu_seqlens_q_prefill_opt,
+    double keqv_inv_k_norm)
 {
     int64_t total_q = q.size(0);
     int64_t num_seqs = seqused_k.size(0);
@@ -5582,7 +7236,9 @@ int dispatch_sm80_fast_attn(
     int total_q_heads = q.size(1);
     int nkv = k_cache.size(2);
     int block_size = k_cache.size(1);
-    if ((head_size != 256 && head_size != 512) || nkv <= 0 || total_q_heads != nkv * 8 || (block_size & 15) != 0)
+    bool is_hd512_nq16 = (head_size == 512 && nkv > 0 && total_q_heads == nkv * 16);
+    if ((head_size != 256 && head_size != 512) || nkv <= 0 ||
+        (!is_hd512_nq16 && total_q_heads != nkv * 8) || (block_size & 15) != 0)
         return 0;
     if (win_right > 0) return 0;
     if (q.scalar_type() != torch::kBFloat16 || out.scalar_type() != torch::kBFloat16 ||
@@ -5629,12 +7285,31 @@ int dispatch_sm80_fast_attn(
                 int64_t cap_o = so.numel() / (num_seqs * total_q_heads * head_size);
                 int nsplits = (int)std::min<int64_t>(target, std::min(cap_m, cap_o));
                 if (nsplits >= 1) {
-                    launch_splitk_raw(
-                        out_ptr, so.data_ptr<float>(), sm.data_ptr<float>(), se.data_ptr<float>(),
-                        q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
-                        fscale, sliding_window_val, nsplits,
-                        head_size, (int)num_seqs, nkv, total_q_heads, block_size,
-                        bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, stream);
+                    if (is_hd512_nq16) {
+                        if (nkv != 1) return 0;
+                        if (keqv_inv_k_norm > 0.0 && block_size == 64 && sliding_window_val == 0) {
+                            launch_splitk_hd512_keqv_raw(
+                                out_ptr, so.data_ptr<float>(), sm.data_ptr<float>(), se.data_ptr<float>(),
+                                q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+                                fscale, static_cast<float>(keqv_inv_k_norm), nsplits,
+                                (int)num_seqs, total_q_heads, block_size,
+                                bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, v_s0, v_s1, stream);
+                        } else {
+                            launch_splitk_raw(
+                                out_ptr, so.data_ptr<float>(), sm.data_ptr<float>(), se.data_ptr<float>(),
+                                q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+                                fscale, sliding_window_val, nsplits,
+                                head_size, (int)num_seqs, 2, total_q_heads, block_size,
+                                bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, 0, v_s0, v_s1, 0, stream);
+                        }
+                    } else {
+                        launch_splitk_raw(
+                            out_ptr, so.data_ptr<float>(), sm.data_ptr<float>(), se.data_ptr<float>(),
+                            q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+                            fscale, sliding_window_val, nsplits,
+                            head_size, (int)num_seqs, nkv, total_q_heads, block_size,
+                            bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, stream);
+                    }
                     return 1;
                 }
             }
@@ -5669,12 +7344,23 @@ int dispatch_sm80_fast_attn(
             int64_t cap_o = so.numel() / ((int64_t)num_decode_reqs * total_q_heads * head_size);
             int nsplits = (int)std::min<int64_t>(target, std::min(cap_m, cap_o));
             if (nsplits >= 1) {
-                launch_splitk_raw(
-                    out_ptr, so.data_ptr<float>(), sm.data_ptr<float>(), se.data_ptr<float>(),
-                    q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, nullptr,
-                    fscale, sliding_window_val, nsplits,
-                    head_size, num_decode_reqs, nkv, total_q_heads, block_size,
-                    bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, stream);
+                if (is_hd512_nq16 && keqv_inv_k_norm > 0.0 && block_size == 64 && sliding_window_val == 0) {
+                    launch_splitk_hd512_keqv_raw(
+                        out_ptr, so.data_ptr<float>(), sm.data_ptr<float>(), se.data_ptr<float>(),
+                        q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, nullptr,
+                        fscale, static_cast<float>(keqv_inv_k_norm), nsplits,
+                        num_decode_reqs, total_q_heads, block_size,
+                        bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, v_s0, v_s1, stream);
+                } else {
+                    launch_splitk_raw(
+                        out_ptr, so.data_ptr<float>(), sm.data_ptr<float>(), se.data_ptr<float>(),
+                        q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, nullptr,
+                        fscale, sliding_window_val, nsplits,
+                        head_size, num_decode_reqs, is_hd512_nq16 ? 2 : nkv, total_q_heads, block_size,
+                        bt_s0, q_s0, q_s1, o_s0, o_s1,
+                        k_s0, k_s1, is_hd512_nq16 ? 0 : k_s2,
+                        v_s0, v_s1, is_hd512_nq16 ? 0 : v_s2, stream);
+                }
                 out_ptr += (int64_t)num_decode_reqs * o_s0;
                 q_ptr += (int64_t)num_decode_reqs * q_s0;
                 bt_ptr += (int64_t)num_decode_reqs * bt_s0;
@@ -5724,6 +7410,25 @@ int dispatch_sm80_fast_attn(
     }
 
     if (head_size == 512 && win_left < 0 && q_s1 == 512 && o_s1 == 512) {
+        if (is_hd512_nq16) {
+            if (max_seqlen_q >= 16 && keqv_inv_k_norm > 0.0 && block_size == 64 && nkv == 1) {
+                launch_wgmma_hd512_keqv_2stage_raw(
+                    out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+                    fscale, static_cast<float>(keqv_inv_k_norm), (int)max_seqlen_q, pref_num_seqs,
+                    bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, v_s0, v_s1, stream);
+            } else if (max_seqlen_q >= 16) {
+                launch_wgmma_hd512_nq16_raw(
+                    out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+                    fscale, (int)max_seqlen_q, pref_num_seqs, block_size,
+                    bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, v_s0, v_s1, stream);
+            } else {
+                launch_hd512_raw_nq16(
+                    out_ptr, q_ptr, k_ptr, v_ptr, bt_ptr, sq_ptr, cuq_ptr,
+                    fscale, pref_total_q, pref_num_seqs, nkv, block_size,
+                    bt_s0, q_s0, q_s1, o_s0, o_s1, k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, stream);
+            }
+            return 1;
+        }
         bool use_bm16 = (pref_total_q <= 128) || (max_seqlen_q <= 64 && pref_total_q <= 256);
         if (use_bm16) {
             launch_hd512_bm16_raw(
@@ -5963,6 +7668,10 @@ void fused_softcap_inplace(torch::Tensor logits, double soft_cap, double scale) 
     }
 }
 
+static torch::Tensor s_greedy_val_ws[8];
+static torch::Tensor s_greedy_idx_ws[8];
+static std::mutex s_greedy_ws_mu;
+
 torch::Tensor fast_greedy_argmax(torch::Tensor logits) {
     int B = logits.size(0), V = logits.size(1);
     auto out = torch::empty({B}, torch::TensorOptions().dtype(torch::kInt64).device(logits.device()));
@@ -5970,19 +7679,36 @@ torch::Tensor fast_greedy_argmax(torch::Tensor logits) {
     bool use_fine = (logits.scalar_type() == torch::kBFloat16) && (B <= 4);
     int cols_per_blk = use_fine ? 2048 : 8192;
     int num_parts = (V + cols_per_blk - 1) / cols_per_blk;
-    auto part_val = torch::empty({B, num_parts}, torch::TensorOptions().dtype(torch::kFloat).device(logits.device()));
-    auto part_idx = torch::empty({B, num_parts}, torch::TensorOptions().dtype(torch::kInt32).device(logits.device()));
+    int64_t needed = static_cast<int64_t>(B) * num_parts;
+    int dev_idx = logits.device().index();
+    if (dev_idx < 0 || dev_idx >= 8) dev_idx = 0;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap_st);
+    torch::Tensor part_val, part_idx;
+    if (cap_st == cudaStreamCaptureStatusNone) {
+        std::lock_guard<std::mutex> lk(s_greedy_ws_mu);
+        if (!s_greedy_val_ws[dev_idx].defined() || s_greedy_val_ws[dev_idx].numel() < needed) {
+            int64_t alloc_n = std::max<int64_t>(needed, 512LL * 128LL);
+            s_greedy_val_ws[dev_idx] = torch::empty({alloc_n}, torch::TensorOptions().dtype(torch::kFloat).device(logits.device()));
+            s_greedy_idx_ws[dev_idx] = torch::empty({alloc_n}, torch::TensorOptions().dtype(torch::kInt32).device(logits.device()));
+        }
+        part_val = s_greedy_val_ws[dev_idx];
+        part_idx = s_greedy_idx_ws[dev_idx];
+    } else {
+        part_val = torch::empty({needed}, torch::TensorOptions().dtype(torch::kFloat).device(logits.device()));
+        part_idx = torch::empty({needed}, torch::TensorOptions().dtype(torch::kInt32).device(logits.device()));
+    }
     dim3 grid1(B, num_parts);
     if (logits.scalar_type() == torch::kBFloat16) {
         if (use_fine)
-            gemma4_greedy_stage1_kernel<true, 1><<<grid1, 256, 0, stream>>>(part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), logits.data_ptr(), logits.stride(0), V);
+            sm90_launch_pdl(gemma4_greedy_stage1_kernel<true, 1>, grid1, dim3(256), 0, stream, part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), logits.data_ptr(), logits.stride(0), V);
         else
-            gemma4_greedy_stage1_kernel<true, 4><<<grid1, 256, 0, stream>>>(part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), logits.data_ptr(), logits.stride(0), V);
+            sm90_launch_pdl(gemma4_greedy_stage1_kernel<true, 4>, grid1, dim3(256), 0, stream, part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), logits.data_ptr(), logits.stride(0), V);
     } else {
-        gemma4_greedy_stage1_kernel<false, 4><<<grid1, 256, 0, stream>>>(part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), logits.data_ptr(), logits.stride(0), V);
+        sm90_launch_pdl(gemma4_greedy_stage1_kernel<false, 4>, grid1, dim3(256), 0, stream, part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), logits.data_ptr(), logits.stride(0), V);
     }
-    gemma4_greedy_stage2_kernel<<<B, 32, 0, stream>>>(out.data_ptr<int64_t>(), part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), num_parts);
+    sm90_launch_pdl(gemma4_greedy_stage2_kernel, dim3(B), dim3(32), 0, stream, out.data_ptr<int64_t>(), part_val.data_ptr<float>(), part_idx.data_ptr<int32_t>(), num_parts);
     return out;
 }
 
@@ -6027,24 +7753,24 @@ torch::Tensor fast_topk_topp_gumbel_sample(
     dim3 grid1(B, num_blocks);
     int total_cands = num_blocks * max_k;
     if (use_prune) {
-        gemma4_topk_stage1_bf16_prune_kernel<8192, 13><<<grid1, 256, 0, stream>>>(
+        sm90_launch_pdl(gemma4_topk_stage1_bf16_prune_kernel<8192, 13>, grid1, dim3(256), 0, stream,
             reinterpret_cast<uint64_t*>(stage1.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr()), logits.stride(0),
             top_k_gpu.data_ptr<int32_t>(), expanded_idx_mapping.data_ptr<int32_t>(), V, max_k);
         if (total_cands <= 1024) {
-            gemma4_topk_topp_gumbel_stage2_prune_kernel<4><<<B, 256, 0, stream>>>(
+            sm90_launch_pdl(gemma4_topk_topp_gumbel_stage2_prune_kernel<4>, dim3(B), dim3(256), 0, stream,
                 out.data_ptr<int64_t>(), reinterpret_cast<const uint64_t*>(stage1.data_ptr()),
                 expanded_idx_mapping.data_ptr<int32_t>(), temperatures.data_ptr<float>(),
                 top_k_gpu.data_ptr<int32_t>(), top_p_gpu.has_value() ? top_p_gpu->data_ptr<float>() : nullptr,
                 seeds_gpu.data_ptr<int64_t>(), pos_gpu.data_ptr<int64_t>(), num_blocks, max_k);
         } else if (total_cands <= 2048) {
-            gemma4_topk_topp_gumbel_stage2_prune_kernel<8><<<B, 256, 0, stream>>>(
+            sm90_launch_pdl(gemma4_topk_topp_gumbel_stage2_prune_kernel<8>, dim3(B), dim3(256), 0, stream,
                 out.data_ptr<int64_t>(), reinterpret_cast<const uint64_t*>(stage1.data_ptr()),
                 expanded_idx_mapping.data_ptr<int32_t>(), temperatures.data_ptr<float>(),
                 top_k_gpu.data_ptr<int32_t>(), top_p_gpu.has_value() ? top_p_gpu->data_ptr<float>() : nullptr,
                 seeds_gpu.data_ptr<int64_t>(), pos_gpu.data_ptr<int64_t>(), num_blocks, max_k);
         } else {
-            gemma4_topk_topp_gumbel_stage2_prune_kernel<16><<<B, 256, 0, stream>>>(
+            sm90_launch_pdl(gemma4_topk_topp_gumbel_stage2_prune_kernel<16>, dim3(B), dim3(256), 0, stream,
                 out.data_ptr<int64_t>(), reinterpret_cast<const uint64_t*>(stage1.data_ptr()),
                 expanded_idx_mapping.data_ptr<int32_t>(), temperatures.data_ptr<float>(),
                 top_k_gpu.data_ptr<int32_t>(), top_p_gpu.has_value() ? top_p_gpu->data_ptr<float>() : nullptr,
@@ -6141,7 +7867,8 @@ int dispatch_sm80_fast_attn(
     c10::optional<torch::Tensor> segm_max_opt,
     c10::optional<torch::Tensor> segm_expsum_opt,
     int num_decode_reqs,
-    c10::optional<torch::Tensor> cu_seqlens_q_prefill_opt);
+    c10::optional<torch::Tensor> cu_seqlens_q_prefill_opt,
+    double keqv_inv_k_norm);
 bool launch_reshape_and_cache_bf16(
     torch::Tensor key,
     torch::Tensor value,
@@ -6232,7 +7959,7 @@ def get_gemma4_sm80_ext() -> ModuleType:
                 "fast_greedy_argmax",
                 "fast_topk_topp_gumbel_sample",
             ],
-            extra_cuda_cflags=["-O3", "-arch=sm_80"],
+            extra_cuda_cflags=["-O3", "-arch=sm_90a" if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9) else "-arch=sm_80"],
             build_directory=build_dir,
             verbose=False,
         )

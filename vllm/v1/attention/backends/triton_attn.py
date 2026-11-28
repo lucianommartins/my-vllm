@@ -5,6 +5,8 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -62,6 +64,21 @@ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 # Gemma4 checkpoints get the sliding-window work split (see builder).
 _GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_text", "gemma4_unified")
+
+_FA3_FWD_CACHE = None
+_FA3_FWD_INITIALIZED = False
+
+
+def _get_fa3_fwd():
+    global _FA3_FWD_CACHE, _FA3_FWD_INITIALIZED
+    if not _FA3_FWD_INITIALIZED:
+        _FA3_FWD_INITIALIZED = True
+        try:
+            import vllm.vllm_flash_attn  # noqa: F401
+            _FA3_FWD_CACHE = torch.ops._vllm_fa3_C.fwd
+        except Exception:
+            _FA3_FWD_CACHE = None
+    return _FA3_FWD_CACHE
 
 
 @dataclass
@@ -174,10 +191,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.max_seqs_64_segments = 0
         if current_platform.is_cuda() and (
             current_platform.is_device_capability((12, 0))
-            # Gemma4 on A100: global layers (2 KV heads) launch only 32
+            # Gemma4 on A100/H100: global layers (1-2 KV heads) launch only 16-32
             # programs per sequence at 16 segments; 64 fills the SMs.
             or (
-                current_platform.is_device_capability((8, 0))
+                current_platform.has_device_capability((8, 0))
+                and kv_cache_spec.sliding_window is None
                 and model_config.hf_config.model_type in _GEMMA4_MODEL_TYPES
             )
         ):
@@ -697,7 +715,7 @@ class TritonAttentionImpl(AttentionImpl):
         self._cached_kv_v = None
         is_sm80_cuda = (
             current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+            and current_platform.has_device_capability((8, 0))
             and not self._set_kv_ptr_range
         )
         self._sm80_use_kv_update = (
@@ -711,8 +729,10 @@ class TritonAttentionImpl(AttentionImpl):
             and not self.use_td
             and self._is_kv_quant_none
             and not self._is_encoder
-            and self.head_size in (256, 512)
-            and self.num_queries_per_kv == 8
+            and (
+                (self.head_size in (256, 512) and self.num_queries_per_kv == 8)
+                or (self.head_size == 512 and self.num_queries_per_kv == 16 and self.num_kv_heads == 1)
+            )
             and self.logits_soft_cap <= 0
             and self.alibi_slopes is None
             and not self.use_alibi_sqrt
@@ -721,8 +741,67 @@ class TritonAttentionImpl(AttentionImpl):
             and self._win_right in (-1, 0)
         )
         self._sm80_dispatch_fn = None
+        self._keqv_inv_k_norm = 0.0
         self._sm80_kv_update_fn = None
         self._sm80_fa2_fwd = None
+        is_sm90_cuda = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(90)
+            and not self._set_kv_ptr_range
+            and os.environ.get("VLLM_GEMMA4_SM90_FA3", "1") != "0"
+        )
+        self._sm90_fa3_fwd = _get_fa3_fwd() if is_sm90_cuda else None
+        self._sm90_fa3_fast_layer = (
+            self._sm90_fa3_fwd is not None
+            and not envs.VLLM_BATCH_INVARIANT
+            and not self.use_td
+            and self._is_kv_quant_none
+            and not self._is_encoder
+            and self.head_size <= 256
+            and self.alibi_slopes is None
+            and not self.use_alibi_sqrt
+            and self.sinks is None
+            and self.chunk_lookback < 0
+            and self._win_right in (-1, 0)
+        )
+        if self._sm90_fa3_fast_layer:
+            logger.info_once(
+                "Triton attention: SM90 Hopper FA3 direct dispatch enabled (head_size=%d, window=%s).",
+                self.head_size,
+                self.sliding_window,
+            )
+        self._sm90_sliding_decode_fn = None
+        self._sm90_sliding_splitk_fn = None
+        self._sm90_sliding_32w_min_bs = 12
+        self._sm90_sliding_splitk_max_bs = 11
+        if (
+            self._sm90_fa3_fast_layer
+            and self.head_size == 256
+            and self.num_heads == 16
+            and self.num_kv_heads == 8
+            and 0 <= self._win_left <= 1024
+            and self.logits_soft_cap <= 0
+            and os.environ.get("VLLM_GEMMA4_SM90_SLIDING_32W", "1") != "0"
+        ):
+            from vllm._gemma4_sliding_decode_sm90 import (
+                _get_mod,
+                sliding_decode_hd256_gqa2_32w,
+                sliding_decode_hd256_gqa2_splitk,
+            )
+            _get_mod()
+            self._sm90_sliding_decode_fn = sliding_decode_hd256_gqa2_32w
+            self._sm90_sliding_splitk_fn = sliding_decode_hd256_gqa2_splitk
+            self._sm90_sliding_32w_min_bs = int(
+                os.environ.get("VLLM_GEMMA4_SM90_SLIDING_32W_MIN_BS", "9")
+            )
+            self._sm90_sliding_splitk_max_bs = int(
+                os.environ.get("VLLM_GEMMA4_SM90_SLIDING_SPLITK_MAX_BS", "8")
+            )
+            logger.info_once(
+                "Triton attention: SM90a zero-spill PDL sliding decode enabled (hd=256, GQA=2, splitk<=%d, 32w>=%d).",
+                self._sm90_sliding_splitk_max_bs,
+                self._sm90_sliding_32w_min_bs,
+            )
 
     def _get_kv_views(self, kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         kv_ptr = kv_cache.data_ptr()
@@ -920,6 +999,118 @@ class TritonAttentionImpl(AttentionImpl):
                     set_triton_ptr_range(kv_t, key_cache, value_cache)
 
             if (
+                self._sm90_fa3_fast_layer
+                and output_scale is None
+                and attn_metadata.mm_prefix_range_tensor is None
+                and attn_metadata.rswa_prefix_lens is None
+                and attn_metadata.causal is True
+                and q_in.shape[0] > 0
+                and attn_metadata.max_seq_len > 0
+                and attn_metadata.seq_lens.shape[0] > 0
+                and q_in.dtype in (torch.bfloat16, torch.float16)
+                and key_cache.dtype == q_in.dtype
+                and q_in.stride(-1) == 1
+                and out_in.stride(-1) == 1
+                and key_cache.stride(-1) == 1
+                and value_cache.stride(-1) == 1
+                and (key_cache.shape[1] & 15) == 0
+                and (
+                    attn_metadata.max_query_len > 1
+                    or attn_metadata.seq_lens.shape[0] >= 4
+                    or (
+                        self._sm90_sliding_splitk_fn is not None
+                        and attn_metadata.seq_lens.shape[0] <= self._sm90_sliding_splitk_max_bs
+                    )
+                )
+            ):
+                max_query_len = attn_metadata.max_query_len
+                if (
+                    max_query_len == 1
+                    and self._sm90_sliding_decode_fn is not None
+                    and q_in.dtype is torch.bfloat16
+                    and key_cache.stride() == value_cache.stride()
+                    and (key_cache.shape[1] & (key_cache.shape[1] - 1)) == 0
+                    and attn_metadata.block_table.dtype is torch.int32
+                    and attn_metadata.seq_lens.dtype is torch.int32
+                    and attn_metadata.block_table.is_contiguous()
+                    and attn_metadata.seq_lens.is_contiguous()
+                ):
+                    bs_cur = attn_metadata.seq_lens.shape[0]
+                    if bs_cur >= self._sm90_sliding_32w_min_bs:
+                        self._sm90_sliding_decode_fn(
+                            q_in,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table,
+                            attn_metadata.seq_lens,
+                            out_in,
+                            self._win_left,
+                            self.scale,
+                        )
+                        return output
+                    if (
+                        self._sm90_sliding_splitk_fn is not None
+                        and 1 <= bs_cur <= self._sm90_sliding_splitk_max_bs
+                    ):
+                        self._sm90_sliding_splitk_fn(
+                            q_in,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table,
+                            attn_metadata.seq_lens,
+                            out_in,
+                            self._win_left,
+                            self.scale,
+                        )
+                        return output
+                if max_query_len == 1 and 0 <= self._win_left <= 1024:
+                    num_splits = 1
+                    pack_gqa = True
+                else:
+                    num_splits = 0
+                    pack_gqa = None
+                self._sm90_fa3_fwd(
+                    q_in,
+                    key_cache,
+                    value_cache,
+                    None,
+                    None,
+                    None,
+                    out_in,
+                    attn_metadata.query_start_loc,
+                    None,
+                    None,
+                    None,
+                    attn_metadata.seq_lens,
+                    max_query_len,
+                    attn_metadata.max_seq_len,
+                    attn_metadata.block_table,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.scale,
+                    True,
+                    self._win_left,
+                    self._win_right,
+                    self.logits_soft_cap,
+                    True,
+                    None,
+                    num_splits,
+                    pack_gqa,
+                    0,
+                    None,
+                    1,
+                    0,
+                    None,
+                )
+                return output
+
+            if (
                 self._sm80_fast_layer
                 and output_scale is None
                 and attn_metadata.mm_prefix_range_tensor is None
@@ -953,6 +1144,7 @@ class TritonAttentionImpl(AttentionImpl):
                     attn_metadata.softmax_segm_expsum,
                     num_decode_reqs,
                     attn_metadata.cu_seqlens_q_prefill,
+                    self._keqv_inv_k_norm,
                 )
                 if rc == 1:
                     return output

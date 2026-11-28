@@ -262,6 +262,36 @@ def gemma4_qkv_norm_rope_cache(
         and kv_cache.stride(3) == 1
         and q_out.is_contiguous()
     )
+    if (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability((9, 0))
+        and hd in (256, 512)
+        and qkv.dtype == torch.bfloat16
+        and q_weight.dtype == torch.bfloat16
+        and k_weight.dtype == torch.bfloat16
+        and cos_sin_cache.dtype == torch.bfloat16
+        and q_out.dtype == torch.bfloat16
+        and kv_cache.dtype == torch.bfloat16
+        and positions.dtype == torch.int64
+        and layer_slot_mapping.dtype == torch.int64
+        and qkv.stride(-1) == 1
+        and q_weight.is_contiguous()
+        and k_weight.is_contiguous()
+        and cos_sin_cache.stride(-1) == 1
+        and hasattr(torch.ops.vllm, "gemma4_12b_qkv_norm_rope_cache")
+    ):
+        torch.ops.vllm.gemma4_12b_qkv_norm_rope_cache(
+            qkv,
+            positions,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            layer_slot_mapping,
+            q_out,
+            kv_cache,
+            eps,
+        )
+        return qkv.new_empty(0)
     nw = 2 if (hd == 512 and num_tokens >= 256) else 1
     _gemma4_qkv_norm_rope_cache_kernel[(num_tokens, nq + 2 * nkv)](
         qkv,
@@ -504,6 +534,20 @@ class Gemma4MLP(nn.Module):
             import vllm._gemma4_e2b_proj_ops  # noqa: F401
 
             logger.info_once("Enabled SM80 Gemma4 E2B MLP projection kernels")
+        self._use_12b_sm90_mlp = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((9, 0))
+            and get_tensor_model_parallel_world_size() == 1
+            and hidden_size == 3840
+            and intermediate_size == 15360
+            and hidden_activation == "gelu_pytorch_tanh"
+            and isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+        )
+        if self._use_12b_sm90_mlp:
+            import vllm._gemma4_12b_sm90_ops  # noqa: F401
+
+            logger.info_once("Enabled SM90a Gemma4 12B fused MLP projection kernels")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
@@ -528,6 +572,17 @@ class Gemma4MLP(nn.Module):
         ):
             x = torch.ops.vllm.e2b_mlp_gate_up_gelu(x, self.gate_up_proj.weight)
             return torch.ops.vllm.e2b_skinny_linear(x, self.down_proj.weight)
+        if (
+            self._use_12b_sm90_mlp
+            and x.dtype == torch.bfloat16
+            and type(self.gate_up_proj) is MergedColumnParallelLinear
+            and type(self.down_proj) is RowParallelLinear
+            and self.gate_up_proj.weight.dtype == torch.bfloat16
+            and self.down_proj.weight.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            x = torch.ops.vllm.gemma4_12b_mlp_gate_up_gelu(x, self.gate_up_proj.weight)
+            return torch.ops.vllm.gemma4_12b_skinny_linear(x, self.down_proj.weight)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -827,6 +882,28 @@ class Gemma4Attention(nn.Module):
             import vllm._gemma4_e2b_proj_ops  # noqa: F401
 
             logger.info_once("Enabled SM80 Gemma4 E2B attention projection kernels")
+        self._use_12b_sm90_attn_proj = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((9, 0))
+            and tp_size == 1
+            and hidden_size == 3840
+            and not config.attention_bias
+            and not self.is_kv_shared_layer
+            and isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and self.q_size in (4096, 8192)
+        )
+        if self._use_12b_sm90_attn_proj:
+            import vllm._gemma4_12b_sm90_ops  # noqa: F401
+
+            logger.info_once("Enabled SM90a Gemma4 12B attention projection kernels")
+        self._use_12b_sm90_keqv = (
+            self._use_12b_sm90_attn_proj
+            and self._use_fused_qkv_norm_rope_cache
+            and attention_k_eq_v
+            and not self.is_sliding
+            and self.head_dim == 512
+        )
 
         rope_angles = getattr(self.rotary_emb, "rope_angles", None)
         if rope_angles is None:
@@ -923,6 +1000,19 @@ class Gemma4Attention(nn.Module):
                 qkv = torch.ops.vllm.e2b_skinny_linear(
                     hidden_states, self.qkv_proj.weight
                 )
+            elif (
+                self._use_12b_sm90_attn_proj
+                and hidden_states.dtype == torch.bfloat16
+                and type(self.qkv_proj) is QKVParallelLinear
+                and self.qkv_proj.weight.dtype == torch.bfloat16
+                and not envs.VLLM_BATCH_INVARIANT
+            ):
+                w_qkv = (
+                    self.qkv_proj.weight[: self.q_size + self.kv_size]
+                    if self._use_12b_sm90_keqv
+                    else self.qkv_proj.weight
+                )
+                qkv = torch.ops.vllm.gemma4_12b_skinny_linear(hidden_states, w_qkv)
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
             if (
@@ -1020,6 +1110,16 @@ class Gemma4Attention(nn.Module):
             and not envs.VLLM_BATCH_INVARIANT
         ):
             output = torch.ops.vllm.e2b_skinny_linear(
+                attn_output, self.o_proj.weight
+            )
+        elif (
+            self._use_12b_sm90_attn_proj
+            and attn_output.dtype == torch.bfloat16
+            and type(self.o_proj) is RowParallelLinear
+            and self.o_proj.weight.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            output = torch.ops.vllm.gemma4_12b_skinny_linear(
                 attn_output, self.o_proj.weight
             )
         else:
@@ -1212,6 +1312,15 @@ class Gemma4DecoderLayer(nn.Module):
         )
         if self._use_sm80_fused_moe_norms:
             import vllm._gemma4_sm80_ops  # noqa: F401
+        self._use_12b_sm90_dense_norms = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((9, 0))
+            and self.hidden_size == 3840
+            and not self.enable_moe_block
+            and self.per_layer_input_gate is None
+        )
+        if self._use_12b_sm90_dense_norms:
+            import vllm._gemma4_12b_sm90_ops  # noqa: F401
 
     def forward_sm80_cross_norm(
         self,
@@ -1250,6 +1359,36 @@ class Gemma4DecoderLayer(nn.Module):
             h_res,
             self.post_feedforward_layernorm_1.weight,
             self.post_feedforward_layernorm_2.weight,
+            self.post_feedforward_layernorm.weight,
+            self.layer_scalar,
+            next_norm_weight,
+            self.post_feedforward_layernorm.variance_epsilon,
+        )
+
+    def forward_12b_sm90_cross_norm(
+        self,
+        positions: torch.Tensor,
+        normed_in: torch.Tensor,
+        residual: torch.Tensor,
+        next_norm_weight: torch.Tensor,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_out = self.self_attn(
+            positions=positions,
+            hidden_states=normed_in,
+            **kwargs,
+        )
+        h_res, h_ffn = torch.ops.vllm.gemma4_12b_post_attn_pre_ffn_norm(
+            attn_out,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
+        mlp_out = self.mlp(h_ffn)
+        return torch.ops.vllm.gemma4_12b_post_ffn_cross_norm(
+            mlp_out,
+            h_res,
             self.post_feedforward_layernorm.weight,
             self.layer_scalar,
             next_norm_weight,
@@ -2122,6 +2261,20 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         )
         if self._use_sm80_cross_layer_norms:
             logger.info_once("Enabled SM80 Gemma4 fused cross-layer Multi-RMSNorms")
+        self._use_12b_sm90_cross_layer_norms = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((9, 0))
+            and not self.fast_prefill_enabled
+            and get_pp_group().is_first_rank
+            and get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+            and all(
+                not isinstance(l, PPMissingLayer) and l._use_12b_sm90_dense_norms
+                for l in self.layers[self.start_layer : self.end_layer]
+            )
+        )
+        if self._use_12b_sm90_cross_layer_norms:
+            logger.info_once("Enabled SM90a Gemma4 12B fused cross-layer dense RMSNorms")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.self_decoder.embed_input_ids(input_ids)
@@ -2434,6 +2587,31 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                     **kwargs,
                 )
             return normed_cur
+        if (
+            self._use_12b_sm90_cross_layer_norms
+            and per_layer_inputs is None
+            and len(self.aux_hidden_state_layers) == 0
+            and hidden_states.dtype == torch.bfloat16
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            active_layers = self.layers[self.start_layer : self.end_layer]
+            num_active = len(active_layers)
+            residual_cur = hidden_states
+            normed_cur = active_layers[0].input_layernorm(residual_cur)
+            for idx, layer in enumerate(active_layers):
+                nxt_w = (
+                    active_layers[idx + 1].input_layernorm.weight
+                    if idx + 1 < num_active
+                    else self.norm.weight
+                )
+                residual_cur, normed_cur = layer.forward_12b_sm90_cross_norm(
+                    positions,
+                    normed_cur,
+                    residual_cur,
+                    nxt_w,
+                    **kwargs,
+                )
+            return normed_cur
         residual = None
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
@@ -2479,6 +2657,7 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         _apply_gemma4_wsp_patches(self)
+        _init_gemma4_keqv_inv_k_norm(self)
         return loaded
 
 
@@ -2687,6 +2866,32 @@ class Gemma4ForCausalLM(
 
             self._sm80_fused_lm_head_fn = e2b_lm_head_softcap
             self._sm80_lm_head_soft_cap = float(self.logits_processor.soft_cap)
+        elif (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((9, 0))
+            and not self.logits_processor.logits_as_input
+            and self.logits_processor.soft_cap is not None
+            and float(self.logits_processor.scale) == 1.0
+            and self.lm_head.tp_size == 1
+            and isinstance(
+                self.lm_head.quant_method,
+                (UnquantizedLinearMethod, UnquantizedEmbeddingMethod),
+            )
+            and getattr(self.lm_head, "bias", None) is None
+            and self.logits_processor.org_vocab_size == self.lm_head.weight.shape[0]
+            and self.lm_head.weight.dtype == torch.bfloat16
+            and (
+                self.logits_processor.head_dtype is None
+                or self.logits_processor.head_dtype == torch.bfloat16
+            )
+            and self.lm_head.weight.shape[1] == 3840
+            and (self.lm_head.weight.shape[0] & 31) == 0
+        ):
+            from vllm._gemma4_12b_sm90_ops import gemma4_12b_lm_head_softcap
+
+            self._sm80_fused_lm_head_fn = gemma4_12b_lm_head_softcap
+            self._sm80_lm_head_soft_cap = float(self.logits_processor.soft_cap)
+            logger.info_once("Enabled SM90a Gemma4 12B fused lm_head + softcap")
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -2747,4 +2952,36 @@ class Gemma4ForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        _init_gemma4_keqv_inv_k_norm(self)
+        return loaded
+
+
+def _init_gemma4_keqv_inv_k_norm(model: nn.Module) -> int:
+    count = 0
+    for m in model.modules():
+        if not isinstance(m, Gemma4Attention):
+            continue
+        if (
+            not getattr(m, "is_sliding", True)
+            and getattr(m, "head_dim", 0) == 512
+            and getattr(m, "num_kv_heads", 0) == 1
+            and hasattr(m, "k_norm")
+            and hasattr(m, "v_norm")
+            and not getattr(m.v_norm, "has_weight", True)
+            and getattr(m, "rotary_emb", None) is not None
+            and getattr(m.rotary_emb, "rope_angles", -1) == 64
+            and getattr(m.rotary_emb, "is_neox_style", False)
+            and hasattr(m, "attn")
+            and hasattr(m.attn, "impl")
+            and hasattr(m.attn.impl, "_keqv_inv_k_norm")
+        ):
+            w = m.k_norm.weight.detach()
+            if w.numel() == 512 and bool((w == w[0]).all().item()):
+                c = float(w[0].float().item())
+                if abs(c) > 1e-4:
+                    m.attn.impl._keqv_inv_k_norm = 1.0 / c
+                    count += 1
+    if count > 0:
+        logger.info("Enabled lossless k_eq_v 75%%-V-skip global hd=512 decode on %d layers", count)
+    return count

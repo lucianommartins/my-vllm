@@ -87,7 +87,10 @@ class Sampler:
         self.needs_pre_top_k_proc = np.zeros(max_num_reqs, dtype=bool)
         self._is_sm80_cuda = (
             current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+            and (
+                current_platform.is_device_capability((8, 0))
+                or current_platform.is_device_capability((9, 0))
+            )
         )
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
